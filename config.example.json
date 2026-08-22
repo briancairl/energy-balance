@@ -1,0 +1,17 @@
+{
+  "client_id": "YOUR_STRAVA_CLIENT_ID",
+  "client_secret": "YOUR_STRAVA_CLIENT_SECRET",
+  "port": 8081,
+  "access_username": "athlete",
+  "access_password": "",
+  "intervals_api_key": "YOUR_INTERVALS_ICU_API_KEY",
+  "intervals_athlete_id": "0",
+  "tls_enabled": false,
+  "tls_hostname": "",
+  "tls_port": 8082,
+  "google_client_id": "",
+  "google_client_secret": "",
+  "google_sheet_id": "",
+  "google_sheet_range": "A1:Z1000",
+  "google_sync_time": "04:00"
+}

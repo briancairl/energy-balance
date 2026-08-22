@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Energy Balance</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" href="/favicon-32x32.png" type="image/png" sizes="32x32">
+<link rel="icon" href="/favicon-16x16.png" type="image/png" sizes="16x16">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0F1416">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/react-is@18/umd/react-is.production.min.js"></script>
+<script src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
+<script src="https://unpkg.com/papaparse@5/papaparse.min.js"></script>
+<script src="https://unpkg.com/recharts@2/umd/Recharts.js"></script>
+<style>
+  html, body, #root { height: 100%; margin: 0; }
+  body { background: #0F1416; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!--
+  This page is meant to be served by server.py (run: python3 server.py),
+  which also handles the Strava OAuth flow and calorie lookups.
+  It's precompiled to plain JS (no in-browser Babel/JSX transform).
+-->
+
+<script src="/app.js"></script>
+
+<script>
+  // Safety net: if a required CDN library failed to load, say so instead of a silent black screen.
+  window.addEventListener("load", () => {
+    setTimeout(() => {
+      const rootEl = document.getElementById("root");
+      const missing = [];
+      if (typeof React === "undefined") missing.push("React");
+      if (typeof ReactDOM === "undefined") missing.push("ReactDOM");
+      if (typeof Recharts === "undefined") missing.push("Recharts");
+      if (typeof Papa === "undefined") missing.push("PapaParse");
+      if (missing.length && rootEl && !rootEl.hasChildNodes()) {
+        rootEl.innerHTML =
+          '<div style="color:#EDE6D6;font-family:sans-serif;padding:40px;max-width:600px;">' +
+          '<h2 style="color:#E1604D;">Failed to load: ' + missing.join(", ") + '</h2>' +
+          '<p>One or more required scripts didn\'t load from unpkg.com. Check your internet connection, ' +
+          'try disabling any ad-blocker/script-blocker for this page, or check the browser console (F12) for the exact network error.</p>' +
+          '</div>';
+      }
+    }, 2500);
+  });
+</script>
+</body>
+</html>

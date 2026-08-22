@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#161D20"/>
+      <stop offset="100%" stop-color="#0B0F11"/>
+    </linearGradient>
+    <linearGradient id="outerFlame" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F0B458"/>
+      <stop offset="55%" stop-color="#E8A33D"/>
+      <stop offset="100%" stop-color="#E1604D"/>
+    </linearGradient>
+    <linearGradient id="innerFlame" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8CE6EC"/>
+      <stop offset="100%" stop-color="#4FD1D9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- background: rounded-square app-icon canvas, full bleed for OS masking -->
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect x="0.5" y="0.5" width="511" height="511" rx="112" fill="none" stroke="#2A363B" stroke-width="1"/>
+
+  <!-- outer flame: demand / exertion -->
+  <path d="M256 76
+           C 198 130 152 190 152 274
+           C 152 356 192 420 256 442
+           C 320 420 360 356 360 274
+           C 360 224 336 190 306 200
+           C 314 158 296 112 256 76 Z"
+        fill="url(#outerFlame)"/>
+
+  <!-- small side lick for a bit of asymmetric character -->
+  <path d="M322 232
+           C 344 244 356 268 352 296
+           C 348 276 336 258 318 250
+           C 320 244 321 238 322 232 Z"
+        fill="url(#outerFlame)"/>
+
+  <!-- inner flame: fuel / intake, the "balance" nested inside the burn -->
+  <path d="M256 192
+           C 228 224 208 262 208 316
+           C 208 366 228 400 256 414
+           C 284 400 304 366 304 316
+           C 304 286 290 262 272 252
+           C 278 230 270 208 256 192 Z"
+        fill="url(#innerFlame)"/>
+</svg>

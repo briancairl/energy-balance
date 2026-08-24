@@ -1,0 +1,14 @@
+.git
+.gitignore
+README.md
+CONTEXT.md
+
+# Secrets and runtime data — never bake these into the image. When running
+# via docker-compose.yml (which bind-mounts the whole project directory),
+# these come from the host instead and persist across container rebuilds.
+config.json
+app_store.json
+*tokens.json
+*cache.json
+*.key
+*.crt

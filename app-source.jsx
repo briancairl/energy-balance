@@ -29,6 +29,11 @@ function fmt(n, d = 0) {
   return n.toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
 }
 function toISODate(d) { return d.toISOString().slice(0, 10); }
+// toISODate above converts through UTC, which silently rolls to the next day
+// once local time is far enough ahead of UTC (e.g. after ~8pm EDT) — wrong for
+// anything keying a calendar grid off the viewer's own local date. This stays
+// in local time throughout.
+function toLocalISODate(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
 
 // JS's native Date parser is notoriously inconsistent for anything but ISO
 // or unambiguous US slash format — Google Sheets' FORMATTED_VALUE output
@@ -1517,6 +1522,7 @@ function WeightLogTable({ weightLog, onSave, onDelete }) {
 
 
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const ACTIVITY_COLORS = { Run: coral, Ride: cyan, Swim: mint, Row: lavender, Strength: gold, Other: amber };
 
 function emptyScheduleForm() {
   return {
@@ -1524,7 +1530,7 @@ function emptyScheduleForm() {
     zone: 2,
     durationMin: "45",
     daysOfWeek: [],
-    startDate: toISODate(new Date()),
+    startDate: toLocalISODate(new Date()),
     endDate: "",
     ongoing: true,
     notes: "",
@@ -1570,14 +1576,17 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
     cancelEdit();
   }
 
-  // Next 7 days, so the schedule's actual effect is visible before it shows up on the dashboard.
-  const upcoming = [];
-  for (let i = 0; i < 7; i++) {
-    const d = daysAgo(-i);
-    const key = toISODate(d);
-    const sessions = getScheduledSessionsForDate(schedule, key);
-    upcoming.push({ key, label: d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }), sessions });
+  // 3 full weeks starting from the most recent Sunday, so the schedule's actual
+  // effect is visible as a calendar before it shows up on the dashboard.
+  const calendarStart = daysAgo(new Date().getDay());
+  const calendarDays = [];
+  for (let i = 0; i < 21; i++) {
+    const d = new Date(calendarStart);
+    d.setDate(d.getDate() + i);
+    const key = toLocalISODate(d);
+    calendarDays.push({ key, date: d, sessions: getScheduledSessionsForDate(schedule, key) });
   }
+  const todayKey = toLocalISODate(new Date());
 
   return (
     <div style={{ display: "grid", gap: 20 }}>
@@ -1678,23 +1687,54 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
       )}
 
       <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Next 7 days</div>
-        <div style={{ display: "grid", gap: 6 }}>
-          {upcoming.map((u) => (
-            <div key={u.key} style={{ display: "flex", alignItems: "flex-start", gap: 12, fontSize: 12.5 }}>
-              <div style={{ width: 90, color: dim, flexShrink: 0, fontFamily: mono }}>{u.label}</div>
-              <div style={{ flex: 1 }}>
-                {u.sessions.length === 0
-                  ? <span style={{ color: dim }}>—</span>
-                  : u.sessions.map((s, i) => (
-                      <div key={i}>
-                        {s.activityType} · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
-                        {isPreloadWorthy(s) && <span style={{ color: amber, marginLeft: 6 }}>(pre-load day before)</span>}
-                      </div>
-                    ))}
-              </div>
-            </div>
+        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
+          <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
+        </div>
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 5 }}>
+          Next 3 weeks · <Icon path={ICONS.flame} size={10} color={amber} /> pre-loads the day before
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+          {WEEKDAY_LABELS.map((label) => (
+            <div key={label} style={{ fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 }}>{label}</div>
           ))}
+          {calendarDays.map((day) => {
+            const isToday = day.key === todayKey;
+            const isFirstOfMonth = day.date.getDate() === 1;
+            return (
+              <div key={day.key} style={{
+                background: panel2,
+                border: isToday ? `2px solid ${cyan}` : `1px solid ${line}`,
+                borderRadius: 5,
+                padding: 6,
+                minHeight: 76,
+                display: "flex",
+                flexDirection: "column",
+                gap: 3,
+              }}>
+                <div style={{ fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600 }}>
+                  {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
+                </div>
+                {day.sessions.map((s, i) => (
+                  <div key={i} title={`${s.activityType} · ${ZONES[s.zone - 1].label.split(" · ")[1]} · ${s.durationMin}min${s.notes ? ` · ${s.notes}` : ""}`}
+                    style={{
+                      background: ACTIVITY_COLORS[s.activityType] || dim,
+                      color: ink,
+                      borderRadius: 3,
+                      padding: "2px 5px",
+                      fontSize: 10.5,
+                      lineHeight: 1.3,
+                      fontWeight: 600,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 3,
+                    }}>
+                    {s.activityType} Z{s.zone} · {s.durationMin}m
+                    {isPreloadWorthy(s) && <Icon path={ICONS.flame} size={9} color={ink} />}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>

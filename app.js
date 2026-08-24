@@ -1,5 +1,5 @@
 (() => {
-  const { useState, useEffect, useMemo, useCallback } = React;
+  const { useState, useEffect, useMemo, useCallback, useRef } = React;
   const {
     ComposedChart,
     Bar,
@@ -9,7 +9,6 @@
     YAxis,
     CartesianGrid,
     Tooltip,
-    ResponsiveContainer,
     ReferenceLine
   } = Recharts;
   const Papa = window.Papa;
@@ -34,6 +33,9 @@
   }
   function toISODate(d) {
     return d.toISOString().slice(0, 10);
+  }
+  function toLocalISODate(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   }
   function parseFlexibleDate(raw) {
     if (raw === null || raw === void 0) return null;
@@ -153,6 +155,7 @@
   ];
   const ACTIVITY_TYPES = ["Run", "Ride", "Swim", "Row", "Strength", "Other"];
   const FORWARD_DAYS = 4;
+  const CHART_DAY_WIDTH = 70;
   function estimatePlannedKcal(zoneNum, durationMin, weightKg) {
     const z = ZONES[zoneNum - 1];
     if (!z || !weightKg) return 0;
@@ -1054,13 +1057,14 @@
     })));
   }
   const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const ACTIVITY_COLORS = { Run: coral, Ride: cyan, Swim: mint, Row: lavender, Strength: gold, Other: amber };
   function emptyScheduleForm() {
     return {
       activityType: "Run",
       zone: 2,
       durationMin: "45",
       daysOfWeek: [],
-      startDate: toISODate(/* @__PURE__ */ new Date()),
+      startDate: toLocalISODate(/* @__PURE__ */ new Date()),
       endDate: "",
       ongoing: true,
       notes: ""
@@ -1110,13 +1114,15 @@
       else onAdd(entry);
       cancelEdit();
     }
-    const upcoming = [];
-    for (let i = 0; i < 7; i++) {
-      const d = daysAgo(-i);
-      const key = toISODate(d);
-      const sessions = getScheduledSessionsForDate(schedule, key);
-      upcoming.push({ key, label: d.toLocaleDateString(void 0, { weekday: "short", month: "short", day: "numeric" }), sessions });
+    const calendarStart = daysAgo((/* @__PURE__ */ new Date()).getDay());
+    const calendarDays = [];
+    for (let i = 0; i < 21; i++) {
+      const d = new Date(calendarStart);
+      d.setDate(d.getDate() + i);
+      const key = toLocalISODate(d);
+      calendarDays.push({ key, date: d, sessions: getScheduledSessionsForDate(schedule, key) });
     }
+    const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
     return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " ", editingId ? "Edit scheduled session" : "Add a recurring session"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Repeats on the days you pick, within the date range. Projects up to ", FORWARD_DAYS, " days ahead on the dashboard as an estimate \u2014 once a real activity syncs in for that day, it takes over automatically."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Activity type" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: form.activityType, onChange: (e) => setForm((f) => ({ ...f, activityType: e.target.value })) }, ACTIVITY_TYPES.map((t) => /* @__PURE__ */ React.createElement("option", { key: t, value: t }, t)))), /* @__PURE__ */ React.createElement(Field, { label: "Duration (min)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "1", value: form.durationMin, onChange: (e) => setForm((f) => ({ ...f, durationMin: e.target.value })) }))), /* @__PURE__ */ React.createElement(Field, { label: "Intensity zone" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, ZONES.map((z) => /* @__PURE__ */ React.createElement(
       "button",
       {
@@ -1149,17 +1155,74 @@
       }
     )), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.ongoing, onChange: (e) => setForm((f) => ({ ...f, ongoing: e.target.checked })) }), "Ongoing")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Notes (optional)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: form.notes, onChange: (e) => setForm((f) => ({ ...f, notes: e.target.value })), placeholder: "e.g. track intervals" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 18 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSubmit }, editingId ? "Save changes" : "Add to schedule"), editingId && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: cancelEdit }, "Cancel"))), schedule.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 } }, "Recurring sessions"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8 } }, schedule.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, style: { display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", "), " \xB7 from ", s.startDate, s.endDate ? ` to ${s.endDate}` : " (ongoing)", s.notes ? ` \xB7 ${s.notes}` : "")), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
       if (confirm("Delete this scheduled session?")) onDelete(s.id);
-    }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 } }, "Next 7 days"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 6 } }, upcoming.map((u) => /* @__PURE__ */ React.createElement("div", { key: u.key, style: { display: "flex", alignItems: "flex-start", gap: 12, fontSize: 12.5 } }, /* @__PURE__ */ React.createElement("div", { style: { width: 90, color: dim, flexShrink: 0, fontFamily: mono } }, u.label), /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, u.sessions.length === 0 ? /* @__PURE__ */ React.createElement("span", { style: { color: dim } }, "\u2014") : u.sessions.map((s, i) => /* @__PURE__ */ React.createElement("div", { key: i }, s.activityType, " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", isPreloadWorthy(s) && /* @__PURE__ */ React.createElement("span", { style: { color: amber, marginLeft: 6 } }, "(pre-load day before)")))))))));
+    }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 5 } }, "Next 3 weeks \xB7 ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
+      const isToday = day.key === todayKey;
+      const isFirstOfMonth = day.date.getDate() === 1;
+      return /* @__PURE__ */ React.createElement("div", { key: day.key, style: {
+        background: panel2,
+        border: isToday ? `2px solid ${cyan}` : `1px solid ${line}`,
+        borderRadius: 5,
+        padding: 6,
+        minHeight: 76,
+        display: "flex",
+        flexDirection: "column",
+        gap: 3
+      } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate()), day.sessions.map((s, i) => /* @__PURE__ */ React.createElement(
+        "div",
+        {
+          key: i,
+          title: `${s.activityType} \xB7 ${ZONES[s.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${s.durationMin}min${s.notes ? ` \xB7 ${s.notes}` : ""}`,
+          style: {
+            background: ACTIVITY_COLORS[s.activityType] || dim,
+            color: ink,
+            borderRadius: 3,
+            padding: "2px 5px",
+            fontSize: 10.5,
+            lineHeight: 1.3,
+            fontWeight: 600,
+            display: "flex",
+            alignItems: "center",
+            gap: 3
+          }
+        },
+        s.activityType,
+        " Z",
+        s.zone,
+        " \xB7 ",
+        s.durationMin,
+        "m",
+        isPreloadWorthy(s) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink })
+      )));
+    }))));
   }
   function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg }) {
     const [visibleMacros, setVisibleMacros] = useState({ carbs: false, protein: false, fat: false });
     const [showFuelingRef, setShowFuelingRef] = useState(false);
     const [showInfoPopout, setShowInfoPopout] = useState(false);
+    const chartScrollRefs = useRef([]);
+    const registerChartScroll = useCallback((el) => {
+      if (el && !chartScrollRefs.current.includes(el)) chartScrollRefs.current.push(el);
+    }, []);
+    function syncChartScroll(e) {
+      const scrollLeft = e.currentTarget.scrollLeft;
+      chartScrollRefs.current.forEach((el) => {
+        if (el && el !== e.currentTarget && el.scrollLeft !== scrollLeft) el.scrollLeft = scrollLeft;
+      });
+    }
+    useEffect(() => {
+      const id = requestAnimationFrame(() => {
+        chartScrollRefs.current.forEach((el) => {
+          if (el) el.scrollLeft = el.scrollWidth - el.clientWidth;
+        });
+      });
+      return () => cancelAnimationFrame(id);
+    }, [rows.length]);
     if (!bmr) return /* @__PURE__ */ React.createElement(EmptyState, { icon: ICONS.settings, text: "Enter your weight, height, age and sex in Setup to calculate a baseline." });
     if (!rows.length || rows.every((r) => r.activityCount === 0 && r.intake === null)) {
       return /* @__PURE__ */ React.createElement(EmptyState, { icon: ICONS.activity, text: "Pull training data from intervals.icu and import a nutrition CSV to see your energy balance." });
     }
     const hasWeight = rows.some((r) => r.weight !== null);
+    const chartWidth = Math.max(rows.length * CHART_DAY_WIDTH, CHART_DAY_WIDTH * 7);
     const rowsWithTrend = rows.map((r, i) => {
       const window2 = rows.slice(Math.max(0, i - 6), i + 1).filter((x) => x.weight !== null);
       const trend = window2.length ? window2.reduce((s, x) => s + x.weight, 0) / window2.length : null;
@@ -1188,7 +1251,7 @@
         style: showFuelingRef ? { padding: "5px 11px", borderRadius: 20, fontWeight: 700, fontSize: 11.5, cursor: "pointer", border: "none", background: amber, color: ink } : { padding: "5px 11px", borderRadius: 20, fontWeight: 600, fontSize: 11.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }
       },
       "Fueling ref"
-    ))), /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 280 }, /* @__PURE__ */ React.createElement(ComposedChart, { data: rows, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "kcal", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), (visibleMacros.carbs || visibleMacros.protein || visibleMacros.fat) && /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "grams", orientation: "right", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false, label: { value: "grams", angle: 90, position: "insideRight", fill: dim, fontSize: 10 } }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { yAxisId: "kcal", dataKey: "demand", name: "Modeled TDEE (kcal)", fill: panel2, stroke: line, strokeWidth: 1, radius: [2, 2, 0, 0] }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "kcal", type: "monotone", dataKey: "target", name: "Target (kcal)", stroke: cyan, strokeWidth: 2, dot: false, strokeDasharray: goalParams.sign !== 0 ? "5 3" : void 0, connectNulls: true }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "kcal", type: "monotone", dataKey: "intake", name: "Intake (kcal)", stroke: amber, strokeWidth: 2.2, dot: { r: 2.5, fill: amber }, connectNulls: true }), visibleMacros.carbs && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "carbs", name: "Carbs actual (g)", stroke: mint, strokeWidth: 2, dot: { r: 2, fill: mint }, connectNulls: true }), visibleMacros.carbs && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "carbTargetG", name: "Carbs target (g)", stroke: mint, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }), visibleMacros.protein && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "protein", name: "Protein actual (g)", stroke: lavender, strokeWidth: 2, dot: { r: 2, fill: lavender }, connectNulls: true }), visibleMacros.protein && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "proteinTargetG", name: "Protein target (g)", stroke: lavender, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }), visibleMacros.fat && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "fat", name: "Fat actual (g)", stroke: gold, strokeWidth: 2, dot: { r: 2, fill: gold }, connectNulls: true }), visibleMacros.fat && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "fatTargetG", name: "Fat target (g)", stroke: gold, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }))), showFuelingRef && /* @__PURE__ */ React.createElement(FuelingReferencePanel, { fuelingByTier })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 8px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" } }, "Daily gap (intake \u2212 target)"), /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 200 }, /* @__PURE__ */ React.createElement(ComposedChart, { data: rows, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), /* @__PURE__ */ React.createElement(ReferenceLine, { y: 0, stroke: dim }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "gap", name: "Gap (kcal)", radius: [2, 2, 2, 2] }, rows.map((r, i) => /* @__PURE__ */ React.createElement(Cell, { key: i, fill: r.gap === null ? line : r.gap < -200 ? coral : r.gap > 200 ? amber : mint })))))), hasWeight && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 8px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" } }, "Body weight"), /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 200 }, /* @__PURE__ */ React.createElement(ComposedChart, { data: rowsWithTrend, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false, domain: ["dataMin - 1", "dataMax + 1"] }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Line, { type: "monotone", dataKey: "weight", name: "Weight (kg)", stroke: dim, strokeWidth: 1, dot: { r: 2.5, fill: dim }, connectNulls: false }), /* @__PURE__ */ React.createElement(Line, { type: "monotone", dataKey: "weightTrend", name: "7-day avg (kg)", stroke: cyan, strokeWidth: 2.2, dot: false, connectNulls: true })))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 20, overflowX: "auto" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12 } }, "Daily breakdown"), /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Date"), /* @__PURE__ */ React.createElement("th", null, "Data"), /* @__PURE__ */ React.createElement("th", null, "Weight"), /* @__PURE__ */ React.createElement("th", null, "BMR"), /* @__PURE__ */ React.createElement("th", null, "Baseline"), /* @__PURE__ */ React.createElement("th", null, "Training"), /* @__PURE__ */ React.createElement("th", null, "EPOC"), /* @__PURE__ */ React.createElement("th", null, "Fatigue+"), /* @__PURE__ */ React.createElement("th", null, "Demand"), /* @__PURE__ */ React.createElement("th", null, "Target"), /* @__PURE__ */ React.createElement("th", null, "Intake"), /* @__PURE__ */ React.createElement("th", null, "Gap"), /* @__PURE__ */ React.createElement("th", null, "TSB"), /* @__PURE__ */ React.createElement("th", null, "Carbs (g)"), /* @__PURE__ */ React.createElement("th", null, "Protein (g)"), /* @__PURE__ */ React.createElement("th", null, "Fat (g)"))), /* @__PURE__ */ React.createElement("tbody", null, rows.slice().reverse().map((r) => {
+    ))), /* @__PURE__ */ React.createElement("div", { ref: registerChartScroll, onScroll: syncChartScroll, style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width: chartWidth, height: 280, data: rows, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "kcal", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), (visibleMacros.carbs || visibleMacros.protein || visibleMacros.fat) && /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "grams", orientation: "right", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false, label: { value: "grams", angle: 90, position: "insideRight", fill: dim, fontSize: 10 } }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { yAxisId: "kcal", dataKey: "demand", name: "Modeled TDEE (kcal)", fill: panel2, stroke: line, strokeWidth: 1, radius: [2, 2, 0, 0] }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "kcal", type: "monotone", dataKey: "target", name: "Target (kcal)", stroke: cyan, strokeWidth: 2, dot: false, strokeDasharray: goalParams.sign !== 0 ? "5 3" : void 0, connectNulls: true }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "kcal", type: "monotone", dataKey: "intake", name: "Intake (kcal)", stroke: amber, strokeWidth: 2.2, dot: { r: 2.5, fill: amber }, connectNulls: true }), visibleMacros.carbs && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "carbs", name: "Carbs actual (g)", stroke: mint, strokeWidth: 2, dot: { r: 2, fill: mint }, connectNulls: true }), visibleMacros.carbs && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "carbTargetG", name: "Carbs target (g)", stroke: mint, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }), visibleMacros.protein && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "protein", name: "Protein actual (g)", stroke: lavender, strokeWidth: 2, dot: { r: 2, fill: lavender }, connectNulls: true }), visibleMacros.protein && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "proteinTargetG", name: "Protein target (g)", stroke: lavender, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }), visibleMacros.fat && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "fat", name: "Fat actual (g)", stroke: gold, strokeWidth: 2, dot: { r: 2, fill: gold }, connectNulls: true }), visibleMacros.fat && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "fatTargetG", name: "Fat target (g)", stroke: gold, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }))), showFuelingRef && /* @__PURE__ */ React.createElement(FuelingReferencePanel, { fuelingByTier })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 8px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" } }, "Daily gap (intake \u2212 target)"), /* @__PURE__ */ React.createElement("div", { ref: registerChartScroll, onScroll: syncChartScroll, style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width: chartWidth, height: 200, data: rows, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), /* @__PURE__ */ React.createElement(ReferenceLine, { y: 0, stroke: dim }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "gap", name: "Gap (kcal)", radius: [2, 2, 2, 2] }, rows.map((r, i) => /* @__PURE__ */ React.createElement(Cell, { key: i, fill: r.gap === null ? line : r.gap < -200 ? coral : r.gap > 200 ? amber : mint })))))), hasWeight && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 8px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" } }, "Body weight"), /* @__PURE__ */ React.createElement("div", { ref: registerChartScroll, onScroll: syncChartScroll, style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width: chartWidth, height: 200, data: rowsWithTrend, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false, domain: ["dataMin - 1", "dataMax + 1"] }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Line, { type: "monotone", dataKey: "weight", name: "Weight (kg)", stroke: dim, strokeWidth: 1, dot: { r: 2.5, fill: dim }, connectNulls: false }), /* @__PURE__ */ React.createElement(Line, { type: "monotone", dataKey: "weightTrend", name: "7-day avg (kg)", stroke: cyan, strokeWidth: 2.2, dot: false, connectNulls: true })))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 20, overflowX: "auto" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12 } }, "Daily breakdown"), /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Date"), /* @__PURE__ */ React.createElement("th", null, "Data"), /* @__PURE__ */ React.createElement("th", null, "Weight"), /* @__PURE__ */ React.createElement("th", null, "BMR"), /* @__PURE__ */ React.createElement("th", null, "Baseline"), /* @__PURE__ */ React.createElement("th", null, "Training"), /* @__PURE__ */ React.createElement("th", null, "EPOC"), /* @__PURE__ */ React.createElement("th", null, "Fatigue+"), /* @__PURE__ */ React.createElement("th", null, "Demand"), /* @__PURE__ */ React.createElement("th", null, "Target"), /* @__PURE__ */ React.createElement("th", null, "Intake"), /* @__PURE__ */ React.createElement("th", null, "Gap"), /* @__PURE__ */ React.createElement("th", null, "TSB"), /* @__PURE__ */ React.createElement("th", null, "Carbs (g)"), /* @__PURE__ */ React.createElement("th", null, "Protein (g)"), /* @__PURE__ */ React.createElement("th", null, "Fat (g)"))), /* @__PURE__ */ React.createElement("tbody", null, rows.slice().reverse().map((r) => {
       var _a;
       return /* @__PURE__ */ React.createElement("tr", { key: r.date }, /* @__PURE__ */ React.createElement("td", null, r.label), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left" } }, /* @__PURE__ */ React.createElement("span", { style: { display: "inline-flex", gap: 5 } }, /* @__PURE__ */ React.createElement(
         "span",

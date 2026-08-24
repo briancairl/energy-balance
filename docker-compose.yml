@@ -1,0 +1,13 @@
+services:
+  energy-balance:
+    build: .
+    ports:
+      - "8081:8081"
+      - "8082:8082"
+    # Mounts the whole project dir into the container so server.py reads/writes
+    # config.json, tokens.json, *cache.json, app_store.json, etc. straight from
+    # the host — they persist across container rebuilds and stay in one place
+    # whether you're editing app-source.jsx or just running the server.
+    volumes:
+      - .:/app
+    restart: unless-stopped

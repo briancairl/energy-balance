@@ -1,4 +1,5 @@
 config.json
+app_store.json
 *tokens.json
 *cache.json
 *.key

@@ -121,6 +121,18 @@ function activityKcal(act) {
   }
   return 0;
 }
+// Same source-priority computation dailyRows uses per activity (Strava's own
+// `calories`/`kilojoules`, or intervals.icu's `calories`/`icu_joules`), with
+// no manual-override fallback — this is specifically "what would we compute
+// with no help," used both to build exerciseKcal and to detect which
+// activities have nothing usable and so need a manual entry.
+function syncedActivityKcal(act, isStrava) {
+  if (isStrava) {
+    if (typeof act.calories === "number" && act.calories > 0) return act.calories;
+    return typeof act.kilojoules === "number" ? act.kilojoules / 4.184 / 0.24 : 0;
+  }
+  return activityKcal(act);
+}
 function intensityFactor(act) {
   if (typeof act.icu_intensity === "number") return act.icu_intensity;
   if (typeof act.icu_training_load === "number" && act.moving_time) {
@@ -309,6 +321,7 @@ function App() {
   const [nutrition, setNutrition] = useState({});
   const [weightLog, setWeightLog] = useState({}); // { 'YYYY-MM-DD': kg }
   const [schedule, setSchedule] = useState([]); // [{ id, activityType, zone, durationMin, daysOfWeek, startDate, endDate, notes }]
+  const [calorieOverrides, setCalorieOverrides] = useState({}); // { activityId: kcal } — manual fallback, only used when Strava/intervals supply no calorie value at all
   const [csvPreview, setCsvPreview] = useState(null);
   const [csvPreviewSource, setCsvPreviewSource] = useState(null); // 'csv' | 'sheet'
   const [colMap, setColMap] = useState({ date: "", calories: "", protein: "", carbs: "", fat: "" });
@@ -332,7 +345,7 @@ function App() {
 
   useEffect(() => {
     (async () => {
-      const [p, n, w, sched, cached, stravaCached, gLastSync] = await Promise.all([
+      const [p, n, w, sched, cached, stravaCached, gLastSync, calOverrides] = await Promise.all([
         storageGet("profile", null),
         storageGet("nutrition-log", {}),
         storageGet("weight-log", {}),
@@ -340,11 +353,13 @@ function App() {
         storageGet("intervals-cache", null),
         storageGet("strava-cache", null),
         storageGet("google-last-auto-sync", null),
+        storageGet("activity-calorie-overrides", {}),
       ]);
       setNutrition(n);
       setWeightLog(w);
       setSchedule(sched);
       setGoogleLastAutoSync(gLastSync);
+      setCalorieOverrides(calOverrides);
 
       // Weight always reflects the most recent logged entry, so a fresh
       // session (new device, or a restart with no profile saved yet) starts
@@ -408,6 +423,19 @@ function App() {
   }
   function deleteScheduleEntry(id) {
     saveSchedule(schedule.filter((s) => s.id !== id));
+  }
+
+  const saveCalorieOverrides = useCallback((next) => {
+    setCalorieOverrides(next);
+    storageSet("activity-calorie-overrides", next);
+  }, []);
+  function saveActivityCalories(activityId, kcal) {
+    saveCalorieOverrides({ ...calorieOverrides, [activityId]: kcal });
+  }
+  function deleteActivityCalories(activityId) {
+    const next = { ...calorieOverrides };
+    delete next[activityId];
+    saveCalorieOverrides(next);
   }
 
   const bmr = useMemo(
@@ -668,9 +696,8 @@ function App() {
       if (stravaActs.length) {
         source = "strava";
         for (const a of stravaActs) {
-          const kcal = (typeof a.calories === "number" && a.calories > 0)
-            ? a.calories
-            : (typeof a.kilojoules === "number" ? a.kilojoules / 4.184 / 0.24 : 0);
+          const synced = syncedActivityKcal(a, true);
+          const kcal = synced > 0 ? synced : (calorieOverrides[String(a.id)] || 0);
           exerciseKcal += kcal;
           const IF = stravaIntensityFactor(a);
           epocKcal += kcal * epocFactorFor(IF) * profile.epocSensitivity;
@@ -680,7 +707,8 @@ function App() {
       } else if (intervalsActs.length) {
         source = "intervals";
         for (const a of intervalsActs) {
-          const kcal = activityKcal(a);
+          const synced = syncedActivityKcal(a, false);
+          const kcal = synced > 0 ? synced : (calorieOverrides[String(a.id)] || 0);
           exerciseKcal += kcal;
           const IF = intensityFactor(a);
           epocKcal += kcal * epocFactorFor(IF) * profile.epocSensitivity;
@@ -791,8 +819,71 @@ function App() {
       });
     }
     return days;
-  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection]);
+  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, calorieOverrides]);
 
+  // Activities with no calorie value from either source, so `dailyRows`
+  // above silently fell back to a manual override (or, if none is on file
+  // yet, folded a 0 into that day's exerciseKcal). Uses the same per-day
+  // source priority as dailyRows — Strava's activities for a date fully
+  // supersede intervals.icu's for that date — so this list matches exactly
+  // what dailyRows actually counted, never a stray intervals.icu activity
+  // that Strava already covers for the same day.
+  const activitiesNeedingCalories = useMemo(() => {
+    const stravaByDate = {};
+    for (const a of stravaData.activities) {
+      const d = (a.start_date_local || "").slice(0, 10);
+      if (!d) continue;
+      if (!stravaByDate[d]) stravaByDate[d] = [];
+      stravaByDate[d].push(a);
+    }
+    const intervalsByDate = {};
+    for (const a of intervalsData.activities) {
+      const d = (a.start_date_local || a.start_date || "").slice(0, 10);
+      if (!d) continue;
+      if (!intervalsByDate[d]) intervalsByDate[d] = [];
+      intervalsByDate[d].push(a);
+    }
+    const dates = new Set([...Object.keys(stravaByDate), ...Object.keys(intervalsByDate)]);
+    const out = [];
+    for (const d of dates) {
+      const acts = stravaByDate[d]
+        ? stravaByDate[d].map((a) => ({ act: a, isStrava: true }))
+        : (intervalsByDate[d] || []).map((a) => ({ act: a, isStrava: false }));
+      for (const { act, isStrava } of acts) {
+        if (act.id === undefined || act.id === null) continue;
+        const id = String(act.id);
+        if (syncedActivityKcal(act, isStrava) > 0) continue;
+        if (calorieOverrides[id] !== undefined) continue;
+        out.push({
+          id, date: d, isStrava,
+          source: isStrava ? "strava" : "intervals",
+          name: act.name || "(unnamed activity)",
+          type: act.type || act.icu_type || null,
+          durationMin: act.moving_time ? act.moving_time / 60 : null,
+        });
+      }
+    }
+    return out.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  }, [stravaData, intervalsData, calorieOverrides]);
+
+  // Same activity id -> {date, name, source} lookup, but unfiltered — used to
+  // label existing overrides (including ones for an activity that's since
+  // been re-synced with real data, so the override table can still show what
+  // it applies to).
+  const activityLabelsById = useMemo(() => {
+    const map = {};
+    for (const a of stravaData.activities) {
+      if (a.id === undefined || a.id === null) continue;
+      map[String(a.id)] = { date: (a.start_date_local || "").slice(0, 10), name: a.name || "(unnamed activity)", source: "strava" };
+    }
+    for (const a of intervalsData.activities) {
+      if (a.id === undefined || a.id === null) continue;
+      const id = String(a.id);
+      if (map[id]) continue; // Strava takes priority, same as everywhere else
+      map[id] = { date: (a.start_date_local || a.start_date || "").slice(0, 10), name: a.name || "(unnamed activity)", source: "intervals" };
+    }
+    return map;
+  }, [stravaData, intervalsData]);
 
   const summary = useMemo(() => {
     const withIntake = dailyRows.filter((d) => d.intake !== null);
@@ -895,7 +986,10 @@ function App() {
             onImport={importMappedCSV} nutrition={nutrition} onSaveManualDay={saveManualDay}
             onDeleteDay={deleteNutritionDay} weightLog={weightLog} onSaveWeight={saveManualWeight}
             onDeleteWeight={deleteWeightDay} googleStatus={googleStatus} googleFetching={googleFetching}
-            googleError={googleError} onSyncGoogleSheet={syncGoogleSheet} googleLastAutoSync={googleLastAutoSync} />
+            googleError={googleError} onSyncGoogleSheet={syncGoogleSheet} googleLastAutoSync={googleLastAutoSync}
+            activitiesNeedingCalories={activitiesNeedingCalories} calorieOverrides={calorieOverrides}
+            activityLabelsById={activityLabelsById} onSaveActivityCalories={saveActivityCalories}
+            onDeleteActivityCalories={deleteActivityCalories} />
         )}
         {tab === "schedule" && (
           <ScheduleTab schedule={schedule} onAdd={addScheduleEntry} onUpdate={updateScheduleEntry}
@@ -1127,12 +1221,14 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection }) {
   );
 }
 
-function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync }) {
+function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, activitiesNeedingCalories, calorieOverrides, activityLabelsById, onSaveActivityCalories, onDeleteActivityCalories }) {
   const [dragOver, setDragOver] = useState(false);
   const dayCount = Object.keys(nutrition).length;
   const weightCount = Object.keys(weightLog).length;
   return (
     <div style={{ display: "grid", gap: 20 }}>
+      <ActivityCalorieCard activitiesNeedingCalories={activitiesNeedingCalories} calorieOverrides={calorieOverrides}
+        activityLabelsById={activityLabelsById} onSave={onSaveActivityCalories} onDelete={onDeleteActivityCalories} />
       <ManualEntryCard nutrition={nutrition} onSave={onSaveManualDay} />
       <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} />
 
@@ -1243,6 +1339,88 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
 
 function macroCalories(protein, carbs, fat) {
   return protein * 4 + carbs * 4 + fat * 9;
+}
+
+// Strava has no `calories` for activity types it can't estimate power/HR
+// energy for (e.g. weight training, some walks), and neither does
+// intervals.icu when an activity has no power meter data. Rather than
+// silently treating that session as a zero-calorie non-event, this panel
+// surfaces exactly the activities where both sources came up empty and lets
+// the athlete fill in a number by hand — nothing else, so a normal ride with
+// real Strava calories never shows up here.
+function ActivityCalorieCard({ activitiesNeedingCalories, calorieOverrides, activityLabelsById, onSave, onDelete }) {
+  const overrideIds = Object.keys(calorieOverrides);
+  return (
+    <div className="card" style={{ padding: 22 }}>
+      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
+        <Icon path={ICONS.flame} size={16} color={cyan} /> Manual calories for unsynced activities
+      </div>
+      <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+        Only listed here when neither Strava nor intervals.icu supplied a calorie value for the
+        activity (e.g. weight training, or anything logged without a power meter/HR strap). Once
+        saved, the value feeds into that day's exercise kcal like any synced figure.
+      </div>
+      {activitiesNeedingCalories.length === 0 ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: mint }}>
+          <Icon path={ICONS.check} size={14} color={mint} /> Every synced activity already has a calorie value.
+        </div>
+      ) : (
+        <table className="data">
+          <thead>
+            <tr><th>Date</th><th>Activity</th><th>Source</th><th>Duration</th><th>Calories</th><th></th></tr>
+          </thead>
+          <tbody>
+            {activitiesNeedingCalories.map((item) => (
+              <ActivityCalorieRow key={item.id} item={item} onSave={onSave} />
+            ))}
+          </tbody>
+        </table>
+      )}
+      {overrideIds.length > 0 && (
+        <div style={{ marginTop: 20 }}>
+          <div style={{ fontSize: 12.5, color: dim, marginBottom: 10 }}>{overrideIds.length} manual override{overrideIds.length === 1 ? "" : "s"} on file:</div>
+          <table className="data">
+            <thead>
+              <tr><th>Date</th><th>Activity</th><th>Calories</th><th></th></tr>
+            </thead>
+            <tbody>
+              {overrideIds.map((id) => {
+                const label = activityLabelsById[id];
+                return (
+                  <tr key={id}>
+                    <td>{label?.date || "—"}</td>
+                    <td>{label?.name || `Activity ${id}`}</td>
+                    <td style={{ color: amber }}>{fmt(calorieOverrides[id])}</td>
+                    <td style={{ textAlign: "left", whiteSpace: "nowrap" }}>
+                      <button title="Delete" onClick={() => { if (confirm(`Remove the manual calorie value for ${label?.name || id}?`)) onDelete(id); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ActivityCalorieRow({ item, onSave }) {
+  const [value, setValue] = useState("");
+  const kcal = parseFloat(value);
+  const valid = !Number.isNaN(kcal) && kcal > 0;
+  return (
+    <tr>
+      <td>{item.date}</td>
+      <td>{item.name}{item.type ? <span style={{ color: dim }}> · {item.type}</span> : null}</td>
+      <td style={{ textTransform: "capitalize" }}>{item.source}</td>
+      <td>{item.durationMin ? `${fmt(item.durationMin)} min` : "—"}</td>
+      <td><input className="inp" style={{ padding: "4px 6px", width: 90, textAlign: "right" }} type="number" min="0" step="1" value={value} placeholder="kcal" onChange={(e) => setValue(e.target.value)} /></td>
+      <td style={{ textAlign: "left", whiteSpace: "nowrap" }}>
+        <button className="btn-ghost" style={{ padding: "4px 10px" }} disabled={!valid} onClick={() => onSave(item.id, kcal)}>Save</button>
+      </td>
+    </tr>
+  );
 }
 
 function ManualEntryCard({ nutrition, onSave }) {

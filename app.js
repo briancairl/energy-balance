@@ -110,6 +110,13 @@
     }
     return 0;
   }
+  function syncedActivityKcal(act, isStrava) {
+    if (isStrava) {
+      if (typeof act.calories === "number" && act.calories > 0) return act.calories;
+      return typeof act.kilojoules === "number" ? act.kilojoules / 4.184 / 0.24 : 0;
+    }
+    return activityKcal(act);
+  }
   function intensityFactor(act) {
     if (typeof act.icu_intensity === "number") return act.icu_intensity;
     if (typeof act.icu_training_load === "number" && act.moving_time) {
@@ -260,6 +267,7 @@
     const [nutrition, setNutrition] = useState({});
     const [weightLog, setWeightLog] = useState({});
     const [schedule, setSchedule] = useState([]);
+    const [calorieOverrides, setCalorieOverrides] = useState({});
     const [csvPreview, setCsvPreview] = useState(null);
     const [csvPreviewSource, setCsvPreviewSource] = useState(null);
     const [colMap, setColMap] = useState({ date: "", calories: "", protein: "", carbs: "", fat: "" });
@@ -280,19 +288,21 @@
     const [googleError, setGoogleError] = useState(null);
     useEffect(() => {
       (async () => {
-        const [p, n, w, sched, cached, stravaCached, gLastSync] = await Promise.all([
+        const [p, n, w, sched, cached, stravaCached, gLastSync, calOverrides] = await Promise.all([
           storageGet("profile", null),
           storageGet("nutrition-log", {}),
           storageGet("weight-log", {}),
           storageGet("training-schedule", []),
           storageGet("intervals-cache", null),
           storageGet("strava-cache", null),
-          storageGet("google-last-auto-sync", null)
+          storageGet("google-last-auto-sync", null),
+          storageGet("activity-calorie-overrides", {})
         ]);
         setNutrition(n);
         setWeightLog(w);
         setSchedule(sched);
         setGoogleLastAutoSync(gLastSync);
+        setCalorieOverrides(calOverrides);
         const latestWeightDate = Object.keys(w).sort().pop();
         const merged = { ...p || {} };
         if (latestWeightDate) merged.weightKg = String(w[latestWeightDate]);
@@ -344,6 +354,18 @@
     }
     function deleteScheduleEntry(id) {
       saveSchedule(schedule.filter((s) => s.id !== id));
+    }
+    const saveCalorieOverrides = useCallback((next) => {
+      setCalorieOverrides(next);
+      storageSet("activity-calorie-overrides", next);
+    }, []);
+    function saveActivityCalories(activityId, kcal) {
+      saveCalorieOverrides({ ...calorieOverrides, [activityId]: kcal });
+    }
+    function deleteActivityCalories(activityId) {
+      const next = { ...calorieOverrides };
+      delete next[activityId];
+      saveCalorieOverrides(next);
     }
     const bmr = useMemo(
       () => calcBMR(profile.sex, parseFloat(profile.weightKg), parseFloat(profile.heightCm), parseFloat(profile.age)),
@@ -572,7 +594,8 @@
         if (stravaActs.length) {
           source = "strava";
           for (const a of stravaActs) {
-            const kcal = typeof a.calories === "number" && a.calories > 0 ? a.calories : typeof a.kilojoules === "number" ? a.kilojoules / 4.184 / 0.24 : 0;
+            const synced = syncedActivityKcal(a, true);
+            const kcal = synced > 0 ? synced : calorieOverrides[String(a.id)] || 0;
             exerciseKcal += kcal;
             const IF = stravaIntensityFactor(a);
             epocKcal += kcal * epocFactorFor(IF) * profile.epocSensitivity;
@@ -582,7 +605,8 @@
         } else if (intervalsActs.length) {
           source = "intervals";
           for (const a of intervalsActs) {
-            const kcal = activityKcal(a);
+            const synced = syncedActivityKcal(a, false);
+            const kcal = synced > 0 ? synced : calorieOverrides[String(a.id)] || 0;
             exerciseKcal += kcal;
             const IF = intensityFactor(a);
             epocKcal += kcal * epocFactorFor(IF) * profile.epocSensitivity;
@@ -680,7 +704,58 @@
         });
       }
       return days;
-    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection]);
+    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, calorieOverrides]);
+    const activitiesNeedingCalories = useMemo(() => {
+      const stravaByDate = {};
+      for (const a of stravaData.activities) {
+        const d = (a.start_date_local || "").slice(0, 10);
+        if (!d) continue;
+        if (!stravaByDate[d]) stravaByDate[d] = [];
+        stravaByDate[d].push(a);
+      }
+      const intervalsByDate = {};
+      for (const a of intervalsData.activities) {
+        const d = (a.start_date_local || a.start_date || "").slice(0, 10);
+        if (!d) continue;
+        if (!intervalsByDate[d]) intervalsByDate[d] = [];
+        intervalsByDate[d].push(a);
+      }
+      const dates = /* @__PURE__ */ new Set([...Object.keys(stravaByDate), ...Object.keys(intervalsByDate)]);
+      const out = [];
+      for (const d of dates) {
+        const acts = stravaByDate[d] ? stravaByDate[d].map((a) => ({ act: a, isStrava: true })) : (intervalsByDate[d] || []).map((a) => ({ act: a, isStrava: false }));
+        for (const { act, isStrava } of acts) {
+          if (act.id === void 0 || act.id === null) continue;
+          const id = String(act.id);
+          if (syncedActivityKcal(act, isStrava) > 0) continue;
+          if (calorieOverrides[id] !== void 0) continue;
+          out.push({
+            id,
+            date: d,
+            isStrava,
+            source: isStrava ? "strava" : "intervals",
+            name: act.name || "(unnamed activity)",
+            type: act.type || act.icu_type || null,
+            durationMin: act.moving_time ? act.moving_time / 60 : null
+          });
+        }
+      }
+      return out.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : 0);
+    }, [stravaData, intervalsData, calorieOverrides]);
+    const activityLabelsById = useMemo(() => {
+      const map = {};
+      for (const a of stravaData.activities) {
+        if (a.id === void 0 || a.id === null) continue;
+        map[String(a.id)] = { date: (a.start_date_local || "").slice(0, 10), name: a.name || "(unnamed activity)", source: "strava" };
+      }
+      for (const a of intervalsData.activities) {
+        if (a.id === void 0 || a.id === null) continue;
+        const id = String(a.id);
+        if (map[id]) continue;
+        map[id] = { date: (a.start_date_local || a.start_date || "").slice(0, 10), name: a.name || "(unnamed activity)", source: "intervals" };
+      }
+      return map;
+    }, [stravaData, intervalsData]);
     const summary = useMemo(() => {
       const withIntake = dailyRows.filter((d) => d.intake !== null);
       const trainingMissingDays = dailyRows.filter((d) => d.trainingMissing).length;
@@ -789,7 +864,12 @@
         googleFetching,
         googleError,
         onSyncGoogleSheet: syncGoogleSheet,
-        googleLastAutoSync
+        googleLastAutoSync,
+        activitiesNeedingCalories,
+        calorieOverrides,
+        activityLabelsById,
+        onSaveActivityCalories: saveActivityCalories,
+        onDeleteActivityCalories: deleteActivityCalories
       }
     ), tab === "schedule" && /* @__PURE__ */ React.createElement(
       ScheduleTab,
@@ -891,11 +971,20 @@
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Safe range ", range.min, "\u2013", range.max, "%/week. Faster ", profile.goal === "build" ? "gains skew toward fat" : "loss risks muscle and performance", ".")), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.trendCalibration, onChange: (e) => setProfile((p) => ({ ...p, trendCalibration: e.target.checked })) }), "Auto-calibrate the target from your logged weight trend"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 6, marginLeft: 24, lineHeight: 1.5 } }, "Compares your actual weight trend (needs ~10+ days logged) against the ", goalParams.label.toLowerCase(), " rate above, and nudges the daily target toward what your real data says you need \u2014 rather than trusting the formula alone."), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries logged so far, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(trendCorrection.actualWeeklyRateKg, 2)} kg/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(trendCorrection.targetWeeklyRateKg, 2)} kg/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`));
   }
-  function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync }) {
+  function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, activitiesNeedingCalories, calorieOverrides, activityLabelsById, onSaveActivityCalories, onDeleteActivityCalories }) {
     const [dragOver, setDragOver] = useState(false);
     const dayCount = Object.keys(nutrition).length;
     const weightCount = Object.keys(weightLog).length;
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20 } }, /* @__PURE__ */ React.createElement(ManualEntryCard, { nutrition, onSave: onSaveManualDay }), /* @__PURE__ */ React.createElement(WeightEntryCard, { weightLog, onSave: onSaveWeight }), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " MacrosFirst via Google Sheets"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst's own API is partner-gated, but its Premium Google Sheets Importer already writes your daily log to a Sheet you own \u2014 this connects to that Sheet directly, through", /* @__PURE__ */ React.createElement("code", null, " server.py"), ", the same pattern as Strava. See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup."), !googleStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : googleStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : googleStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "google_client_id"), ", ", /* @__PURE__ */ React.createElement("code", null, "google_client_secret"), ", and ", /* @__PURE__ */ React.createElement("code", null, "google_sheet_id"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server.") : googleStatus.connected ? /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected")), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: onSyncGoogleSheet, disabled: googleFetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), " ", googleFetching ? "Syncing\u2026" : "Sync from Google Sheet")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, googleLastAutoSync ? `Last automatic sync: ${new Date(googleLastAutoSync).toLocaleString()}` : "No automatic sync yet \u2014 runs daily once you've imported at least once (set google_sync_time in config.json, default 04:00).")) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? /* @__PURE__ */ React.createElement("a", { className: "btn-primary", href: "/google/login", style: { textDecoration: "none", width: "fit-content", display: "inline-flex" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 13, color: ink }), " Connect Google Sheets") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, "Connect from ", /* @__PURE__ */ React.createElement("code", null, "http://localhost:", window.location.port, "/"), " on the computer running ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " \u2014 Google's OAuth callback only works there. Every device on this network shares that connection automatically once it's made."), googleError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: coral }), /* @__PURE__ */ React.createElement("span", null, googleError))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Or import a CSV manually"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst Premium \u2192 Download Food Log (Excel), or export any spreadsheet as CSV. Drop the file here and map its columns below."), /* @__PURE__ */ React.createElement(
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20 } }, /* @__PURE__ */ React.createElement(
+      ActivityCalorieCard,
+      {
+        activitiesNeedingCalories,
+        calorieOverrides,
+        activityLabelsById,
+        onSave: onSaveActivityCalories,
+        onDelete: onDeleteActivityCalories
+      }
+    ), /* @__PURE__ */ React.createElement(ManualEntryCard, { nutrition, onSave: onSaveManualDay }), /* @__PURE__ */ React.createElement(WeightEntryCard, { weightLog, onSave: onSaveWeight }), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " MacrosFirst via Google Sheets"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst's own API is partner-gated, but its Premium Google Sheets Importer already writes your daily log to a Sheet you own \u2014 this connects to that Sheet directly, through", /* @__PURE__ */ React.createElement("code", null, " server.py"), ", the same pattern as Strava. See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup."), !googleStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : googleStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : googleStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "google_client_id"), ", ", /* @__PURE__ */ React.createElement("code", null, "google_client_secret"), ", and ", /* @__PURE__ */ React.createElement("code", null, "google_sheet_id"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server.") : googleStatus.connected ? /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected")), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: onSyncGoogleSheet, disabled: googleFetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), " ", googleFetching ? "Syncing\u2026" : "Sync from Google Sheet")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, googleLastAutoSync ? `Last automatic sync: ${new Date(googleLastAutoSync).toLocaleString()}` : "No automatic sync yet \u2014 runs daily once you've imported at least once (set google_sync_time in config.json, default 04:00).")) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? /* @__PURE__ */ React.createElement("a", { className: "btn-primary", href: "/google/login", style: { textDecoration: "none", width: "fit-content", display: "inline-flex" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 13, color: ink }), " Connect Google Sheets") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, "Connect from ", /* @__PURE__ */ React.createElement("code", null, "http://localhost:", window.location.port, "/"), " on the computer running ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " \u2014 Google's OAuth callback only works there. Every device on this network shares that connection automatically once it's made."), googleError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: coral }), /* @__PURE__ */ React.createElement("span", null, googleError))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Or import a CSV manually"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst Premium \u2192 Download Food Log (Excel), or export any spreadsheet as CSV. Drop the file here and map its columns below."), /* @__PURE__ */ React.createElement(
       "div",
       {
         onDragOver: (e) => {
@@ -924,6 +1013,21 @@
   }
   function macroCalories(protein, carbs, fat) {
     return protein * 4 + carbs * 4 + fat * 9;
+  }
+  function ActivityCalorieCard({ activitiesNeedingCalories, calorieOverrides, activityLabelsById, onSave, onDelete }) {
+    const overrideIds = Object.keys(calorieOverrides);
+    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 16, color: cyan }), " Manual calories for unsynced activities"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Only listed here when neither Strava nor intervals.icu supplied a calorie value for the activity (e.g. weight training, or anything logged without a power meter/HR strap). Once saved, the value feeds into that day's exercise kcal like any synced figure."), activitiesNeedingCalories.length === 0 ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: mint } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 14, color: mint }), " Every synced activity already has a calorie value.") : /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Date"), /* @__PURE__ */ React.createElement("th", null, "Activity"), /* @__PURE__ */ React.createElement("th", null, "Source"), /* @__PURE__ */ React.createElement("th", null, "Duration"), /* @__PURE__ */ React.createElement("th", null, "Calories"), /* @__PURE__ */ React.createElement("th", null))), /* @__PURE__ */ React.createElement("tbody", null, activitiesNeedingCalories.map((item) => /* @__PURE__ */ React.createElement(ActivityCalorieRow, { key: item.id, item, onSave })))), overrideIds.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 20 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 10 } }, overrideIds.length, " manual override", overrideIds.length === 1 ? "" : "s", " on file:"), /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Date"), /* @__PURE__ */ React.createElement("th", null, "Activity"), /* @__PURE__ */ React.createElement("th", null, "Calories"), /* @__PURE__ */ React.createElement("th", null))), /* @__PURE__ */ React.createElement("tbody", null, overrideIds.map((id) => {
+      const label = activityLabelsById[id];
+      return /* @__PURE__ */ React.createElement("tr", { key: id }, /* @__PURE__ */ React.createElement("td", null, (label == null ? void 0 : label.date) || "\u2014"), /* @__PURE__ */ React.createElement("td", null, (label == null ? void 0 : label.name) || `Activity ${id}`), /* @__PURE__ */ React.createElement("td", { style: { color: amber } }, fmt(calorieOverrides[id])), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+        if (confirm(`Remove the manual calorie value for ${(label == null ? void 0 : label.name) || id}?`)) onDelete(id);
+      }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral }))));
+    })))));
+  }
+  function ActivityCalorieRow({ item, onSave }) {
+    const [value, setValue] = useState("");
+    const kcal = parseFloat(value);
+    const valid = !Number.isNaN(kcal) && kcal > 0;
+    return /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, item.date), /* @__PURE__ */ React.createElement("td", null, item.name, item.type ? /* @__PURE__ */ React.createElement("span", { style: { color: dim } }, " \xB7 ", item.type) : null), /* @__PURE__ */ React.createElement("td", { style: { textTransform: "capitalize" } }, item.source), /* @__PURE__ */ React.createElement("td", null, item.durationMin ? `${fmt(item.durationMin)} min` : "\u2014"), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", width: 90, textAlign: "right" }, type: "number", min: "0", step: "1", value, placeholder: "kcal", onChange: (e) => setValue(e.target.value) })), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px" }, disabled: !valid, onClick: () => onSave(item.id, kcal) }, "Save")));
   }
   function ManualEntryCard({ nutrition, onSave }) {
     const [date, setDate] = useState(() => toISODate(/* @__PURE__ */ new Date()));

@@ -978,6 +978,12 @@ function App() {
         table.data th:first-child, table.data td:first-child { text-align:left; font-family: ${body}; }
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         .spin { animation: spin 1s linear infinite; }
+        * { scrollbar-color: ${line} transparent; scrollbar-width: thin; }
+        *::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+        *::-webkit-scrollbar-track { background: transparent; }
+        *::-webkit-scrollbar-thumb { background: ${line}; border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
+        *::-webkit-scrollbar-thumb:hover { background: ${dim}; background-clip: padding-box; }
+        *::-webkit-scrollbar-corner { background: transparent; }
       `}</style>
 
       <div style={{ borderBottom: `1px solid ${line}` }}>

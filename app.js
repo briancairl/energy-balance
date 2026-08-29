@@ -814,6 +814,12 @@
         table.data th:first-child, table.data td:first-child { text-align:left; font-family: ${body}; }
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         .spin { animation: spin 1s linear infinite; }
+        * { scrollbar-color: ${line} transparent; scrollbar-width: thin; }
+        *::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+        *::-webkit-scrollbar-track { background: transparent; }
+        *::-webkit-scrollbar-thumb { background: ${line}; border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
+        *::-webkit-scrollbar-thumb:hover { background: ${dim}; background-clip: padding-box; }
+        *::-webkit-scrollbar-corner { background: transparent; }
       `), /* @__PURE__ */ React.createElement("div", { style: { borderBottom: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("div", { style: { padding: "18px 28px", maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10 } }, /* @__PURE__ */ React.createElement("img", { src: "/logo-header.png", alt: "", width: 28, height: 28, style: { borderRadius: 6, display: "block" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 17, letterSpacing: "-0.01em" } }, "Energy Balance"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, fontFamily: mono, marginTop: 1 } }, "training demand vs. fuel intake \u2014 local build"))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, [
       { id: "setup", label: "Setup", icon: ICONS.settings },
       { id: "import", label: "Log", icon: ICONS.upload },

@@ -748,6 +748,8 @@ function App() {
       const stravaSynced = stravaSyncedSet.has(key);
       const { sessions: scheduledSessions, taper } = getEffectiveSessionsForDate(schedule, key);
       const carbLoad = getCarbLoadState(schedule, key);
+      const upcomingRace = getUpcomingRace(schedule, key);
+      const raceToday = upcomingRace && upcomingRace.raceDate === key ? upcomingRace : null;
 
       // Use that day's logged weight for BMR/targets when available — body
       // weight shifts across a training block, and this keeps demand/fueling
@@ -794,6 +796,17 @@ function App() {
           durationSec += s.durationMin * 60;
           ifWeightedSum += effIF * (s.durationMin * 60);
         }
+      } else if (raceToday) {
+        // The race itself, estimated the same way a recurring session would
+        // be — replaced automatically once real activity data syncs in for
+        // race day, same as any other planned session.
+        source = "planned";
+        const z = ZONES[raceToday.zone - 1];
+        const kcal = estimatePlannedKcal(raceToday.zone, raceToday.durationMin, weightForDay);
+        exerciseKcal += kcal;
+        epocKcal += kcal * epocFactorFor(z.if) * profile.epocSensitivity;
+        durationSec += raceToday.durationMin * 60;
+        ifWeightedSum += z.if * (raceToday.durationMin * 60);
       } else if (stravaSynced) {
         source = "strava"; // confirmed rest day — zero is a real answer, not a gap
       }
@@ -895,7 +908,7 @@ function App() {
         weightMissing: weightMissing && !isFutureOrToday,
         durationMin, fuelTier, carbTargetG, proteinTargetG, fatTargetG, isFutureOrToday,
         scheduledSessions, preloading, preloadSession, borrowedKcal, repaidKcal,
-        taper, raceLoading, race: taper?.race || carbLoad?.race || null,
+        taper, raceLoading, race: taper?.race || carbLoad?.race || raceToday || null,
       });
     }
     return days;

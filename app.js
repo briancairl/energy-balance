@@ -619,6 +619,8 @@
         const stravaSynced = stravaSyncedSet.has(key);
         const { sessions: scheduledSessions, taper } = getEffectiveSessionsForDate(schedule, key);
         const carbLoad = getCarbLoadState(schedule, key);
+        const upcomingRace = getUpcomingRace(schedule, key);
+        const raceToday = upcomingRace && upcomingRace.raceDate === key ? upcomingRace : null;
         const weightForDay = (_a = weightLog[key]) != null ? _a : parseFloat(profile.weightKg) || null;
         let exerciseKcal = 0, epocKcal = 0, source = null;
         let durationSec = 0, ifWeightedSum = 0;
@@ -653,6 +655,14 @@
             durationSec += s.durationMin * 60;
             ifWeightedSum += effIF * (s.durationMin * 60);
           }
+        } else if (raceToday) {
+          source = "planned";
+          const z = ZONES[raceToday.zone - 1];
+          const kcal = estimatePlannedKcal(raceToday.zone, raceToday.durationMin, weightForDay);
+          exerciseKcal += kcal;
+          epocKcal += kcal * epocFactorFor(z.if) * profile.epocSensitivity;
+          durationSec += raceToday.durationMin * 60;
+          ifWeightedSum += z.if * (raceToday.durationMin * 60);
         } else if (stravaSynced) {
           source = "strava";
         }
@@ -735,7 +745,7 @@
           repaidKcal,
           taper,
           raceLoading,
-          race: (taper == null ? void 0 : taper.race) || (carbLoad == null ? void 0 : carbLoad.race) || null
+          race: (taper == null ? void 0 : taper.race) || (carbLoad == null ? void 0 : carbLoad.race) || raceToday || null
         });
       }
       return days;

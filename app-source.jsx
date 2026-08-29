@@ -2071,6 +2071,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
           </div>
         </div>
         <div ref={registerChartScroll} onScroll={syncChartScroll} style={{ overflowX: "auto", overflowY: "hidden", maxWidth: "100%" }}>
+          <div style={{ width: chartWidth, margin: "0 auto" }}>
           <ComposedChart width={chartWidth} height={280} data={rows} margin={{ top: 4, right: 12, left: -14, bottom: 0 }}>
             <CartesianGrid stroke={line} vertical={false} />
             <XAxis dataKey="label" tick={{ fill: dim, fontSize: 11, fontFamily: mono }} axisLine={{ stroke: line }} tickLine={false} />
@@ -2089,6 +2090,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
             {visibleMacros.fat && <Line yAxisId="grams" type="monotone" dataKey="fat" name="Fat actual (g)" stroke={gold} strokeWidth={2} dot={{ r: 2, fill: gold }} connectNulls />}
             {visibleMacros.fat && <Line yAxisId="grams" type="monotone" dataKey="fatTargetG" name="Fat target (g)" stroke={gold} strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls />}
           </ComposedChart>
+          </div>
         </div>
         {showFuelingRef && <FuelingReferencePanel fuelingByTier={fuelingByTier} />}
       </div>
@@ -2096,6 +2098,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
       <div className="card" style={{ padding: "20px 20px 8px" }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" }}>Daily gap (intake − target)</div>
         <div ref={registerChartScroll} onScroll={syncChartScroll} style={{ overflowX: "auto", overflowY: "hidden", maxWidth: "100%" }}>
+          <div style={{ width: chartWidth, margin: "0 auto" }}>
           <ComposedChart width={chartWidth} height={200} data={rows} margin={{ top: 4, right: 12, left: -14, bottom: 0 }}>
             <CartesianGrid stroke={line} vertical={false} />
             <XAxis dataKey="label" tick={{ fill: dim, fontSize: 11, fontFamily: mono }} axisLine={{ stroke: line }} tickLine={false} />
@@ -2108,6 +2111,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
               ))}
             </Bar>
           </ComposedChart>
+          </div>
         </div>
       </div>
 
@@ -2115,6 +2119,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
         <div className="card" style={{ padding: "20px 20px 8px" }}>
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" }}>Body weight</div>
           <div ref={registerChartScroll} onScroll={syncChartScroll} style={{ overflowX: "auto", overflowY: "hidden", maxWidth: "100%" }}>
+            <div style={{ width: chartWidth, margin: "0 auto" }}>
             <ComposedChart width={chartWidth} height={200} data={rowsWithTrend} margin={{ top: 4, right: 12, left: -14, bottom: 0 }}>
               <CartesianGrid stroke={line} vertical={false} />
               <XAxis dataKey="label" tick={{ fill: dim, fontSize: 11, fontFamily: mono }} axisLine={{ stroke: line }} tickLine={false} />
@@ -2123,6 +2128,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
               <Line type="monotone" dataKey="weight" name="Weight (kg)" stroke={dim} strokeWidth={1} dot={{ r: 2.5, fill: dim }} connectNulls={false} />
               <Line type="monotone" dataKey="weightTrend" name="7-day avg (kg)" stroke={cyan} strokeWidth={2.2} dot={false} connectNulls />
             </ComposedChart>
+            </div>
           </div>
         </div>
       )}

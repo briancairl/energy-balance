@@ -967,25 +967,27 @@ function App() {
         .spin { animation: spin 1s linear infinite; }
       `}</style>
 
-      <div style={{ borderBottom: `1px solid ${line}`, padding: "18px 28px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <img src="/logo-header.png" alt="" width={28} height={28} style={{ borderRadius: 6, display: "block" }} />
-          <div>
-            <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 17, letterSpacing: "-0.01em" }}>Energy Balance</div>
-            <div style={{ fontSize: 11, color: dim, fontFamily: mono, marginTop: 1 }}>training demand vs. fuel intake — local build</div>
-          </div>
-        </div>
-        <div style={{ display: "flex", gap: 4 }}>
-          {[
-            { id: "setup", label: "Setup", icon: ICONS.settings },
-            { id: "import", label: "Log", icon: ICONS.upload },
-            { id: "schedule", label: "Schedule", icon: ICONS.calendar },
-            { id: "dashboard", label: "Dashboard", icon: ICONS.activity },
-          ].map(({ id, label, icon }) => (
-            <div key={id} className={`navbtn ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>
-              <Icon path={icon} size={14} /> {label}
+      <div style={{ borderBottom: `1px solid ${line}` }}>
+        <div style={{ padding: "18px 28px", maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <img src="/logo-header.png" alt="" width={28} height={28} style={{ borderRadius: 6, display: "block" }} />
+            <div>
+              <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 17, letterSpacing: "-0.01em" }}>Energy Balance</div>
+              <div style={{ fontSize: 11, color: dim, fontFamily: mono, marginTop: 1 }}>training demand vs. fuel intake — local build</div>
             </div>
-          ))}
+          </div>
+          <div style={{ display: "flex", gap: 4 }}>
+            {[
+              { id: "setup", label: "Setup", icon: ICONS.settings },
+              { id: "import", label: "Log", icon: ICONS.upload },
+              { id: "schedule", label: "Schedule", icon: ICONS.calendar },
+              { id: "dashboard", label: "Dashboard", icon: ICONS.activity },
+            ].map(({ id, label, icon }) => (
+              <div key={id} className={`navbtn ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>
+                <Icon path={icon} size={14} /> {label}
+              </div>
+            ))}
+          </div>
         </div>
       </div>
 

@@ -431,18 +431,25 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || `Google Sheets request failed (${res.status}).`);
         if (!data.fields.length) throw new Error("Sheet appears empty \u2014 check google_sheet_id and google_sheet_range in config.json.");
-        setColMap(guessColumnMapping(data.fields));
-        setCsvPreview({ fields: data.fields, rows: data.rows });
-        setCsvPreviewSource("sheet");
+        const cachedMap = await storageGet("google-sheet-colmap", null);
+        const cachedMapUsable = cachedMap && cachedMap.date && cachedMap.calories && [cachedMap.date, cachedMap.calories, cachedMap.protein, cachedMap.carbs, cachedMap.fat].every((f) => !f || data.fields.includes(f));
+        if (cachedMapUsable) {
+          setColMap(cachedMap);
+          importMappedCSV({ fields: data.fields, rows: data.rows }, cachedMap, "sheet");
+        } else {
+          setColMap(guessColumnMapping(data.fields));
+          setCsvPreview({ fields: data.fields, rows: data.rows });
+          setCsvPreviewSource("sheet");
+        }
       } catch (e) {
         setGoogleError(e.message || "Could not reach the local server's Google Sheets proxy.");
       } finally {
         setGoogleFetching(false);
       }
     }
-    function importMappedCSV() {
+    function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
       var _a, _b, _c, _d, _e, _f;
-      if (!csvPreview || !colMap.date || !colMap.calories) {
+      if (!preview || !map.date || !map.calories) {
         alert("Map at least the date and calories columns first.");
         return;
       }
@@ -450,8 +457,8 @@
       const importedDates = [];
       const skippedExamples = [];
       let count = 0;
-      for (const row of csvPreview.rows) {
-        const rawDate = row[colMap.date];
+      for (const row of preview.rows) {
+        const rawDate = row[map.date];
         const d = parseFlexibleDate(rawDate);
         if (!d) {
           if (skippedExamples.length < 3) skippedExamples.push(JSON.stringify(rawDate));
@@ -462,10 +469,10 @@
         next[key] = {
           ...existing,
           macrosfirst: {
-            calories: parseFloat(row[colMap.calories]) || 0,
-            protein: colMap.protein ? parseFloat(row[colMap.protein]) || 0 : (_b = (_a = existing.macrosfirst) == null ? void 0 : _a.protein) != null ? _b : 0,
-            carbs: colMap.carbs ? parseFloat(row[colMap.carbs]) || 0 : (_d = (_c = existing.macrosfirst) == null ? void 0 : _c.carbs) != null ? _d : 0,
-            fat: colMap.fat ? parseFloat(row[colMap.fat]) || 0 : (_f = (_e = existing.macrosfirst) == null ? void 0 : _e.fat) != null ? _f : 0
+            calories: parseFloat(row[map.calories]) || 0,
+            protein: map.protein ? parseFloat(row[map.protein]) || 0 : (_b = (_a = existing.macrosfirst) == null ? void 0 : _a.protein) != null ? _b : 0,
+            carbs: map.carbs ? parseFloat(row[map.carbs]) || 0 : (_d = (_c = existing.macrosfirst) == null ? void 0 : _c.carbs) != null ? _d : 0,
+            fat: map.fat ? parseFloat(row[map.fat]) || 0 : (_f = (_e = existing.macrosfirst) == null ? void 0 : _e.fat) != null ? _f : 0
           }
         };
         importedDates.push(key);
@@ -473,8 +480,8 @@
       }
       saveNutrition(next);
       setCsvPreview(null);
-      if (csvPreviewSource === "sheet") {
-        storageSet("google-sheet-colmap", colMap);
+      if (source === "sheet") {
+        storageSet("google-sheet-colmap", map);
       }
       setCsvPreviewSource(null);
       if (count === 0 && skippedExamples.length) {
@@ -972,7 +979,7 @@
       /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "center", marginBottom: 10 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 22, color: dim })),
       /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, marginBottom: 12 } }, "Drop your CSV export here, or"),
       /* @__PURE__ */ React.createElement("label", { className: "btn-ghost", style: { display: "inline-block" } }, "Choose file", /* @__PURE__ */ React.createElement("input", { type: "file", accept: ".csv", style: { display: "none" }, onChange: (e) => e.target.files[0] && onFile(e.target.files[0]) }))
-    )), csvPreview && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Map columns"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16 } }, csvPreview.rows.length, " rows found. Match the columns to the fields below."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 } }, ["date", "calories", "protein", "carbs", "fat"].map((k) => /* @__PURE__ */ React.createElement(Field, { key: k, label: k }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: colMap[k], onChange: (e) => setColMap((m) => ({ ...m, [k]: e.target.value })) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "\u2014 none \u2014"), csvPreview.fields.map((f) => /* @__PURE__ */ React.createElement("option", { key: f, value: f }, f)))))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { marginTop: 18 }, onClick: onImport }, "Import ", csvPreview.rows.length, " rows")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored nutrition log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 } }, dayCount, " day", dayCount === 1 ? "" : "s", " of intake saved. Click a row to edit it."), dayCount > 0 && /* @__PURE__ */ React.createElement(NutritionLogTable, { nutrition, onSave: onSaveManualDay, onDelete: onDeleteDay })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored weight log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 } }, weightCount, " day", weightCount === 1 ? "" : "s", " of weight saved. Click a row to edit it."), weightCount > 0 && /* @__PURE__ */ React.createElement(WeightLogTable, { weightLog, onSave: onSaveWeight, onDelete: onDeleteWeight })));
+    )), csvPreview && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Map columns"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16 } }, csvPreview.rows.length, " rows found. Match the columns to the fields below."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 } }, ["date", "calories", "protein", "carbs", "fat"].map((k) => /* @__PURE__ */ React.createElement(Field, { key: k, label: k }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: colMap[k], onChange: (e) => setColMap((m) => ({ ...m, [k]: e.target.value })) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "\u2014 none \u2014"), csvPreview.fields.map((f) => /* @__PURE__ */ React.createElement("option", { key: f, value: f }, f)))))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { marginTop: 18 }, onClick: () => onImport() }, "Import ", csvPreview.rows.length, " rows")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored nutrition log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 } }, dayCount, " day", dayCount === 1 ? "" : "s", " of intake saved. Click a row to edit it."), dayCount > 0 && /* @__PURE__ */ React.createElement(NutritionLogTable, { nutrition, onSave: onSaveManualDay, onDelete: onDeleteDay })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored weight log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 } }, weightCount, " day", weightCount === 1 ? "" : "s", " of weight saved. Click a row to edit it."), weightCount > 0 && /* @__PURE__ */ React.createElement(WeightLogTable, { weightLog, onSave: onSaveWeight, onDelete: onDeleteWeight })));
   }
   function macroCalories(protein, carbs, fat) {
     return protein * 4 + carbs * 4 + fat * 9;

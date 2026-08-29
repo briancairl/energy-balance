@@ -531,9 +531,25 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `Google Sheets request failed (${res.status}).`);
       if (!data.fields.length) throw new Error("Sheet appears empty — check google_sheet_id and google_sheet_range in config.json.");
-      setColMap(guessColumnMapping(data.fields));
-      setCsvPreview({ fields: data.fields, rows: data.rows });
-      setCsvPreviewSource("sheet");
+
+      // If the sheet's columns still match what was mapped last time, reuse
+      // that mapping and import right away — no need to make the user click
+      // through "Map columns" -> "Import Rows" again for a layout that hasn't
+      // changed. Only fall back to the manual mapping step if there's no
+      // cached mapping yet, or the sheet's columns have shifted since.
+      const cachedMap = await storageGet("google-sheet-colmap", null);
+      const cachedMapUsable = cachedMap && cachedMap.date && cachedMap.calories
+        && [cachedMap.date, cachedMap.calories, cachedMap.protein, cachedMap.carbs, cachedMap.fat]
+          .every((f) => !f || data.fields.includes(f));
+
+      if (cachedMapUsable) {
+        setColMap(cachedMap);
+        importMappedCSV({ fields: data.fields, rows: data.rows }, cachedMap, "sheet");
+      } else {
+        setColMap(guessColumnMapping(data.fields));
+        setCsvPreview({ fields: data.fields, rows: data.rows });
+        setCsvPreviewSource("sheet");
+      }
     } catch (e) {
       setGoogleError(e.message || "Could not reach the local server's Google Sheets proxy.");
     } finally {
@@ -541,8 +557,11 @@ function App() {
     }
   }
 
-  function importMappedCSV() {
-    if (!csvPreview || !colMap.date || !colMap.calories) {
+  // Takes explicit preview/map/source rather than always reading state, so
+  // syncGoogleSheet's cached-mapping fast path can import immediately with
+  // freshly-fetched data instead of waiting a render cycle for state to catch up.
+  function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
+    if (!preview || !map.date || !map.calories) {
       alert("Map at least the date and calories columns first.");
       return;
     }
@@ -550,8 +569,8 @@ function App() {
     const importedDates = [];
     const skippedExamples = [];
     let count = 0;
-    for (const row of csvPreview.rows) {
-      const rawDate = row[colMap.date];
+    for (const row of preview.rows) {
+      const rawDate = row[map.date];
       const d = parseFlexibleDate(rawDate);
       if (!d) {
         if (skippedExamples.length < 3) skippedExamples.push(JSON.stringify(rawDate));
@@ -562,10 +581,10 @@ function App() {
       next[key] = {
         ...existing,
         macrosfirst: {
-          calories: parseFloat(row[colMap.calories]) || 0,
-          protein: colMap.protein ? parseFloat(row[colMap.protein]) || 0 : (existing.macrosfirst?.protein ?? 0),
-          carbs: colMap.carbs ? parseFloat(row[colMap.carbs]) || 0 : (existing.macrosfirst?.carbs ?? 0),
-          fat: colMap.fat ? parseFloat(row[colMap.fat]) || 0 : (existing.macrosfirst?.fat ?? 0),
+          calories: parseFloat(row[map.calories]) || 0,
+          protein: map.protein ? parseFloat(row[map.protein]) || 0 : (existing.macrosfirst?.protein ?? 0),
+          carbs: map.carbs ? parseFloat(row[map.carbs]) || 0 : (existing.macrosfirst?.carbs ?? 0),
+          fat: map.fat ? parseFloat(row[map.fat]) || 0 : (existing.macrosfirst?.fat ?? 0),
         },
       };
       importedDates.push(key);
@@ -573,8 +592,8 @@ function App() {
     }
     saveNutrition(next);
     setCsvPreview(null);
-    if (csvPreviewSource === "sheet") {
-      storageSet("google-sheet-colmap", colMap); // lets the server's auto-sync reuse this mapping
+    if (source === "sheet") {
+      storageSet("google-sheet-colmap", map); // lets the server's auto-sync reuse this mapping
     }
     setCsvPreviewSource(null);
     if (count === 0 && skippedExamples.length) {
@@ -1311,7 +1330,7 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
               </Field>
             ))}
           </div>
-          <button className="btn-primary" style={{ marginTop: 18 }} onClick={onImport}>Import {csvPreview.rows.length} rows</button>
+          <button className="btn-primary" style={{ marginTop: 18 }} onClick={() => onImport()}>Import {csvPreview.rows.length} rows</button>
         </div>
       )}
 

@@ -167,11 +167,55 @@
   function getScheduledSessionsForDate(schedule, dateStr) {
     const weekday = (/* @__PURE__ */ new Date(dateStr + "T00:00:00")).getDay();
     return schedule.filter((s) => {
+      if (s.kind === "race") return false;
       if (!s.daysOfWeek.includes(weekday)) return false;
       if (dateStr < s.startDate) return false;
       if (s.endDate && dateStr > s.endDate) return false;
       return true;
     });
+  }
+  function getRaces(schedule) {
+    return schedule.filter((s) => s.kind === "race");
+  }
+  function getUpcomingRace(schedule, dateStr) {
+    const races = getRaces(schedule).filter((s) => s.raceDate >= dateStr);
+    races.sort((a, b) => a.raceDate < b.raceDate ? -1 : 1);
+    return races[0] || null;
+  }
+  function daysBetween(fromStr, toStr) {
+    return Math.round((/* @__PURE__ */ new Date(toStr + "T00:00:00") - /* @__PURE__ */ new Date(fromStr + "T00:00:00")) / 864e5);
+  }
+  const TAPER_VOLUME_FLOOR = 0.4;
+  const TAPER_INTENSITY_FLOOR = 0.9;
+  function getTaperState(schedule, dateStr) {
+    const race = getUpcomingRace(schedule, dateStr);
+    if (!race || !race.taperDays) return null;
+    const daysToRace = daysBetween(dateStr, race.raceDate);
+    if (daysToRace <= 0 || daysToRace > race.taperDays) return null;
+    const progress = race.taperDays > 1 ? (daysToRace - 1) / (race.taperDays - 1) : 0;
+    const volumeFactor = TAPER_VOLUME_FLOOR + (1 - TAPER_VOLUME_FLOOR) * progress;
+    const intensityFactor2 = TAPER_INTENSITY_FLOOR + (1 - TAPER_INTENSITY_FLOOR) * progress;
+    return { race, daysToRace, volumeFactor, intensityFactor: intensityFactor2 };
+  }
+  function getEffectiveSessionsForDate(schedule, dateStr) {
+    const sessions = getScheduledSessionsForDate(schedule, dateStr);
+    const taper = getTaperState(schedule, dateStr);
+    if (!taper) return { sessions, taper: null };
+    const tapered = sessions.map((s) => ({
+      ...s,
+      durationMin: Math.max(0, Math.round(s.durationMin * taper.volumeFactor)),
+      taperIntensityFactor: taper.intensityFactor
+    }));
+    return { sessions: tapered, taper };
+  }
+  const CARB_LOAD_DAYS = 3;
+  const CARB_LOAD_MIN_DURATION = 90;
+  function getCarbLoadState(schedule, dateStr) {
+    const race = getUpcomingRace(schedule, dateStr);
+    if (!race || race.durationMin < CARB_LOAD_MIN_DURATION) return null;
+    const daysToRace = daysBetween(dateStr, race.raceDate);
+    if (daysToRace <= 0 || daysToRace > CARB_LOAD_DAYS) return null;
+    return { race, daysToRace };
   }
   const KCAL_PER_KG_TISSUE = 7700;
   const GOAL_DEFAULTS = {
@@ -237,7 +281,8 @@
     pencil: "M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4z",
     trash: "M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z",
     plus: "M12 5v14M5 12h14",
-    calendar: "M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z"
+    calendar: "M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z",
+    trophy: "M8 21h8M12 17v4M7 4h10v4a5 5 0 01-10 0V4zM7 4H3v2a4 4 0 004 4M17 4h4v2a4 4 0 01-4 4"
   };
   function App() {
     const [tab, setTab] = useState("setup");
@@ -565,7 +610,8 @@
         const stravaActs = stravaByDate[key] || [];
         const intervalsActs = actByDate[key] || [];
         const stravaSynced = stravaSyncedSet.has(key);
-        const scheduledSessions = getScheduledSessionsForDate(schedule, key);
+        const { sessions: scheduledSessions, taper } = getEffectiveSessionsForDate(schedule, key);
+        const carbLoad = getCarbLoadState(schedule, key);
         const weightForDay = (_a = weightLog[key]) != null ? _a : parseFloat(profile.weightKg) || null;
         let exerciseKcal = 0, epocKcal = 0, source = null;
         let durationSec = 0, ifWeightedSum = 0;
@@ -593,11 +639,12 @@
           source = "planned";
           for (const s of scheduledSessions) {
             const z = ZONES[s.zone - 1];
+            const effIF = s.taperIntensityFactor ? z.if * s.taperIntensityFactor : z.if;
             const kcal = estimatePlannedKcal(s.zone, s.durationMin, weightForDay);
             exerciseKcal += kcal;
-            epocKcal += kcal * epocFactorFor(z.if) * profile.epocSensitivity;
+            epocKcal += kcal * epocFactorFor(effIF) * profile.epocSensitivity;
             durationSec += s.durationMin * 60;
-            ifWeightedSum += z.if * (s.durationMin * 60);
+            ifWeightedSum += effIF * (s.durationMin * 60);
           }
         } else if (stravaSynced) {
           source = "strava";
@@ -624,16 +671,18 @@
         const preloadSession = tomorrowSessions.filter(isPreloadWorthy).sort((a, b) => b.durationMin - a.durationMin)[0];
         const preloadTier = preloadSession ? classifyTrainingTier(preloadSession.durationMin) : null;
         const preloading = !!(preloadTier && FUEL_TIERS.indexOf(preloadTier) > FUEL_TIERS.indexOf(fuelTier));
-        const effectiveTier = preloading ? preloadTier : fuelTier;
+        const raceLoading = !!carbLoad;
+        const effectiveTier = raceLoading ? FUEL_TIERS[FUEL_TIERS.length - 1] : preloading ? preloadTier : fuelTier;
         const blend = intensityBlend(avgIF);
+        const effectiveBlend = raceLoading ? 1 : blend;
         const normalCarbTargetG = weightForDay ? weightForDay * (fuelTier.carbLo + (fuelTier.carbHi - fuelTier.carbLo) * blend) : null;
-        const carbTargetG = weightForDay ? weightForDay * (effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * blend) : null;
-        const extraCarbKcal = preloading && carbTargetG !== null && normalCarbTargetG !== null ? (carbTargetG - normalCarbTargetG) * 4 : 0;
+        const carbTargetG = weightForDay ? weightForDay * (effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * effectiveBlend) : null;
+        const extraCarbKcal = (preloading || raceLoading) && carbTargetG !== null && normalCarbTargetG !== null && carbTargetG > normalCarbTargetG ? (carbTargetG - normalCarbTargetG) * 4 : 0;
         const borrowRatio = Math.min(1, Math.max(0, parseFloat(profile.preloadBorrowRatio)));
-        const borrowedKcal = extraCarbKcal * (isNaN(borrowRatio) ? 1 : borrowRatio);
+        const borrowedKcal = raceLoading ? extraCarbKcal : extraCarbKcal * (isNaN(borrowRatio) ? 1 : borrowRatio);
         const repaidKcal = carryRepaymentKcal;
         const target = baseTarget - repaidKcal + borrowedKcal;
-        carryRepaymentKcal = borrowedKcal;
+        carryRepaymentKcal = raceLoading ? 0 : borrowedKcal;
         const gap = intake !== null ? intake - target : null;
         const proteinTargetG = weightForDay ? weightForDay * (parseFloat(profile.proteinGPerKg) || 1) : null;
         const fatFloorG = target * 0.2 / 9;
@@ -676,7 +725,10 @@
           preloading,
           preloadSession,
           borrowedKcal,
-          repaidKcal
+          repaidKcal,
+          taper,
+          raceLoading,
+          race: (taper == null ? void 0 : taper.race) || (carbLoad == null ? void 0 : carbLoad.race) || null
         });
       }
       return days;
@@ -1058,8 +1110,10 @@
   }
   const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const ACTIVITY_COLORS = { Run: coral, Ride: cyan, Swim: mint, Row: lavender, Strength: gold, Other: amber };
+  const DEFAULT_TAPER_DAYS = 10;
   function emptyScheduleForm() {
     return {
+      kind: "recurring",
       activityType: "Run",
       zone: 2,
       durationMin: "45",
@@ -1067,12 +1121,16 @@
       startDate: toLocalISODate(/* @__PURE__ */ new Date()),
       endDate: "",
       ongoing: true,
-      notes: ""
+      notes: "",
+      raceDate: toLocalISODate(/* @__PURE__ */ new Date()),
+      taperDays: String(DEFAULT_TAPER_DAYS)
     };
   }
   function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
     const [form, setForm] = useState(emptyScheduleForm());
     const [editingId, setEditingId] = useState(null);
+    const recurring = schedule.filter((s) => s.kind !== "race");
+    const races = getRaces(schedule).slice().sort((a, b) => a.raceDate < b.raceDate ? -1 : 1);
     function toggleDay(n) {
       setForm((f) => ({
         ...f,
@@ -1080,28 +1138,60 @@
       }));
     }
     function startEdit(s) {
+      var _a;
       setEditingId(s.id);
-      setForm({
-        activityType: s.activityType,
-        zone: s.zone,
-        durationMin: String(s.durationMin),
-        daysOfWeek: s.daysOfWeek,
-        startDate: s.startDate,
-        endDate: s.endDate || "",
-        ongoing: !s.endDate,
-        notes: s.notes || ""
-      });
+      if (s.kind === "race") {
+        setForm({
+          ...emptyScheduleForm(),
+          kind: "race",
+          activityType: s.activityType,
+          zone: s.zone,
+          durationMin: String(s.durationMin),
+          raceDate: s.raceDate,
+          taperDays: String((_a = s.taperDays) != null ? _a : DEFAULT_TAPER_DAYS),
+          notes: s.notes || ""
+        });
+      } else {
+        setForm({
+          ...emptyScheduleForm(),
+          kind: "recurring",
+          activityType: s.activityType,
+          zone: s.zone,
+          durationMin: String(s.durationMin),
+          daysOfWeek: s.daysOfWeek,
+          startDate: s.startDate,
+          endDate: s.endDate || "",
+          ongoing: !s.endDate,
+          notes: s.notes || ""
+        });
+      }
     }
     function cancelEdit() {
       setEditingId(null);
       setForm(emptyScheduleForm());
     }
     function handleSubmit() {
+      if (form.kind === "race") {
+        const entry2 = {
+          kind: "race",
+          activityType: form.activityType,
+          zone: form.zone,
+          durationMin: parseInt(form.durationMin) || 0,
+          raceDate: form.raceDate,
+          taperDays: Math.max(0, parseInt(form.taperDays) || 0),
+          notes: form.notes
+        };
+        if (editingId) onUpdate(editingId, entry2);
+        else onAdd(entry2);
+        cancelEdit();
+        return;
+      }
       if (form.daysOfWeek.length === 0) {
         alert("Pick at least one day of the week.");
         return;
       }
       const entry = {
+        kind: "recurring",
         activityType: form.activityType,
         zone: form.zone,
         durationMin: parseInt(form.durationMin) || 0,
@@ -1120,10 +1210,31 @@
       const d = new Date(calendarStart);
       d.setDate(d.getDate() + i);
       const key = toLocalISODate(d);
-      calendarDays.push({ key, date: d, sessions: getScheduledSessionsForDate(schedule, key) });
+      const { sessions, taper } = getEffectiveSessionsForDate(schedule, key);
+      const raceToday = races.find((r) => r.raceDate === key);
+      const carbLoad = getCarbLoadState(schedule, key);
+      calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad });
     }
     const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " ", editingId ? "Edit scheduled session" : "Add a recurring session"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Repeats on the days you pick, within the date range. Projects up to ", FORWARD_DAYS, " days ahead on the dashboard as an estimate \u2014 once a real activity syncs in for that day, it takes over automatically."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Activity type" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: form.activityType, onChange: (e) => setForm((f) => ({ ...f, activityType: e.target.value })) }, ACTIVITY_TYPES.map((t) => /* @__PURE__ */ React.createElement("option", { key: t, value: t }, t)))), /* @__PURE__ */ React.createElement(Field, { label: "Duration (min)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "1", value: form.durationMin, onChange: (e) => setForm((f) => ({ ...f, durationMin: e.target.value })) }))), /* @__PURE__ */ React.createElement(Field, { label: "Intensity zone" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, ZONES.map((z) => /* @__PURE__ */ React.createElement(
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: form.kind === "race" ? ICONS.trophy : ICONS.calendar, size: 16, color: cyan }), " ", editingId ? "Edit scheduled session" : "Add to schedule"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, form.kind === "race" ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days." : /* @__PURE__ */ React.createElement(React.Fragment, null, "Repeats on the days you pick, within the date range. Projects up to ", FORWARD_DAYS, " days ahead on the dashboard as an estimate \u2014 once a real activity syncs in for that day, it takes over automatically.")), !editingId && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4, marginBottom: 16 } }, /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        onClick: () => setForm((f) => ({ ...f, kind: "recurring" })),
+        style: form.kind === "recurring" ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 } : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 13, color: form.kind === "recurring" ? ink : dim }),
+      " Recurring session"
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        onClick: () => setForm((f) => ({ ...f, kind: "race" })),
+        style: form.kind === "race" ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 } : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 13, color: form.kind === "race" ? ink : dim }),
+      " Race"
+    )), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Activity type" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: form.activityType, onChange: (e) => setForm((f) => ({ ...f, activityType: e.target.value })) }, ACTIVITY_TYPES.map((t) => /* @__PURE__ */ React.createElement("option", { key: t, value: t }, t)))), /* @__PURE__ */ React.createElement(Field, { label: form.kind === "race" ? "Expected finish time (min)" : "Duration (min)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "1", value: form.durationMin, onChange: (e) => setForm((f) => ({ ...f, durationMin: e.target.value })) }))), /* @__PURE__ */ React.createElement(Field, { label: "Intensity zone" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, ZONES.map((z) => /* @__PURE__ */ React.createElement(
       "button",
       {
         key: z.n,
@@ -1134,7 +1245,7 @@
       },
       "Z",
       z.n
-    ))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, ZONES[form.zone - 1].label, " \xB7 ", ZONES[form.zone - 1].hrPct)), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement("span", { className: "fieldlabel" }, "Days of week"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, WEEKDAY_LABELS.map((label, n) => /* @__PURE__ */ React.createElement(
+    ))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, ZONES[form.zone - 1].label, " \xB7 ", ZONES[form.zone - 1].hrPct)), form.kind === "race" ? /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Race date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.raceDate, onChange: (e) => setForm((f) => ({ ...f, raceDate: e.target.value })) })), /* @__PURE__ */ React.createElement(Field, { label: "Taper starts (days before race)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", value: form.taperDays, onChange: (e) => setForm((f) => ({ ...f, taperDays: e.target.value })) }))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement("span", { className: "fieldlabel" }, "Days of week"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, WEEKDAY_LABELS.map((label, n) => /* @__PURE__ */ React.createElement(
       "button",
       {
         key: n,
@@ -1153,25 +1264,47 @@
         onChange: (e) => setForm((f) => ({ ...f, endDate: e.target.value })),
         style: { opacity: form.ongoing ? 0.5 : 1 }
       }
-    )), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.ongoing, onChange: (e) => setForm((f) => ({ ...f, ongoing: e.target.checked })) }), "Ongoing")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Notes (optional)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: form.notes, onChange: (e) => setForm((f) => ({ ...f, notes: e.target.value })), placeholder: "e.g. track intervals" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 18 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSubmit }, editingId ? "Save changes" : "Add to schedule"), editingId && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: cancelEdit }, "Cancel"))), schedule.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 } }, "Recurring sessions"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8 } }, schedule.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, style: { display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", "), " \xB7 from ", s.startDate, s.endDate ? ` to ${s.endDate}` : " (ongoing)", s.notes ? ` \xB7 ${s.notes}` : "")), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+    )), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.ongoing, onChange: (e) => setForm((f) => ({ ...f, ongoing: e.target.checked })) }), "Ongoing"))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Notes (optional)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: form.notes, onChange: (e) => setForm((f) => ({ ...f, notes: e.target.value })), placeholder: form.kind === "race" ? "e.g. Boston Marathon" : "e.g. track intervals" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 18 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSubmit }, editingId ? "Save changes" : form.kind === "race" ? "Add race" : "Add to schedule"), editingId && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: cancelEdit }, "Cancel"))), races.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 16, color: gold }), " Races"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8 } }, races.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, style: { display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.notes || s.activityType), " \xB7 ", s.activityType, " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.raceDate, " \xB7 taper starts ", s.taperDays, "d out")), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+      if (confirm("Delete this race?")) onDelete(s.id);
+    }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))), recurring.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 } }, "Recurring sessions"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8 } }, recurring.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, style: { display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", "), " \xB7 from ", s.startDate, s.endDate ? ` to ${s.endDate}` : " (ongoing)", s.notes ? ` \xB7 ${s.notes}` : "")), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
       if (confirm("Delete this scheduled session?")) onDelete(s.id);
-    }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 5 } }, "Next 3 weeks \xB7 ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
+    }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "Next 3 weeks"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
       const isToday = day.key === todayKey;
       const isFirstOfMonth = day.date.getDate() === 1;
       return /* @__PURE__ */ React.createElement("div", { key: day.key, style: {
         background: panel2,
-        border: isToday ? `2px solid ${cyan}` : `1px solid ${line}`,
+        border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
         borderRadius: 5,
         padding: 6,
         minHeight: 76,
         display: "flex",
         flexDirection: "column",
         gap: 3
-      } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate()), day.sessions.map((s, i) => /* @__PURE__ */ React.createElement(
+      } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold }))), day.race && /* @__PURE__ */ React.createElement(
+        "div",
+        {
+          title: `Race: ${day.race.notes || day.race.activityType} \xB7 ${day.race.durationMin}min`,
+          style: {
+            background: gold,
+            color: ink,
+            borderRadius: 3,
+            padding: "2px 5px",
+            fontSize: 10.5,
+            lineHeight: 1.3,
+            fontWeight: 700,
+            display: "flex",
+            alignItems: "center",
+            gap: 3
+          }
+        },
+        /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 9, color: ink }),
+        " ",
+        day.race.notes || day.race.activityType
+      ), day.sessions.map((s, i) => /* @__PURE__ */ React.createElement(
         "div",
         {
           key: i,
-          title: `${s.activityType} \xB7 ${ZONES[s.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${s.durationMin}min${s.notes ? ` \xB7 ${s.notes}` : ""}`,
+          title: `${s.activityType} \xB7 ${ZONES[s.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${s.durationMin}min${s.notes ? ` \xB7 ${s.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}`,
           style: {
             background: ACTIVITY_COLORS[s.activityType] || dim,
             color: ink,
@@ -1182,7 +1315,8 @@
             fontWeight: 600,
             display: "flex",
             alignItems: "center",
-            gap: 3
+            gap: 3,
+            opacity: day.taper ? 0.65 : 1
           }
         },
         s.activityType,
@@ -1252,7 +1386,7 @@
       },
       "Fueling ref"
     ))), /* @__PURE__ */ React.createElement("div", { ref: registerChartScroll, onScroll: syncChartScroll, style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width: chartWidth, height: 280, data: rows, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "kcal", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), (visibleMacros.carbs || visibleMacros.protein || visibleMacros.fat) && /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "grams", orientation: "right", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false, label: { value: "grams", angle: 90, position: "insideRight", fill: dim, fontSize: 10 } }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { yAxisId: "kcal", dataKey: "demand", name: "Modeled TDEE (kcal)", fill: panel2, stroke: line, strokeWidth: 1, radius: [2, 2, 0, 0] }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "kcal", type: "monotone", dataKey: "target", name: "Target (kcal)", stroke: cyan, strokeWidth: 2, dot: false, strokeDasharray: goalParams.sign !== 0 ? "5 3" : void 0, connectNulls: true }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "kcal", type: "monotone", dataKey: "intake", name: "Intake (kcal)", stroke: amber, strokeWidth: 2.2, dot: { r: 2.5, fill: amber }, connectNulls: true }), visibleMacros.carbs && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "carbs", name: "Carbs actual (g)", stroke: mint, strokeWidth: 2, dot: { r: 2, fill: mint }, connectNulls: true }), visibleMacros.carbs && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "carbTargetG", name: "Carbs target (g)", stroke: mint, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }), visibleMacros.protein && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "protein", name: "Protein actual (g)", stroke: lavender, strokeWidth: 2, dot: { r: 2, fill: lavender }, connectNulls: true }), visibleMacros.protein && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "proteinTargetG", name: "Protein target (g)", stroke: lavender, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }), visibleMacros.fat && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "fat", name: "Fat actual (g)", stroke: gold, strokeWidth: 2, dot: { r: 2, fill: gold }, connectNulls: true }), visibleMacros.fat && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "fatTargetG", name: "Fat target (g)", stroke: gold, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }))), showFuelingRef && /* @__PURE__ */ React.createElement(FuelingReferencePanel, { fuelingByTier })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 8px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" } }, "Daily gap (intake \u2212 target)"), /* @__PURE__ */ React.createElement("div", { ref: registerChartScroll, onScroll: syncChartScroll, style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width: chartWidth, height: 200, data: rows, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), /* @__PURE__ */ React.createElement(ReferenceLine, { y: 0, stroke: dim }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "gap", name: "Gap (kcal)", radius: [2, 2, 2, 2] }, rows.map((r, i) => /* @__PURE__ */ React.createElement(Cell, { key: i, fill: r.gap === null ? line : r.gap < -200 ? coral : r.gap > 200 ? amber : mint })))))), hasWeight && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 8px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" } }, "Body weight"), /* @__PURE__ */ React.createElement("div", { ref: registerChartScroll, onScroll: syncChartScroll, style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width: chartWidth, height: 200, data: rowsWithTrend, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false, domain: ["dataMin - 1", "dataMax + 1"] }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Line, { type: "monotone", dataKey: "weight", name: "Weight (kg)", stroke: dim, strokeWidth: 1, dot: { r: 2.5, fill: dim }, connectNulls: false }), /* @__PURE__ */ React.createElement(Line, { type: "monotone", dataKey: "weightTrend", name: "7-day avg (kg)", stroke: cyan, strokeWidth: 2.2, dot: false, connectNulls: true })))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 20, overflowX: "auto" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12 } }, "Daily breakdown"), /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Date"), /* @__PURE__ */ React.createElement("th", null, "Data"), /* @__PURE__ */ React.createElement("th", null, "Weight"), /* @__PURE__ */ React.createElement("th", null, "BMR"), /* @__PURE__ */ React.createElement("th", null, "Baseline"), /* @__PURE__ */ React.createElement("th", null, "Training"), /* @__PURE__ */ React.createElement("th", null, "EPOC"), /* @__PURE__ */ React.createElement("th", null, "Fatigue+"), /* @__PURE__ */ React.createElement("th", null, "Demand"), /* @__PURE__ */ React.createElement("th", null, "Target"), /* @__PURE__ */ React.createElement("th", null, "Intake"), /* @__PURE__ */ React.createElement("th", null, "Gap"), /* @__PURE__ */ React.createElement("th", null, "TSB"), /* @__PURE__ */ React.createElement("th", null, "Carbs (g)"), /* @__PURE__ */ React.createElement("th", null, "Protein (g)"), /* @__PURE__ */ React.createElement("th", null, "Fat (g)"))), /* @__PURE__ */ React.createElement("tbody", null, rows.slice().reverse().map((r) => {
-      var _a;
+      var _a, _b, _c;
       return /* @__PURE__ */ React.createElement("tr", { key: r.date }, /* @__PURE__ */ React.createElement("td", null, r.label), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left" } }, /* @__PURE__ */ React.createElement("span", { style: { display: "inline-flex", gap: 5 } }, /* @__PURE__ */ React.createElement(
         "span",
         {
@@ -1271,7 +1405,7 @@
           title: r.weightMissing ? "No weight logged for this day (using Setup default)" : "Weight logged",
           style: { width: 7, height: 7, borderRadius: "50%", background: r.weightMissing ? line : mint, display: "inline-block" }
         }
-      ), r.preloading && /* @__PURE__ */ React.createElement("span", { title: `Pre-loading carbs for tomorrow's ${((_a = r.preloadSession) == null ? void 0 : _a.activityType) || "session"}${r.borrowedKcal > 5 ? ` \u2014 borrowing ${fmt(r.borrowedKcal)} kcal from tomorrow's target` : ""}` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber })), r.repaidKcal > 5 && /* @__PURE__ */ React.createElement("span", { title: `Repaying ${fmt(r.repaidKcal)} kcal borrowed by yesterday's pre-load` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: dim })))), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.weight !== null ? `${fmt(r.weight, 1)}kg` : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(r.bmr)), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(r.baseline)), /* @__PURE__ */ React.createElement("td", null, r.exerciseKcal ? fmt(r.exerciseKcal) : r.trainingMissing ? /* @__PURE__ */ React.createElement("span", { style: { color: coral } }, "?") : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.epocKcal ? fmt(r.epocKcal) : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.fatigueBuffer ? fmt(r.fatigueBuffer) : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(r.demand)), /* @__PURE__ */ React.createElement("td", { style: { color: cyan, fontWeight: 600 } }, fmt(r.target)), /* @__PURE__ */ React.createElement("td", { style: { color: amber } }, r.intake !== null ? fmt(r.intake) : r.nutritionMissing ? /* @__PURE__ */ React.createElement("span", { style: { color: coral } }, "?") : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: r.gap === null ? dim : r.gap < -200 ? coral : r.gap > 200 ? amber : mint, fontWeight: 600 } }, r.gap !== null ? `${r.gap >= 0 ? "+" : ""}${fmt(r.gap)}` : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.tsb !== null ? fmt(r.tsb, 1) : "\u2014"), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(MacroCell, { actual: r.carbs, target: r.carbTargetG })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(MacroCell, { actual: r.protein, target: r.proteinTargetG })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(MacroCell, { actual: r.fat, target: r.fatTargetG })));
+      ), r.preloading && !r.raceLoading && /* @__PURE__ */ React.createElement("span", { title: `Pre-loading carbs for tomorrow's ${((_a = r.preloadSession) == null ? void 0 : _a.activityType) || "session"}${r.borrowedKcal > 5 ? ` \u2014 borrowing ${fmt(r.borrowedKcal)} kcal from tomorrow's target` : ""}` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber })), r.repaidKcal > 5 && /* @__PURE__ */ React.createElement("span", { title: `Repaying ${fmt(r.repaidKcal)} kcal borrowed by yesterday's pre-load` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: dim })), r.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${r.taper.race.notes || r.taper.race.activityType + " race"} in ${r.taper.daysToRace}d \u2014 training scaled to ~${Math.round(r.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender })), r.raceLoading && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${((_b = r.race) == null ? void 0 : _b.notes) || ((_c = r.race) == null ? void 0 : _c.activityType) + " race"} in ${r.race ? daysBetween(r.date, r.race.raceDate) : "?"}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold })))), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.weight !== null ? `${fmt(r.weight, 1)}kg` : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(r.bmr)), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(r.baseline)), /* @__PURE__ */ React.createElement("td", null, r.exerciseKcal ? fmt(r.exerciseKcal) : r.trainingMissing ? /* @__PURE__ */ React.createElement("span", { style: { color: coral } }, "?") : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.epocKcal ? fmt(r.epocKcal) : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.fatigueBuffer ? fmt(r.fatigueBuffer) : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(r.demand)), /* @__PURE__ */ React.createElement("td", { style: { color: cyan, fontWeight: 600 } }, fmt(r.target)), /* @__PURE__ */ React.createElement("td", { style: { color: amber } }, r.intake !== null ? fmt(r.intake) : r.nutritionMissing ? /* @__PURE__ */ React.createElement("span", { style: { color: coral } }, "?") : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: r.gap === null ? dim : r.gap < -200 ? coral : r.gap > 200 ? amber : mint, fontWeight: 600 } }, r.gap !== null ? `${r.gap >= 0 ? "+" : ""}${fmt(r.gap)}` : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.tsb !== null ? fmt(r.tsb, 1) : "\u2014"), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(MacroCell, { actual: r.carbs, target: r.carbTargetG })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(MacroCell, { actual: r.protein, target: r.proteinTargetG })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(MacroCell, { actual: r.fat, target: r.fatTargetG })));
     })))));
   }
   function MacroCell({ actual, target }) {

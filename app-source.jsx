@@ -204,14 +204,87 @@ function estimatePlannedKcal(zoneNum, durationMin, weightKg) {
 function isPreloadWorthy(session) {
   return session.durationMin >= 90 || session.zone >= 4;
 }
+// Races are scheduled separately from recurring sessions — a single dated
+// event rather than a weekly-repeating block — so they're kept in the same
+// `schedule` array but tagged `kind: "race"` and filtered out of the regular
+// recurring-session lookups below. Older entries have no `kind` at all and
+// are treated as recurring for backward compatibility.
 function getScheduledSessionsForDate(schedule, dateStr) {
   const weekday = new Date(dateStr + "T00:00:00").getDay(); // 0=Sun..6=Sat
   return schedule.filter((s) => {
+    if (s.kind === "race") return false;
     if (!s.daysOfWeek.includes(weekday)) return false;
     if (dateStr < s.startDate) return false;
     if (s.endDate && dateStr > s.endDate) return false;
     return true;
   });
+}
+function getRaces(schedule) {
+  return schedule.filter((s) => s.kind === "race");
+}
+// The nearest race on or after dateStr — taper/carb-load math always looks
+// forward to whichever race is next, never a race that's already passed.
+function getUpcomingRace(schedule, dateStr) {
+  const races = getRaces(schedule).filter((s) => s.raceDate >= dateStr);
+  races.sort((a, b) => (a.raceDate < b.raceDate ? -1 : 1));
+  return races[0] || null;
+}
+function daysBetween(fromStr, toStr) {
+  return Math.round((new Date(toStr + "T00:00:00") - new Date(fromStr + "T00:00:00")) / 86400000);
+}
+
+// ---------- auto-taper: general tapering wisdom (Mujika & Padilla, 2003,
+// "Scientific bases for precompetition tapering strategies") ----------
+// The consensus taper cuts training VOLUME substantially (their review puts
+// the effective range at ~40-60% reduction) while keeping frequency and, most
+// importantly, INTENSITY close to normal — intensity is what preserves
+// race-day fitness, volume is what sheds accumulated fatigue. So this ramps
+// session duration down toward a floor as the race nears, while only mildly
+// easing intensity right at the end (never gutting it).
+const TAPER_VOLUME_FLOOR = 0.4; // duration shrinks to as little as 40% of normal on race-eve
+const TAPER_INTENSITY_FLOOR = 0.9; // intensity is preserved, at most trimmed 10%
+function getTaperState(schedule, dateStr) {
+  const race = getUpcomingRace(schedule, dateStr);
+  if (!race || !race.taperDays) return null;
+  const daysToRace = daysBetween(dateStr, race.raceDate);
+  if (daysToRace <= 0 || daysToRace > race.taperDays) return null;
+  // progress: 1.0 at the start of the taper window, 0.0 on the day before the race
+  const progress = race.taperDays > 1 ? (daysToRace - 1) / (race.taperDays - 1) : 0;
+  const volumeFactor = TAPER_VOLUME_FLOOR + (1 - TAPER_VOLUME_FLOOR) * progress;
+  const intensityFactor = TAPER_INTENSITY_FLOOR + (1 - TAPER_INTENSITY_FLOOR) * progress;
+  return { race, daysToRace, volumeFactor, intensityFactor };
+}
+// Recurring sessions that fall inside an active taper window get their
+// duration (and, mildly, intensity) scaled down for demand/fueling purposes —
+// the underlying schedule entry itself is untouched, this only affects the
+// day's projection.
+function getEffectiveSessionsForDate(schedule, dateStr) {
+  const sessions = getScheduledSessionsForDate(schedule, dateStr);
+  const taper = getTaperState(schedule, dateStr);
+  if (!taper) return { sessions, taper: null };
+  const tapered = sessions.map((s) => ({
+    ...s,
+    durationMin: Math.max(0, Math.round(s.durationMin * taper.volumeFactor)),
+    taperIntensityFactor: taper.intensityFactor,
+  }));
+  return { sessions: tapered, taper };
+}
+
+// ---------- pre-race carbohydrate loading ----------
+// Final days before a long race get deliberate glycogen supercompensation
+// (Bussau et al. / the classic Sherman-Costill loading protocol, now folded
+// into the IOC consensus statement): carb intake pushed to the top of the
+// high-volume tier for a short window, independent of that day's own (now
+// tapered-down) training load. Only worth doing ahead of races long enough to
+// meaningfully deplete glycogen in the first place.
+const CARB_LOAD_DAYS = 3;
+const CARB_LOAD_MIN_DURATION = 90;
+function getCarbLoadState(schedule, dateStr) {
+  const race = getUpcomingRace(schedule, dateStr);
+  if (!race || race.durationMin < CARB_LOAD_MIN_DURATION) return null;
+  const daysToRace = daysBetween(dateStr, race.raceDate);
+  if (daysToRace <= 0 || daysToRace > CARB_LOAD_DAYS) return null;
+  return { race, daysToRace };
 }
 
 // ---------- goal-based calorie targets + weight-trend calibration ----------
@@ -293,6 +366,7 @@ const ICONS = {
   trash: "M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z",
   plus: "M12 5v14M5 12h14",
   calendar: "M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z",
+  trophy: "M8 21h8M12 17v4M7 4h10v4a5 5 0 01-10 0V4zM7 4H3v2a4 4 0 004 4M17 4h4v2a4 4 0 01-4 4",
 };
 
 function App() {
@@ -308,7 +382,9 @@ function App() {
   const [loaded, setLoaded] = useState(false);
   const [nutrition, setNutrition] = useState({});
   const [weightLog, setWeightLog] = useState({}); // { 'YYYY-MM-DD': kg }
-  const [schedule, setSchedule] = useState([]); // [{ id, activityType, zone, durationMin, daysOfWeek, startDate, endDate, notes }]
+  const [schedule, setSchedule] = useState([]);
+  // Recurring: { id, kind: "recurring", activityType, zone, durationMin, daysOfWeek, startDate, endDate, notes }
+  // Race:      { id, kind: "race", activityType, zone, durationMin, raceDate, taperDays, notes }
   const [csvPreview, setCsvPreview] = useState(null);
   const [csvPreviewSource, setCsvPreviewSource] = useState(null); // 'csv' | 'sheet'
   const [colMap, setColMap] = useState({ date: "", calories: "", protein: "", carbs: "", fat: "" });
@@ -651,7 +727,8 @@ function App() {
       const stravaActs = stravaByDate[key] || [];
       const intervalsActs = actByDate[key] || [];
       const stravaSynced = stravaSyncedSet.has(key);
-      const scheduledSessions = getScheduledSessionsForDate(schedule, key);
+      const { sessions: scheduledSessions, taper } = getEffectiveSessionsForDate(schedule, key);
+      const carbLoad = getCarbLoadState(schedule, key);
 
       // Use that day's logged weight for BMR/targets when available — body
       // weight shifts across a training block, and this keeps demand/fueling
@@ -691,11 +768,12 @@ function App() {
         source = "planned";
         for (const s of scheduledSessions) {
           const z = ZONES[s.zone - 1];
-          const kcal = estimatePlannedKcal(s.zone, s.durationMin, weightForDay);
+          const effIF = s.taperIntensityFactor ? z.if * s.taperIntensityFactor : z.if; // tapered sessions carry a reduced effective intensity
+          const kcal = estimatePlannedKcal(s.zone, s.durationMin, weightForDay); // s.durationMin is already taper-adjusted
           exerciseKcal += kcal;
-          epocKcal += kcal * epocFactorFor(z.if) * profile.epocSensitivity;
+          epocKcal += kcal * epocFactorFor(effIF) * profile.epocSensitivity;
           durationSec += s.durationMin * 60;
-          ifWeightedSum += z.if * (s.durationMin * 60);
+          ifWeightedSum += effIF * (s.durationMin * 60);
         }
       } else if (stravaSynced) {
         source = "strava"; // confirmed rest day — zero is a real answer, not a gap
@@ -743,19 +821,29 @@ function App() {
       const preloadSession = tomorrowSessions.filter(isPreloadWorthy).sort((a, b) => b.durationMin - a.durationMin)[0];
       const preloadTier = preloadSession ? classifyTrainingTier(preloadSession.durationMin) : null;
       const preloading = !!(preloadTier && FUEL_TIERS.indexOf(preloadTier) > FUEL_TIERS.indexOf(fuelTier));
-      const effectiveTier = preloading ? preloadTier : fuelTier;
+      // Pre-race carb loading overrides the ordinary day-before pre-load: it
+      // pins carbs to the top tier at the top of its range regardless of that
+      // day's own (now tapered-down) training, for the last few days before a
+      // qualifying race.
+      const raceLoading = !!carbLoad;
+      const effectiveTier = raceLoading ? FUEL_TIERS[FUEL_TIERS.length - 1] : (preloading ? preloadTier : fuelTier);
       const blend = intensityBlend(avgIF);
+      const effectiveBlend = raceLoading ? 1 : blend;
       const normalCarbTargetG = weightForDay ? weightForDay * (fuelTier.carbLo + (fuelTier.carbHi - fuelTier.carbLo) * blend) : null;
-      const carbTargetG = weightForDay ? weightForDay * (effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * blend) : null;
-      const extraCarbKcal = (preloading && carbTargetG !== null && normalCarbTargetG !== null) ? (carbTargetG - normalCarbTargetG) * 4 : 0;
+      const carbTargetG = weightForDay ? weightForDay * (effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * effectiveBlend) : null;
+      const extraCarbKcal = ((preloading || raceLoading) && carbTargetG !== null && normalCarbTargetG !== null && carbTargetG > normalCarbTargetG)
+        ? (carbTargetG - normalCarbTargetG) * 4 : 0;
       const borrowRatio = Math.min(1, Math.max(0, parseFloat(profile.preloadBorrowRatio)));
-      const borrowedKcal = extraCarbKcal * (isNaN(borrowRatio) ? 1 : borrowRatio);
+      // Race-day carb loading is a deliberate short-term surplus, not a swap —
+      // it isn't funded by shorting some later day the way the ordinary
+      // day-before pre-load is.
+      const borrowedKcal = raceLoading ? extraCarbKcal : extraCarbKcal * (isNaN(borrowRatio) ? 1 : borrowRatio);
 
       // Apply today: repay what yesterday borrowed from today, then borrow
       // today's own share from tomorrow.
       const repaidKcal = carryRepaymentKcal; // capture before we overwrite it below
       const target = baseTarget - repaidKcal + borrowedKcal;
-      carryRepaymentKcal = borrowedKcal; // tomorrow's iteration will subtract this
+      carryRepaymentKcal = raceLoading ? 0 : borrowedKcal; // tomorrow's iteration will subtract this
 
       const gap = intake !== null ? intake - target : null;
 
@@ -788,6 +876,7 @@ function App() {
         weightMissing: weightMissing && !isFutureOrToday,
         durationMin, fuelTier, carbTargetG, proteinTargetG, fatTargetG, isFutureOrToday,
         scheduledSessions, preloading, preloadSession, borrowedKcal, repaidKcal,
+        taper, raceLoading, race: taper?.race || carbLoad?.race || null,
       });
     }
     return days;
@@ -1524,8 +1613,11 @@ function WeightLogTable({ weightLog, onSave, onDelete }) {
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const ACTIVITY_COLORS = { Run: coral, Ride: cyan, Swim: mint, Row: lavender, Strength: gold, Other: amber };
 
+const DEFAULT_TAPER_DAYS = 10; // middle of the commonly-cited 1-2 week taper window
+
 function emptyScheduleForm() {
   return {
+    kind: "recurring",
     activityType: "Run",
     zone: 2,
     durationMin: "45",
@@ -1534,12 +1626,17 @@ function emptyScheduleForm() {
     endDate: "",
     ongoing: true,
     notes: "",
+    raceDate: toLocalISODate(new Date()),
+    taperDays: String(DEFAULT_TAPER_DAYS),
   };
 }
 
 function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
   const [form, setForm] = useState(emptyScheduleForm());
   const [editingId, setEditingId] = useState(null);
+
+  const recurring = schedule.filter((s) => s.kind !== "race");
+  const races = getRaces(schedule).slice().sort((a, b) => (a.raceDate < b.raceDate ? -1 : 1));
 
   function toggleDay(n) {
     setForm((f) => ({
@@ -1550,11 +1647,20 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
 
   function startEdit(s) {
     setEditingId(s.id);
-    setForm({
-      activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
-      daysOfWeek: s.daysOfWeek, startDate: s.startDate, endDate: s.endDate || "",
-      ongoing: !s.endDate, notes: s.notes || "",
-    });
+    if (s.kind === "race") {
+      setForm({
+        ...emptyScheduleForm(),
+        kind: "race", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
+        raceDate: s.raceDate, taperDays: String(s.taperDays ?? DEFAULT_TAPER_DAYS), notes: s.notes || "",
+      });
+    } else {
+      setForm({
+        ...emptyScheduleForm(),
+        kind: "recurring", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
+        daysOfWeek: s.daysOfWeek, startDate: s.startDate, endDate: s.endDate || "",
+        ongoing: !s.endDate, notes: s.notes || "",
+      });
+    }
   }
   function cancelEdit() {
     setEditingId(null);
@@ -1562,8 +1668,23 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
   }
 
   function handleSubmit() {
+    if (form.kind === "race") {
+      const entry = {
+        kind: "race",
+        activityType: form.activityType,
+        zone: form.zone,
+        durationMin: parseInt(form.durationMin) || 0,
+        raceDate: form.raceDate,
+        taperDays: Math.max(0, parseInt(form.taperDays) || 0),
+        notes: form.notes,
+      };
+      if (editingId) onUpdate(editingId, entry); else onAdd(entry);
+      cancelEdit();
+      return;
+    }
     if (form.daysOfWeek.length === 0) { alert("Pick at least one day of the week."); return; }
     const entry = {
+      kind: "recurring",
       activityType: form.activityType,
       zone: form.zone,
       durationMin: parseInt(form.durationMin) || 0,
@@ -1577,14 +1698,18 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
   }
 
   // 3 full weeks starting from the most recent Sunday, so the schedule's actual
-  // effect is visible as a calendar before it shows up on the dashboard.
+  // effect (including any taper/carb-loading a race triggers) is visible as a
+  // calendar before it shows up on the dashboard.
   const calendarStart = daysAgo(new Date().getDay());
   const calendarDays = [];
   for (let i = 0; i < 21; i++) {
     const d = new Date(calendarStart);
     d.setDate(d.getDate() + i);
     const key = toLocalISODate(d);
-    calendarDays.push({ key, date: d, sessions: getScheduledSessionsForDate(schedule, key) });
+    const { sessions, taper } = getEffectiveSessionsForDate(schedule, key);
+    const raceToday = races.find((r) => r.raceDate === key);
+    const carbLoad = getCarbLoadState(schedule, key);
+    calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad });
   }
   const todayKey = toLocalISODate(new Date());
 
@@ -1592,12 +1717,31 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
     <div style={{ display: "grid", gap: 20 }}>
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.calendar} size={16} color={cyan} /> {editingId ? "Edit scheduled session" : "Add a recurring session"}
+          <Icon path={form.kind === "race" ? ICONS.trophy : ICONS.calendar} size={16} color={cyan} /> {editingId ? "Edit scheduled session" : "Add to schedule"}
         </div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
-          Repeats on the days you pick, within the date range. Projects up to {FORWARD_DAYS} days ahead on the
-          dashboard as an estimate — once a real activity syncs in for that day, it takes over automatically.
+          {form.kind === "race"
+            ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days."
+            : <>Repeats on the days you pick, within the date range. Projects up to {FORWARD_DAYS} days ahead on the
+              dashboard as an estimate — once a real activity syncs in for that day, it takes over automatically.</>}
         </div>
+
+        {!editingId && (
+          <div style={{ display: "flex", gap: 4, marginBottom: 16 }}>
+            <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "recurring" }))}
+              style={form.kind === "recurring"
+                ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+                : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Icon path={ICONS.calendar} size={13} color={form.kind === "recurring" ? ink : dim} /> Recurring session
+            </button>
+            <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "race" }))}
+              style={form.kind === "race"
+                ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+                : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Icon path={ICONS.trophy} size={13} color={form.kind === "race" ? ink : dim} /> Race
+            </button>
+          </div>
+        )}
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
           <Field label="Activity type">
@@ -1605,7 +1749,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
               {ACTIVITY_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
             </select>
           </Field>
-          <Field label="Duration (min)">
+          <Field label={form.kind === "race" ? "Expected finish time (min)" : "Duration (min)"}>
             <input className="inp" type="number" min="1" value={form.durationMin} onChange={(e) => setForm((f) => ({ ...f, durationMin: e.target.value }))} />
           </Field>
         </div>
@@ -1625,51 +1769,86 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
           <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>{ZONES[form.zone - 1].label} · {ZONES[form.zone - 1].hrPct}</div>
         </Field>
 
-        <div style={{ marginTop: 14 }}>
-          <span className="fieldlabel">Days of week</span>
-          <div style={{ display: "flex", gap: 4 }}>
-            {WEEKDAY_LABELS.map((label, n) => (
-              <button key={n} type="button" onClick={() => toggleDay(n)}
-                style={form.daysOfWeek.includes(n)
-                  ? { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 700, fontSize: 11.5, cursor: "pointer", border: "none", background: amber, color: ink }
-                  : { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 600, fontSize: 11.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }}>
-                {label}
-              </button>
-            ))}
+        {form.kind === "race" ? (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 }}>
+            <Field label="Race date">
+              <input className="inp" type="date" value={form.raceDate} onChange={(e) => setForm((f) => ({ ...f, raceDate: e.target.value }))} />
+            </Field>
+            <Field label="Taper starts (days before race)">
+              <input className="inp" type="number" min="0" value={form.taperDays} onChange={(e) => setForm((f) => ({ ...f, taperDays: e.target.value }))} />
+            </Field>
           </div>
-        </div>
+        ) : (
+          <>
+            <div style={{ marginTop: 14 }}>
+              <span className="fieldlabel">Days of week</span>
+              <div style={{ display: "flex", gap: 4 }}>
+                {WEEKDAY_LABELS.map((label, n) => (
+                  <button key={n} type="button" onClick={() => toggleDay(n)}
+                    style={form.daysOfWeek.includes(n)
+                      ? { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 700, fontSize: 11.5, cursor: "pointer", border: "none", background: amber, color: ink }
+                      : { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 600, fontSize: 11.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 14, marginTop: 14, alignItems: "end" }}>
-          <Field label="Start date">
-            <input className="inp" type="date" value={form.startDate} onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value }))} />
-          </Field>
-          <Field label="End date">
-            <input className="inp" type="date" value={form.endDate} disabled={form.ongoing}
-              onChange={(e) => setForm((f) => ({ ...f, endDate: e.target.value }))} style={{ opacity: form.ongoing ? 0.5 : 1 }} />
-          </Field>
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
-            <input type="checkbox" checked={form.ongoing} onChange={(e) => setForm((f) => ({ ...f, ongoing: e.target.checked }))} />
-            Ongoing
-          </label>
-        </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 14, marginTop: 14, alignItems: "end" }}>
+              <Field label="Start date">
+                <input className="inp" type="date" value={form.startDate} onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value }))} />
+              </Field>
+              <Field label="End date">
+                <input className="inp" type="date" value={form.endDate} disabled={form.ongoing}
+                  onChange={(e) => setForm((f) => ({ ...f, endDate: e.target.value }))} style={{ opacity: form.ongoing ? 0.5 : 1 }} />
+              </Field>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
+                <input type="checkbox" checked={form.ongoing} onChange={(e) => setForm((f) => ({ ...f, ongoing: e.target.checked }))} />
+                Ongoing
+              </label>
+            </div>
+          </>
+        )}
 
         <div style={{ marginTop: 14 }}>
           <Field label="Notes (optional)">
-            <input className="inp" value={form.notes} onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} placeholder="e.g. track intervals" />
+            <input className="inp" value={form.notes} onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} placeholder={form.kind === "race" ? "e.g. Boston Marathon" : "e.g. track intervals"} />
           </Field>
         </div>
 
         <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
-          <button className="btn-primary" onClick={handleSubmit}>{editingId ? "Save changes" : "Add to schedule"}</button>
+          <button className="btn-primary" onClick={handleSubmit}>{editingId ? "Save changes" : (form.kind === "race" ? "Add race" : "Add to schedule")}</button>
           {editingId && <button className="btn-ghost" onClick={cancelEdit}>Cancel</button>}
         </div>
       </div>
 
-      {schedule.length > 0 && (
+      {races.length > 0 && (
+        <div className="card" style={{ padding: 22 }}>
+          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", gap: 7 }}>
+            <Icon path={ICONS.trophy} size={16} color={gold} /> Races
+          </div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {races.map((s) => (
+              <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 }}>
+                <div style={{ flex: 1 }}>
+                  <b>{s.notes || s.activityType}</b> · {s.activityType} · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
+                  <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
+                    {s.raceDate} · taper starts {s.taperDays}d out
+                  </div>
+                </div>
+                <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
+                <button title="Delete" onClick={() => { if (confirm("Delete this race?")) onDelete(s.id); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {recurring.length > 0 && (
         <div className="card" style={{ padding: 22 }}>
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Recurring sessions</div>
           <div style={{ display: "grid", gap: 8 }}>
-            {schedule.map((s) => (
+            {recurring.map((s) => (
               <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 }}>
                 <div style={{ flex: 1 }}>
                   <b>{s.activityType}</b> · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
@@ -1690,8 +1869,12 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
           <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
         </div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 5 }}>
-          Next 3 weeks · <Icon path={ICONS.flame} size={10} color={amber} /> pre-loads the day before
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <span>Next 3 weeks</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={amber} /> pre-loads the day before</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.gauge} size={10} color={lavender} /> tapering</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.trophy} size={10} color={gold} /> race day</span>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
           {WEEKDAY_LABELS.map((label) => (
@@ -1703,7 +1886,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
             return (
               <div key={day.key} style={{
                 background: panel2,
-                border: isToday ? `2px solid ${cyan}` : `1px solid ${line}`,
+                border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
                 borderRadius: 5,
                 padding: 6,
                 minHeight: 76,
@@ -1711,11 +1894,22 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
                 flexDirection: "column",
                 gap: 3,
               }}>
-                <div style={{ fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600 }}>
+                <div style={{ fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 }}>
                   {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
+                  {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
+                  {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
                 </div>
+                {day.race && (
+                  <div title={`Race: ${day.race.notes || day.race.activityType} · ${day.race.durationMin}min`}
+                    style={{
+                      background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
+                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3,
+                    }}>
+                    <Icon path={ICONS.trophy} size={9} color={ink} /> {day.race.notes || day.race.activityType}
+                  </div>
+                )}
                 {day.sessions.map((s, i) => (
-                  <div key={i} title={`${s.activityType} · ${ZONES[s.zone - 1].label.split(" · ")[1]} · ${s.durationMin}min${s.notes ? ` · ${s.notes}` : ""}`}
+                  <div key={i} title={`${s.activityType} · ${ZONES[s.zone - 1].label.split(" · ")[1]} · ${s.durationMin}min${s.notes ? ` · ${s.notes}` : ""}${day.taper ? " · tapered" : ""}`}
                     style={{
                       background: ACTIVITY_COLORS[s.activityType] || dim,
                       color: ink,
@@ -1727,6 +1921,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
                       display: "flex",
                       alignItems: "center",
                       gap: 3,
+                      opacity: day.taper ? 0.65 : 1,
                     }}>
                     {s.activityType} Z{s.zone} · {s.durationMin}m
                     {isPreloadWorthy(s) && <Icon path={ICONS.flame} size={9} color={ink} />}
@@ -1925,8 +2120,10 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
                       style={{ width: 7, height: 7, borderRadius: "50%", background: r.nutritionMissing ? coral : (r.intake !== null ? (r.nutritionSource === "macrosfirst" ? amber : mint) : line), display: "inline-block" }} />
                     <span title={r.weightMissing ? "No weight logged for this day (using Setup default)" : "Weight logged"}
                       style={{ width: 7, height: 7, borderRadius: "50%", background: r.weightMissing ? line : mint, display: "inline-block" }} />
-                    {r.preloading && <span title={`Pre-loading carbs for tomorrow's ${r.preloadSession?.activityType || "session"}${r.borrowedKcal > 5 ? ` — borrowing ${fmt(r.borrowedKcal)} kcal from tomorrow's target` : ""}`}><Icon path={ICONS.flame} size={10} color={amber} /></span>}
+                    {r.preloading && !r.raceLoading && <span title={`Pre-loading carbs for tomorrow's ${r.preloadSession?.activityType || "session"}${r.borrowedKcal > 5 ? ` — borrowing ${fmt(r.borrowedKcal)} kcal from tomorrow's target` : ""}`}><Icon path={ICONS.flame} size={10} color={amber} /></span>}
                     {r.repaidKcal > 5 && <span title={`Repaying ${fmt(r.repaidKcal)} kcal borrowed by yesterday's pre-load`}><Icon path={ICONS.gauge} size={10} color={dim} /></span>}
+                    {r.taper && <span title={`Tapering for ${r.taper.race.notes || r.taper.race.activityType + " race"} in ${r.taper.daysToRace}d — training scaled to ~${Math.round(r.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={10} color={lavender} /></span>}
+                    {r.raceLoading && <span title={`Carb-loading ahead of ${r.race?.notes || r.race?.activityType + " race"} in ${r.race ? daysBetween(r.date, r.race.raceDate) : "?"}d`}><Icon path={ICONS.flame} size={10} color={gold} /></span>}
                   </span>
                 </td>
                 <td style={{ color: dim }}>{r.weight !== null ? `${fmt(r.weight, 1)}kg` : "—"}</td>

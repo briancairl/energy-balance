@@ -2008,7 +2008,14 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
     return { ...r, weightTrend: trend };
   });
   return (
-    <div style={{ display: "grid", gap: 20 }}>
+    // gridTemplateColumns is pinned to minmax(0, 1fr) rather than left as the
+    // default "auto" — a card containing a chart pinned to a fixed pixel
+    // width (days × 70px, easily 1000px+) would otherwise make its grid
+    // track (and this whole column, and the page) blow out past the
+    // viewport, since "auto" tracks size to their content's min-content
+    // width. That silently broke the page's centering only while Dashboard
+    // was open, since it's the only tab with fixed-width content this wide.
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" }}>
       {(summary.trainingMissingDays > 0 || summary.nutritionMissingDays > 0) && (
         <div style={{ display: "flex", gap: 8, background: "rgba(232,163,61,0.1)", border: `1px solid ${amber}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" }}>
           <Icon path={ICONS.warn} size={16} color={amber} />

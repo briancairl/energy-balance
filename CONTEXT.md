@@ -87,9 +87,12 @@ app.js` confirms the compiled output is valid JS.
 - **Google does not rotate refresh tokens on renewal** (unlike Strava) —
   `ensure_fresh_google_token` reuses the original one; don't "fix" this into expecting a new
   one each refresh.
-- Manual flow: Log tab → "Sync from Google Sheet" → map columns (same UI/logic as a CSV
-  import) → Import. The chosen mapping is saved server-side under the store key
-  `google-sheet-colmap` specifically so the automatic job (below) can reuse it.
+- Manual flow: Log tab → "Sync from Google Sheet". If the fetched sheet's columns still match
+  the mapping saved from a previous import (`google-sheet-colmap`), it imports immediately —
+  no re-mapping or a separate "Import Rows" click needed. Only falls back to the manual
+  map-columns-then-import step (same UI/logic as a CSV import) when there's no cached mapping
+  yet, or the sheet's columns have changed since. Either way, the mapping used gets saved back
+  to `google-sheet-colmap`, which is also what seeds the automatic job (below).
 - **Automatic daily sync**: `google_auto_sync_loop` (background thread) wakes at
   `google_sync_time` (default `"04:00"`) every day, re-fetches the sheet, and merges rows
   into `nutrition-log`'s `macrosfirst` slot per date. It refuses to run (logs why, doesn't
@@ -158,6 +161,17 @@ history and just persist as entered.
   table, `durationMin`, `daysOfWeek`, date range). Used to (a) estimate kcal for
   future/unsynced days (MET × weight × hours) and (b) drive pre-loading. Dashboard projects
   `FORWARD_DAYS` (4) days beyond today.
+- **Races + auto-taper**: races are a second `schedule` entry kind (`kind: "race"` — a single
+  `raceDate` + `taperDays` instead of a weekly recurrence) rather than a separate store key, so
+  taper/carb-load math can look at the same array as recurring sessions. Inside the taper
+  window, recurring sessions get duration scaled down to as low as 40% on race-eve while
+  intensity is only mildly trimmed (floor 90%) — standard taper guidance (Mujika & Padilla,
+  2003) is to shed volume, not intensity. The final `CARB_LOAD_DAYS` (3) before a race
+  ≥`CARB_LOAD_MIN_DURATION` (90 min) pin carb targets to the top tier's top end regardless of
+  that day's own (tapered) training, and — unlike ordinary pre-loading — that surplus is *not*
+  funded by debiting a later day; it's a deliberate short-term glycogen-loading overshoot, not
+  a swap. See `getTaperState` / `getCarbLoadState` / `getEffectiveSessionsForDate` in
+  `app-source.jsx`.
 
 ## Server concurrency (fixed after a real corruption incident — don't regress this)
 

@@ -12,18 +12,18 @@
     ReferenceLine
   } = Recharts;
   const Papa = window.Papa;
-  const ink = "#0F1416";
-  const panel = "#161D20";
-  const panel2 = "#1D262A";
-  const line = "#2A363B";
-  const paper = "#EDE6D6";
-  const cyan = "#4FD1D9";
-  const amber = "#E8A33D";
-  const coral = "#E1604D";
-  const mint = "#7FC8A9";
-  const lavender = "#B98CE8";
-  const gold = "#E8C468";
-  const dim = "#7C8B8F";
+  const ink = "var(--ink)";
+  const panel = "var(--panel)";
+  const panel2 = "var(--panel2)";
+  const line = "var(--line)";
+  const paper = "var(--paper)";
+  const cyan = "var(--cyan)";
+  const amber = "var(--amber)";
+  const coral = "var(--coral)";
+  const mint = "var(--mint)";
+  const lavender = "var(--lavender)";
+  const gold = "var(--gold)";
+  const dim = "var(--dim)";
   const mono = "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace";
   const grotesk = "'Space Grotesk', system-ui, sans-serif";
   const body = "'Inter', system-ui, sans-serif";
@@ -282,10 +282,21 @@
     trash: "M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z",
     plus: "M12 5v14M5 12h14",
     calendar: "M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z",
-    trophy: "M8 21h8M12 17v4M7 4h10v4a5 5 0 01-10 0V4zM7 4H3v2a4 4 0 004 4M17 4h4v2a4 4 0 01-4 4"
+    trophy: "M8 21h8M12 17v4M7 4h10v4a5 5 0 01-10 0V4zM7 4H3v2a4 4 0 004 4M17 4h4v2a4 4 0 01-4 4",
+    sun: "M12 17a5 5 0 100-10 5 5 0 000 10zM12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42",
+    moon: "M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"
   };
   function App() {
     const [tab, setTab] = useState("setup");
+    const [theme, setTheme] = useState(() => document.documentElement.dataset.theme === "light" ? "light" : "dark");
+    const toggleTheme = useCallback(() => {
+      setTheme((prev) => {
+        const next = prev === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = next;
+        localStorage.setItem("theme", next);
+        return next;
+      });
+    }, []);
     const [profile, setProfile] = useState({
       sex: "male",
       weightKg: "",
@@ -820,12 +831,22 @@
         *::-webkit-scrollbar-thumb { background: ${line}; border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
         *::-webkit-scrollbar-thumb:hover { background: ${dim}; background-clip: padding-box; }
         *::-webkit-scrollbar-corner { background: transparent; }
-      `), /* @__PURE__ */ React.createElement("div", { style: { borderBottom: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("div", { style: { padding: "18px 28px", maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10 } }, /* @__PURE__ */ React.createElement("img", { src: "/logo-header.png", alt: "", width: 28, height: 28, style: { borderRadius: 6, display: "block" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 17, letterSpacing: "-0.01em" } }, "Energy Balance"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, fontFamily: mono, marginTop: 1 } }, "training demand vs. fuel intake \u2014 local build"))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, [
+      `), /* @__PURE__ */ React.createElement("div", { style: { borderBottom: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("div", { style: { padding: "18px 28px", maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10 } }, /* @__PURE__ */ React.createElement("img", { src: "/logo-header.png", alt: "", width: 28, height: 28, style: { borderRadius: 6, display: "block" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 17, letterSpacing: "-0.01em" } }, "Energy Balance"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, fontFamily: mono, marginTop: 1 } }, "training demand vs. fuel intake \u2014 local build"))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 4 } }, [
       { id: "setup", label: "Setup", icon: ICONS.settings },
       { id: "import", label: "Log", icon: ICONS.upload },
       { id: "schedule", label: "Schedule", icon: ICONS.calendar },
       { id: "dashboard", label: "Dashboard", icon: ICONS.activity }
-    ].map(({ id, label, icon }) => /* @__PURE__ */ React.createElement("div", { key: id, className: `navbtn ${tab === id ? "active" : ""}`, onClick: () => setTab(id) }, /* @__PURE__ */ React.createElement(Icon, { path: icon, size: 14 }), " ", label))))), /* @__PURE__ */ React.createElement("div", { style: { padding: "24px 28px", maxWidth: 1080, margin: "0 auto" } }, tab === "setup" && /* @__PURE__ */ React.createElement(
+    ].map(({ id, label, icon }) => /* @__PURE__ */ React.createElement("div", { key: id, className: `navbtn ${tab === id ? "active" : ""}`, onClick: () => setTab(id) }, /* @__PURE__ */ React.createElement(Icon, { path: icon, size: 14 }), " ", label)), /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        className: "navbtn",
+        onClick: toggleTheme,
+        title: theme === "dark" ? "Switch to light mode" : "Switch to dark mode",
+        "aria-label": "Toggle color theme",
+        style: { marginLeft: 6 }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { path: theme === "dark" ? ICONS.sun : ICONS.moon, size: 14 })
+    )))), /* @__PURE__ */ React.createElement("div", { style: { padding: "24px 28px", maxWidth: 1080, margin: "0 auto" } }, tab === "setup" && /* @__PURE__ */ React.createElement(
       SetupTab,
       {
         profile,

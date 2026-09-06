@@ -813,8 +813,13 @@ function App() {
       const durationMin = durationSec / 60;
       const avgIF = durationSec > 0 ? ifWeightedSum / durationSec : 0.5;
 
-      const dayBmr = weightForDay
-        ? calcBMR(profile.sex, weightForDay, parseFloat(profile.heightCm), parseFloat(profile.age))
+      // Maintenance pins BMR to the athlete's profile weight rather than
+      // that day's logged weight — day-to-day water/glycogen swings
+      // shouldn't move the "maintain" target. Build/lose intentionally
+      // keep tracking the logged weight, since their rate is a % of it.
+      const bmrWeight = profile.goal === "maintain" ? (parseFloat(profile.weightKg) || null) : weightForDay;
+      const dayBmr = bmrWeight
+        ? calcBMR(profile.sex, bmrWeight, parseFloat(profile.heightCm), parseFloat(profile.age))
         : bmr;
 
       const w = wellByDate[key];

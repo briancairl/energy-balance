@@ -668,7 +668,8 @@
         }
         const durationMin = durationSec / 60;
         const avgIF = durationSec > 0 ? ifWeightedSum / durationSec : 0.5;
-        const dayBmr = weightForDay ? calcBMR(profile.sex, weightForDay, parseFloat(profile.heightCm), parseFloat(profile.age)) : bmr;
+        const bmrWeight = profile.goal === "maintain" ? parseFloat(profile.weightKg) || null : weightForDay;
+        const dayBmr = bmrWeight ? calcBMR(profile.sex, bmrWeight, parseFloat(profile.heightCm), parseFloat(profile.age)) : bmr;
         const w = wellByDate[key];
         const ctl = (_b = w == null ? void 0 : w.ctl) != null ? _b : null;
         const atl = (_c = w == null ? void 0 : w.atl) != null ? _c : null;

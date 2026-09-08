@@ -19,9 +19,49 @@
 <script src="https://unpkg.com/papaparse@5/papaparse.min.js"></script>
 <script src="https://unpkg.com/recharts@2/umd/Recharts.js"></script>
 <style>
+  :root {
+    --ink: #0F1416;
+    --panel: #161D20;
+    --panel2: #1D262A;
+    --line: #2A363B;
+    --paper: #EDE6D6;
+    --cyan: #4FD1D9;
+    --amber: #E8A33D;
+    --coral: #E1604D;
+    --mint: #7FC8A9;
+    --lavender: #B98CE8;
+    --gold: #E8C468;
+    --dim: #7C8B8F;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --ink: #EDE6D6;
+    --panel: #FAF6EC;
+    --panel2: #F2ECDC;
+    --line: #D9CFB4;
+    --paper: #14181A;
+    --cyan: #0E7C86;
+    --amber: #B36E14;
+    --coral: #C23F2D;
+    --mint: #2F8F68;
+    --lavender: #7A4FC4;
+    --gold: #9C7A1E;
+    --dim: #6B6357;
+    color-scheme: light;
+  }
   html, body, #root { height: 100%; margin: 0; }
-  body { background: #0F1416; }
+  body { background: var(--ink); }
 </style>
+<script>
+  // Blocking (pre-render) so the correct theme applies before first paint —
+  // avoids a flash of the wrong theme. Falls back to OS preference on a
+  // first visit with nothing saved yet.
+  (function () {
+    const saved = localStorage.getItem("theme");
+    const theme = saved || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
 </head>
 <body>
 <div id="root"></div>

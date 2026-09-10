@@ -70,6 +70,50 @@ function parseFlexibleDate(raw) {
 
 function daysAgo(n) { const d = new Date(); d.setDate(d.getDate() - n); return d; }
 
+// ---------- units: canonical storage (profile.weightKg/heightCm, weightLog,
+// targetWeightKg) always stays metric — only display/input translates through
+// the global profile.units toggle, so BMR/fueling math never has to care
+// which unit the person is looking at. ----------
+const KG_PER_LB = 0.45359237;
+const CM_PER_IN = 2.54;
+function kgToLb(kg) { return kg / KG_PER_LB; }
+function lbToKg(lb) { return lb * KG_PER_LB; }
+function cmToIn(cm) { return cm / CM_PER_IN; }
+function inToCm(inch) { return inch * CM_PER_IN; }
+function weightUnitLabel(units) { return units === "imperial" ? "lb" : "kg"; }
+function heightUnitLabel(units) { return units === "imperial" ? "in" : "cm"; }
+function kgToDisplay(kg, units) { return units === "imperial" ? kgToLb(kg) : kg; }
+function displayToKg(v, units) { return units === "imperial" ? lbToKg(v) : v; }
+function cmToDisplayLen(cm, units) { return units === "imperial" ? cmToIn(cm) : cm; }
+function displayToCm(v, units) { return units === "imperial" ? inToCm(v) : v; }
+function roundTo(n, decimals) { const f = 10 ** decimals; return Math.round(n * f) / f; }
+
+// Keeps a text input's displayed value in the current unit system while the
+// value passed around the rest of the app stays metric — only resyncs the
+// buffer when the metric value changed for a reason OTHER than this input's
+// own last edit (profile loaded from the server, a new weigh-in auto-synced
+// in, or the global unit toggle flipped), so a keystroke never gets
+// reformatted out from under whoever's typing it.
+function useUnitInput(metricStr, units, toDisplay, toMetric, decimals = 1) {
+  const [text, setText] = useState("");
+  const lastSyncedRef = useRef({ metric: undefined, units: undefined });
+  useEffect(() => {
+    if (metricStr === lastSyncedRef.current.metric && units === lastSyncedRef.current.units) return;
+    lastSyncedRef.current = { metric: metricStr, units };
+    const num = parseFloat(metricStr);
+    setText(Number.isNaN(num) ? "" : String(roundTo(toDisplay(num, units), decimals)));
+  }, [metricStr, units]);
+  function onChange(e, onChangeMetric) {
+    const raw = e.target.value;
+    setText(raw);
+    const num = parseFloat(raw);
+    const metric = raw.trim() === "" ? "" : (Number.isNaN(num) ? (lastSyncedRef.current.metric ?? "") : String(toMetric(num, units)));
+    lastSyncedRef.current = { metric, units };
+    onChangeMetric(metric);
+  }
+  return [text, onChange];
+}
+
 // ---------- persistence: server-side (/api/store), shared across every device
 // pointed at this server instance, instead of per-browser localStorage ----------
 async function storageGet(key, fallback) {
@@ -213,10 +257,19 @@ function isPreloadWorthy(session) {
 // `schedule` array but tagged `kind: "race"` and filtered out of the regular
 // recurring-session lookups below. Older entries have no `kind` at all and
 // are treated as recurring for backward compatibility.
+//
+// `kind: "single"` is a third variant: one specific date, no weekly repeat
+// (`date` instead of `daysOfWeek`/`startDate`/`endDate`). It exists so a
+// one-off session (a plan swap, a single group ride, a day imported from an
+// external plan) doesn't have to be faked as a recurring entry whose
+// startDate/endDate happen to be the same day — that hack made every such
+// entry show up in the "Recurring sessions" list even though it never
+// recurred. Single-session entries get their own list in ScheduleTab.
 function getScheduledSessionsForDate(schedule, dateStr) {
   const weekday = new Date(dateStr + "T00:00:00").getDay(); // 0=Sun..6=Sat
   return schedule.filter((s) => {
     if (s.kind === "race") return false;
+    if (s.kind === "single") return s.date === dateStr;
     if (!s.daysOfWeek.includes(weekday)) return false;
     if (dateStr < s.startDate) return false;
     if (s.endDate && dateStr > s.endDate) return false;
@@ -346,6 +399,64 @@ function computeTrendCorrection(weightLog, goalSign, ratePct) {
   return { insufficient: false, n, spanDays, actualWeeklyRateKg, targetWeeklyRateKg, correctionKcal };
 }
 
+// Trailing average ending at the most recent logged date (not necessarily
+// today) — rides out the same day-to-day water/glycogen noise as the
+// dashboard's weight-chart trend line, so goal-vs-target comparisons don't
+// react to a single heavy or light weigh-in.
+function computeRollingAvgWeight(weightLog, windowDays = 7) {
+  const entries = Object.entries(weightLog);
+  if (!entries.length) return null;
+  const mostRecent = entries.map(([d]) => d).sort().pop();
+  const cutoff = new Date(mostRecent);
+  cutoff.setDate(cutoff.getDate() - (windowDays - 1));
+  const inWindow = entries.filter(([d]) => new Date(d) >= cutoff).map(([, kg]) => kg);
+  return inWindow.length ? inWindow.reduce((s, kg) => s + kg, 0) / inWindow.length : null;
+}
+
+// Compares the rolling-average weight against the configured target weight
+// and returns a goal-appropriate status. "Maintain" treats the target as a
+// point to hold, so drift in either direction escalates through three
+// severities. "Build"/"lose" treat it as a boundary the rate is carrying you
+// toward, so there's nothing to say until you've crossed it — at which point
+// the goal has effectively been met and it's time to switch to maintaining.
+function computeGoalWeightStatus(profile, weightTrendAvg) {
+  const target = parseFloat(profile.targetWeightKg);
+  if (!target || weightTrendAvg === null) return null;
+  const diffKg = weightTrendAvg - target;
+  const pct = (Math.abs(diffKg) / target) * 100;
+  const direction = diffKg > 0 ? "above" : "below";
+
+  if (profile.goal === "build") {
+    if (diffKg <= 0) return null;
+    return { severity: "high", pct, diffKg, direction, weightTrendAvg, target, suggestMaintain: true };
+  }
+  if (profile.goal === "lose") {
+    if (diffKg >= 0) return null;
+    return { severity: "high", pct, diffKg, direction, weightTrendAvg, target, suggestMaintain: true };
+  }
+  // maintain: escalating drift warning, no direction-specific action to suggest
+  let severity = null;
+  if (pct >= 10) severity = "high";
+  else if (pct >= 5) severity = "medium";
+  else if (pct >= 2) severity = "low";
+  if (!severity) return null;
+  return { severity, pct, diffKg, direction, weightTrendAvg, target, suggestMaintain: false };
+}
+
+// Renders a computeGoalWeightStatus() result as text, translating its
+// (always-metric) figures through the current display unit — kept separate
+// from computeGoalWeightStatus so flipping the unit toggle doesn't need to
+// recompute severity, just reformat the same underlying numbers.
+function formatWeightGoalMessage(status, units) {
+  const u = weightUnitLabel(units);
+  const avg = fmt(kgToDisplay(status.weightTrendAvg, units), 1);
+  const target = fmt(kgToDisplay(status.target, units), 1);
+  const pct = fmt(status.pct, 1);
+  return status.suggestMaintain
+    ? `Averaging ${avg} ${u} (7-day) — ${pct}% ${status.direction} your ${target} ${u} target. Consider switching to Maintain.`
+    : `Averaging ${avg} ${u} (7-day) — ${pct}% ${status.direction} your ${target} ${u} target weight.`;
+}
+
 // ---------- tiny inline icon set (no icon library needed) ----------
 function Icon({ path, size = 14, color = "currentColor" }) {
   return (
@@ -375,6 +486,12 @@ const ICONS = {
   moon: "M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z",
 };
 
+// Shared severity palette for goal-weight warnings — reuses the same
+// cyan/amber/coral grammar the rest of the app already uses for
+// info/caution/error banners, just applied to three escalating tiers.
+const SEVERITY_COLOR = { low: cyan, medium: amber, high: coral };
+const SEVERITY_BG = { low: "rgba(79,209,217,0.08)", medium: "rgba(232,163,61,0.1)", high: "rgba(225,96,77,0.12)" };
+
 function App() {
   const [tab, setTab] = useState("setup");
   const [theme, setTheme] = useState(() => (document.documentElement.dataset.theme === "light" ? "light" : "dark"));
@@ -390,15 +507,22 @@ function App() {
     sex: "male", weightKg: "", heightCm: "", age: "",
     neatFactor: 1.15, epocSensitivity: 1.0, fatigueBuffer: true,
     goal: "maintain", buildRatePct: GOAL_DEFAULTS.build.ratePct, loseRatePct: GOAL_DEFAULTS.lose.ratePct,
+    targetWeightKg: "",
     trendCalibration: true,
     proteinGPerKg: 1.0,
     preloadBorrowRatio: 1.0,
+    units: "metric",
   });
+  const units = profile.units || "metric";
+  const toggleUnits = useCallback(() => {
+    setProfile((p) => ({ ...p, units: (p.units || "metric") === "imperial" ? "metric" : "imperial" }));
+  }, []);
   const [loaded, setLoaded] = useState(false);
   const [nutrition, setNutrition] = useState({});
   const [weightLog, setWeightLog] = useState({}); // { 'YYYY-MM-DD': kg }
   const [schedule, setSchedule] = useState([]);
   // Recurring: { id, kind: "recurring", activityType, zone, durationMin, daysOfWeek, startDate, endDate, notes }
+  // Single:    { id, kind: "single", activityType, zone, durationMin, date, notes } — one-off, non-repeating
   // Race:      { id, kind: "race", activityType, zone, durationMin, raceDate, taperDays, notes }
   const [csvPreview, setCsvPreview] = useState(null);
   const [csvPreviewSource, setCsvPreviewSource] = useState(null); // 'csv' | 'sheet'
@@ -510,6 +634,11 @@ function App() {
   const trendCorrection = useMemo(
     () => computeTrendCorrection(weightLog, goalParams.sign, goalParams.ratePct),
     [weightLog, goalParams]
+  );
+  const weightTrendAvg = useMemo(() => computeRollingAvgWeight(weightLog), [weightLog]);
+  const weightGoalStatus = useMemo(
+    () => computeGoalWeightStatus(profile, weightTrendAvg),
+    [profile.goal, profile.targetWeightKg, weightTrendAvg]
   );
 
   function guessColumnMapping(fields) {
@@ -1028,6 +1157,15 @@ function App() {
             ))}
             <div
               className="navbtn"
+              onClick={toggleUnits}
+              title={units === "imperial" ? "Switch to metric (kg/cm)" : "Switch to imperial (lb/in)"}
+              aria-label="Toggle unit system"
+              style={{ marginLeft: 6 }}
+            >
+              {units === "imperial" ? "LB" : "KG"}
+            </div>
+            <div
+              className="navbtn"
               onClick={toggleTheme}
               title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
               aria-label="Toggle color theme"
@@ -1046,14 +1184,16 @@ function App() {
             lastFetched={lastFetched} stravaStatus={stravaStatus} stravaError={stravaError}
             stravaLastFetched={stravaLastFetched} stravaSyncedCount={stravaData.syncedDates.length}
             intervalsStatus={intervalsStatus} intervalsSyncedCount={intervalsData.syncedDates.length}
-            goalParams={goalParams} trendCorrection={trendCorrection} />
+            goalParams={goalParams} trendCorrection={trendCorrection}
+            weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus} />
         )}
         {tab === "import" && (
           <ImportTab onFile={handleCSVFile} csvPreview={csvPreview} colMap={colMap} setColMap={setColMap}
             onImport={importMappedCSV} nutrition={nutrition} onSaveManualDay={saveManualDay}
             onDeleteDay={deleteNutritionDay} weightLog={weightLog} onSaveWeight={saveManualWeight}
             onDeleteWeight={deleteWeightDay} googleStatus={googleStatus} googleFetching={googleFetching}
-            googleError={googleError} onSyncGoogleSheet={syncGoogleSheet} googleLastAutoSync={googleLastAutoSync} />
+            googleError={googleError} onSyncGoogleSheet={syncGoogleSheet} googleLastAutoSync={googleLastAutoSync}
+            units={units} />
         )}
         {tab === "schedule" && (
           <ScheduleTab schedule={schedule} onAdd={addScheduleEntry} onUpdate={updateScheduleEntry}
@@ -1062,7 +1202,8 @@ function App() {
         {tab === "dashboard" && (
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
             goalParams={goalParams} trendCorrection={trendCorrection} trendCalibration={profile.trendCalibration}
-            proteinGPerKg={profile.proteinGPerKg} />
+            proteinGPerKg={profile.proteinGPerKg} weightGoalStatus={weightGoalStatus}
+            targetWeightKg={parseFloat(profile.targetWeightKg) || null} units={units} />
         )}
       </div>
     </div>
@@ -1073,8 +1214,11 @@ function Field({ label, children }) {
   return <div><span className="fieldlabel">{label}</span>{children}</div>;
 }
 
-function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, rangeDays, setRangeDays, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection }) {
+function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, rangeDays, setRangeDays, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
   const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
+  const units = profile.units || "metric";
+  const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
+  const [heightText, onHeightChange] = useUnitInput(profile.heightCm, units, cmToDisplayLen, displayToCm, 1);
   return (
     <div style={{ display: "grid", gap: 20 }}>
       <div className="card" style={{ padding: 22 }}>
@@ -1086,8 +1230,16 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
               <option value="female">Female</option>
             </select>
           </Field>
-          <Field label="Weight (kg)"><input className="inp" value={profile.weightKg} onChange={set("weightKg")} placeholder="70" /></Field>
-          <Field label="Height (cm)"><input className="inp" value={profile.heightCm} onChange={set("heightCm")} placeholder="178" /></Field>
+          <Field label={`Weight (${weightUnitLabel(units)})`}>
+            <input className="inp" value={weightText}
+              onChange={(e) => onWeightChange(e, (v) => setProfile((p) => ({ ...p, weightKg: v })))}
+              placeholder={units === "imperial" ? "154" : "70"} />
+          </Field>
+          <Field label={`Height (${heightUnitLabel(units)})`}>
+            <input className="inp" value={heightText}
+              onChange={(e) => onHeightChange(e, (v) => setProfile((p) => ({ ...p, heightCm: v })))}
+              placeholder={units === "imperial" ? "70" : "178"} />
+          </Field>
           <Field label="Age"><input className="inp" value={profile.age} onChange={set("age")} placeholder="34" /></Field>
         </div>
         {bmr && (
@@ -1217,7 +1369,8 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
         </label>
       </div>
 
-      <GoalCard profile={profile} setProfile={setProfile} goalParams={goalParams} trendCorrection={trendCorrection} />
+      <GoalCard profile={profile} setProfile={setProfile} goalParams={goalParams} trendCorrection={trendCorrection}
+        weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus} />
 
       <div style={{ display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start" }}>
         <Icon path={ICONS.info} size={14} color={dim} />
@@ -1227,10 +1380,13 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
   );
 }
 
-function GoalCard({ profile, setProfile, goalParams, trendCorrection }) {
+function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
   const setGoal = (goal) => setProfile((p) => ({ ...p, goal }));
   const range = profile.goal === "build" ? GOAL_DEFAULTS.build : profile.goal === "lose" ? GOAL_DEFAULTS.lose : null;
   const rateKey = profile.goal === "build" ? "buildRatePct" : "loseRatePct";
+  const units = profile.units || "metric";
+  const wUnit = weightUnitLabel(units);
+  const [targetWeightText, onTargetWeightChange] = useUnitInput(profile.targetWeightKg, units, kgToDisplay, displayToKg, 1);
 
   return (
     <div className="card" style={{ padding: 22 }}>
@@ -1256,6 +1412,24 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection }) {
         ))}
       </div>
 
+      <Field label={`Target weight (${wUnit})`}>
+        <input className="inp" value={targetWeightText}
+          onChange={(e) => onTargetWeightChange(e, (v) => setProfile((p) => ({ ...p, targetWeightKg: v })))}
+          placeholder={units === "imperial" ? "154" : "70"} />
+        <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
+          What {goalParams.label.toLowerCase()} is aiming for — kept separate from the current weight above so the
+          goal doesn't shift just because you logged a new weigh-in.
+          {weightTrendAvg !== null && ` Currently averaging ${fmt(kgToDisplay(weightTrendAvg, units), 1)} ${wUnit} (7-day).`}
+        </div>
+      </Field>
+
+      {weightGoalStatus && (
+        <div style={{ marginTop: 14, display: "flex", gap: 8, background: SEVERITY_BG[weightGoalStatus.severity], border: `1px solid ${SEVERITY_COLOR[weightGoalStatus.severity]}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, alignItems: "flex-start" }}>
+          <Icon path={ICONS.warn} size={15} color={SEVERITY_COLOR[weightGoalStatus.severity]} />
+          <span>{formatWeightGoalMessage(weightGoalStatus, units)}</span>
+        </div>
+      )}
+
       {range && (
         <Field label={`${profile.goal === "build" ? "Weight gain" : "Weight loss"} rate — ${profile[rateKey]}%/week`}>
           <input type="range" min={range.min} max={range.max} step="0.05" value={profile[rateKey]}
@@ -1278,21 +1452,21 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection }) {
         <div style={{ marginTop: 12, fontFamily: mono, fontSize: 12, color: dim }}>
           {trendCorrection.insufficient
             ? `Gathering data — ${trendCorrection.n} weight entries logged so far, need ~8+ spanning 10+ days.`
-            : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(trendCorrection.actualWeeklyRateKg, 2)} kg/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(trendCorrection.targetWeeklyRateKg, 2)} kg/wk target → correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`}
+            : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target → correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`}
         </div>
       )}
     </div>
   );
 }
 
-function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync }) {
+function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, units }) {
   const [dragOver, setDragOver] = useState(false);
   const dayCount = Object.keys(nutrition).length;
   const weightCount = Object.keys(weightLog).length;
   return (
     <div style={{ display: "grid", gap: 20 }}>
       <ManualEntryCard nutrition={nutrition} onSave={onSaveManualDay} />
-      <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} />
+      <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} units={units} />
 
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
@@ -1393,7 +1567,7 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored weight log</div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 }}>{weightCount} day{weightCount === 1 ? "" : "s"} of weight saved. Click a row to edit it.</div>
-        {weightCount > 0 && <WeightLogTable weightLog={weightLog} onSave={onSaveWeight} onDelete={onDeleteWeight} />}
+        {weightCount > 0 && <WeightLogTable weightLog={weightLog} onSave={onSaveWeight} onDelete={onDeleteWeight} units={units} />}
       </div>
     </div>
   );
@@ -1559,36 +1733,24 @@ function NutritionLogTable({ nutrition, onSave, onDelete }) {
   );
 }
 
-function WeightEntryCard({ weightLog, onSave }) {
+function WeightEntryCard({ weightLog, onSave, units }) {
   const [date, setDate] = useState(() => toISODate(new Date()));
-  const [unit, setUnit] = useState("kg");
-  const [value, setValue] = useState("");
+  const [metricKg, setMetricKg] = useState(""); // canonical (kg) buffer for the currently edited date
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
     const existingKg = weightLog[date];
-    if (existingKg === undefined) {
-      setValue("");
-    } else {
-      setValue(String(unit === "kg" ? existingKg : existingKg / 0.453592));
-    }
+    setMetricKg(existingKg === undefined ? "" : String(existingKg));
     setSaved(false);
     // eslint-disable-next-line
   }, [date]);
 
-  // Re-express the displayed number (not the stored value) when the unit toggle changes.
-  function switchUnit(next) {
-    const v = parseFloat(value);
-    if (!Number.isNaN(v)) {
-      setValue(next === "kg" ? String(v * 0.453592) : String(v / 0.453592));
-    }
-    setUnit(next);
-  }
+  const [text, onChange] = useUnitInput(metricKg, units, kgToDisplay, displayToKg, 1);
+  const wUnit = weightUnitLabel(units);
 
   function handleSave() {
-    const v = parseFloat(value);
-    if (Number.isNaN(v) || v <= 0) return;
-    const kg = unit === "kg" ? v : v * 0.453592;
+    const kg = parseFloat(metricKg);
+    if (Number.isNaN(kg) || kg <= 0) return;
     onSave(date, Math.round(kg * 100) / 100);
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
@@ -1603,20 +1765,16 @@ function WeightEntryCard({ weightLog, onSave }) {
         Feeds directly into BMR and fueling targets for that day — body weight shifts across a training
         block, so this keeps demand and g/kg targets tracking you rather than a fixed Setup value.
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 14, alignItems: "end" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, alignItems: "end" }}>
         <Field label="Date">
           <input className="inp" type="date" value={date} max={toISODate(new Date())} onChange={(e) => setDate(e.target.value)} />
         </Field>
-        <Field label={`Weight (${unit})`}>
-          <input className="inp" type="number" min="0" step="0.1" value={value} onChange={(e) => setValue(e.target.value)} placeholder={unit === "kg" ? "70.0" : "154.0"} />
+        <Field label={`Weight (${wUnit})`}>
+          <input className="inp" type="number" min="0" step="0.1" value={text} onChange={(e) => onChange(e, setMetricKg)} placeholder={units === "imperial" ? "154.0" : "70.0"} />
         </Field>
-        <div style={{ display: "flex", gap: 4, marginBottom: 1 }}>
-          <button className="btn-ghost" style={{ padding: "9px 12px", background: unit === "kg" ? panel2 : "transparent", borderColor: unit === "kg" ? cyan : line }} onClick={() => switchUnit("kg")}>kg</button>
-          <button className="btn-ghost" style={{ padding: "9px 12px", background: unit === "lb" ? panel2 : "transparent", borderColor: unit === "lb" ? cyan : line }} onClick={() => switchUnit("lb")}>lb</button>
-        </div>
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 16 }}>
-        <button className="btn-primary" onClick={handleSave} disabled={!value}>
+        <button className="btn-primary" onClick={handleSave} disabled={!text}>
           {weightLog[date] !== undefined ? "Update this day" : "Save this day"}
         </button>
         {saved && <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint }}><Icon path={ICONS.check} size={13} color={mint} /> Saved</div>}
@@ -1625,25 +1783,25 @@ function WeightEntryCard({ weightLog, onSave }) {
   );
 }
 
-function WeightLogTable({ weightLog, onSave, onDelete }) {
+function WeightLogTable({ weightLog, onSave, onDelete, units }) {
   const [editingDate, setEditingDate] = useState(null);
   const [draft, setDraft] = useState("");
   const dates = Object.keys(weightLog).sort().reverse();
 
   function startEdit(date) {
     setEditingDate(date);
-    setDraft(String(weightLog[date]));
+    setDraft(String(roundTo(kgToDisplay(weightLog[date], units), 1)));
   }
   function commitEdit(date) {
     const v = parseFloat(draft);
-    if (!Number.isNaN(v) && v > 0) onSave(date, Math.round(v * 100) / 100);
+    if (!Number.isNaN(v) && v > 0) onSave(date, Math.round(displayToKg(v, units) * 100) / 100);
     setEditingDate(null);
   }
 
   return (
     <table className="data">
       <thead>
-        <tr><th>Date</th><th>Weight (kg)</th><th>Weight (lb)</th><th></th></tr>
+        <tr><th>Date</th><th>Weight ({weightUnitLabel(units)})</th><th></th></tr>
       </thead>
       <tbody>
         {dates.map((date) => {
@@ -1654,7 +1812,7 @@ function WeightLogTable({ weightLog, onSave, onDelete }) {
               <td>{date}</td>
               {editing ? (
                 <>
-                  <td colSpan={2}><input className="inp" style={{ padding: "4px 6px", textAlign: "right" }} type="number" step="0.1" value={draft} onChange={(ev) => setDraft(ev.target.value)} /></td>
+                  <td><input className="inp" style={{ padding: "4px 6px", textAlign: "right" }} type="number" step="0.1" value={draft} onChange={(ev) => setDraft(ev.target.value)} /></td>
                   <td style={{ textAlign: "left", whiteSpace: "nowrap" }}>
                     <button className="btn-ghost" style={{ padding: "4px 10px", marginRight: 6 }} onClick={() => commitEdit(date)}>Save</button>
                     <button className="btn-ghost" style={{ padding: "4px 10px" }} onClick={() => setEditingDate(null)}>Cancel</button>
@@ -1662,8 +1820,7 @@ function WeightLogTable({ weightLog, onSave, onDelete }) {
                 </>
               ) : (
                 <>
-                  <td>{fmt(kg, 1)}</td>
-                  <td style={{ color: dim }}>{fmt(kg / 0.453592, 1)}</td>
+                  <td>{fmt(kgToDisplay(kg, units), 1)}</td>
                   <td style={{ textAlign: "left", whiteSpace: "nowrap" }}>
                     <button title="Edit" onClick={() => startEdit(date)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
                     <button title="Delete" onClick={() => { if (confirm(`Delete weight entry for ${date}?`)) onDelete(date); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
@@ -1695,6 +1852,7 @@ function emptyScheduleForm() {
     endDate: "",
     ongoing: true,
     notes: "",
+    date: toLocalISODate(new Date()),
     raceDate: toLocalISODate(new Date()),
     taperDays: String(DEFAULT_TAPER_DAYS),
   };
@@ -1704,7 +1862,8 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
   const [form, setForm] = useState(emptyScheduleForm());
   const [editingId, setEditingId] = useState(null);
 
-  const recurring = schedule.filter((s) => s.kind !== "race");
+  const recurring = schedule.filter((s) => s.kind !== "race" && s.kind !== "single");
+  const singles = schedule.filter((s) => s.kind === "single").slice().sort((a, b) => (a.date < b.date ? -1 : 1));
   const races = getRaces(schedule).slice().sort((a, b) => (a.raceDate < b.raceDate ? -1 : 1));
 
   function toggleDay(n) {
@@ -1721,6 +1880,12 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
         ...emptyScheduleForm(),
         kind: "race", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
         raceDate: s.raceDate, taperDays: String(s.taperDays ?? DEFAULT_TAPER_DAYS), notes: s.notes || "",
+      });
+    } else if (s.kind === "single") {
+      setForm({
+        ...emptyScheduleForm(),
+        kind: "single", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
+        date: s.date, notes: s.notes || "",
       });
     } else {
       setForm({
@@ -1745,6 +1910,19 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
         durationMin: parseInt(form.durationMin) || 0,
         raceDate: form.raceDate,
         taperDays: Math.max(0, parseInt(form.taperDays) || 0),
+        notes: form.notes,
+      };
+      if (editingId) onUpdate(editingId, entry); else onAdd(entry);
+      cancelEdit();
+      return;
+    }
+    if (form.kind === "single") {
+      const entry = {
+        kind: "single",
+        activityType: form.activityType,
+        zone: form.zone,
+        durationMin: parseInt(form.durationMin) || 0,
+        date: form.date,
         notes: form.notes,
       };
       if (editingId) onUpdate(editingId, entry); else onAdd(entry);
@@ -1791,6 +1969,8 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
           {form.kind === "race"
             ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days."
+            : form.kind === "single"
+            ? "A single session on one specific date — doesn't repeat, and won't affect any other day."
             : <>Repeats on the days you pick, within the date range. Projects up to {FORWARD_DAYS} days ahead on the
               dashboard as an estimate — once a real activity syncs in for that day, it takes over automatically.</>}
         </div>
@@ -1802,6 +1982,12 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
                 ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
                 : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
               <Icon path={ICONS.calendar} size={13} color={form.kind === "recurring" ? ink : dim} /> Recurring session
+            </button>
+            <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "single" }))}
+              style={form.kind === "single"
+                ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+                : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Icon path={ICONS.calendar} size={13} color={form.kind === "single" ? ink : dim} /> Single session
             </button>
             <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "race" }))}
               style={form.kind === "race"
@@ -1845,6 +2031,12 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
             </Field>
             <Field label="Taper starts (days before race)">
               <input className="inp" type="number" min="0" value={form.taperDays} onChange={(e) => setForm((f) => ({ ...f, taperDays: e.target.value }))} />
+            </Field>
+          </div>
+        ) : form.kind === "single" ? (
+          <div style={{ marginTop: 14 }}>
+            <Field label="Date">
+              <input className="inp" type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} />
             </Field>
           </div>
         ) : (
@@ -1907,6 +2099,27 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
                 </div>
                 <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
                 <button title="Delete" onClick={() => { if (confirm("Delete this race?")) onDelete(s.id); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {singles.length > 0 && (
+        <div className="card" style={{ padding: 22 }}>
+          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Single sessions</div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {singles.map((s) => (
+              <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 }}>
+                <div style={{ flex: 1 }}>
+                  <b>{s.activityType}</b> · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
+                  <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
+                    {s.date}
+                    {s.notes ? ` · ${s.notes}` : ""}
+                  </div>
+                </div>
+                <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
+                <button title="Delete" onClick={() => { if (confirm("Delete this scheduled session?")) onDelete(s.id); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
               </div>
             ))}
           </div>
@@ -2006,8 +2219,10 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
 }
 
 
-function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg }) {
+function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units }) {
+  const wUnit = weightUnitLabel(units);
   const [visibleMacros, setVisibleMacros] = useState({ carbs: false, protein: false, fat: false });
+  const [visibleWeightSeries, setVisibleWeightSeries] = useState({ actual: true, rollingAvg: true, target: true });
   const [showFuelingRef, setShowFuelingRef] = useState(false);
   const [showInfoPopout, setShowInfoPopout] = useState(false);
   const chartScrollRefs = useRef([]);
@@ -2037,10 +2252,18 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
   const hasWeight = rows.some((r) => r.weight !== null);
   const chartWidth = Math.max(rows.length * CHART_DAY_WIDTH, CHART_DAY_WIDTH * 7);
   // 7-day trailing average, since daily body weight swings ~1-2kg from water/glycogen.
+  // targetWeight is carried as a flat per-row value (rather than a plain
+  // ReferenceLine) so it participates in the axis's auto domain and shows up
+  // in the tooltip alongside actual/trend, the same as any other series.
   const rowsWithTrend = rows.map((r, i) => {
     const window = rows.slice(Math.max(0, i - 6), i + 1).filter((x) => x.weight !== null);
     const trend = window.length ? window.reduce((s, x) => s + x.weight, 0) / window.length : null;
-    return { ...r, weightTrend: trend };
+    return {
+      ...r,
+      weight: r.weight !== null ? kgToDisplay(r.weight, units) : null,
+      weightTrend: trend !== null ? kgToDisplay(trend, units) : null,
+      targetWeight: targetWeightKg !== null ? kgToDisplay(targetWeightKg, units) : null,
+    };
   });
   return (
     // gridTemplateColumns is pinned to minmax(0, 1fr) rather than left as the
@@ -2067,12 +2290,19 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
           <div>
             <b>{goalParams.label}</b> at {goalParams.ratePct}%/week.
             {trendCalibration && trendCorrection && !trendCorrection.insufficient && (
-              <> Trend calibration is live: {trendCorrection.correctionKcal >= 0 ? "+" : ""}{fmt(trendCorrection.correctionKcal)} kcal/day applied based on your actual {fmt(trendCorrection.actualWeeklyRateKg, 2)} kg/wk trend.</>
+              <> Trend calibration is live: {trendCorrection.correctionKcal >= 0 ? "+" : ""}{fmt(trendCorrection.correctionKcal)} kcal/day applied based on your actual {fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} {wUnit}/wk trend.</>
             )}
             {trendCalibration && trendCorrection && trendCorrection.insufficient && (
               <> Log weight for ~10+ days to enable trend-based calibration ({trendCorrection.n} logged so far).</>
             )}
           </div>
+        </div>
+      )}
+
+      {weightGoalStatus && (
+        <div style={{ display: "flex", gap: 8, background: SEVERITY_BG[weightGoalStatus.severity], border: `1px solid ${SEVERITY_COLOR[weightGoalStatus.severity]}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" }}>
+          <Icon path={ICONS.warn} size={16} color={SEVERITY_COLOR[weightGoalStatus.severity]} />
+          <div>{formatWeightGoalMessage(weightGoalStatus, units)}</div>
         </div>
       )}
 
@@ -2159,7 +2389,19 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
 
       {hasWeight && (
         <div className="card" style={{ padding: "20px 20px 8px" }}>
-          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" }}>Body weight</div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12, padding: "0 4px" }}>
+            <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14 }}>Body weight</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {[["actual", "Actual", dim], ["rollingAvg", "7-day avg", cyan], ...(targetWeightKg !== null ? [["target", "Target", gold]] : [])].map(([key, label, color]) => (
+                <button key={key} onClick={() => setVisibleWeightSeries((v) => ({ ...v, [key]: !v[key] }))}
+                  style={visibleWeightSeries[key]
+                    ? { padding: "5px 11px", borderRadius: 20, fontWeight: 700, fontSize: 11.5, cursor: "pointer", border: "none", background: color, color: ink }
+                    : { padding: "5px 11px", borderRadius: 20, fontWeight: 600, fontSize: 11.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
           <div ref={registerChartScroll} onScroll={syncChartScroll} style={{ overflowX: "auto", overflowY: "hidden", maxWidth: "100%" }}>
             <div style={{ width: chartWidth, margin: "0 auto" }}>
             <ComposedChart width={chartWidth} height={200} data={rowsWithTrend} margin={{ top: 4, right: 12, left: -14, bottom: 0 }}>
@@ -2167,8 +2409,9 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
               <XAxis dataKey="label" tick={{ fill: dim, fontSize: 11, fontFamily: mono }} axisLine={{ stroke: line }} tickLine={false} />
               <YAxis tick={{ fill: dim, fontSize: 11, fontFamily: mono }} axisLine={false} tickLine={false} domain={["dataMin - 1", "dataMax + 1"]} />
               <Tooltip content={<CustomTooltip />} />
-              <Line type="monotone" dataKey="weight" name="Weight (kg)" stroke={dim} strokeWidth={1} dot={{ r: 2.5, fill: dim }} connectNulls={false} />
-              <Line type="monotone" dataKey="weightTrend" name="7-day avg (kg)" stroke={cyan} strokeWidth={2.2} dot={false} connectNulls />
+              {visibleWeightSeries.actual && <Line type="monotone" dataKey="weight" name={`Weight (${wUnit})`} stroke={dim} strokeWidth={1} dot={{ r: 2.5, fill: dim }} connectNulls={false} />}
+              {visibleWeightSeries.rollingAvg && <Line type="monotone" dataKey="weightTrend" name={`7-day avg (${wUnit})`} stroke={cyan} strokeWidth={2.2} dot={false} connectNulls />}
+              {visibleWeightSeries.target && targetWeightKg !== null && <Line type="monotone" dataKey="targetWeight" name={`Target (${wUnit})`} stroke={gold} strokeWidth={2} strokeDasharray="6 3" dot={false} connectNulls />}
             </ComposedChart>
             </div>
           </div>
@@ -2208,7 +2451,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
                     {r.raceLoading && <span title={`Carb-loading ahead of ${r.race?.notes || r.race?.activityType + " race"} in ${r.race ? daysBetween(r.date, r.race.raceDate) : "?"}d`}><Icon path={ICONS.flame} size={10} color={gold} /></span>}
                   </span>
                 </td>
-                <td style={{ color: dim }}>{r.weight !== null ? `${fmt(r.weight, 1)}kg` : "—"}</td>
+                <td style={{ color: dim }}>{r.weight !== null ? `${fmt(kgToDisplay(r.weight, units), 1)}${wUnit}` : "—"}</td>
                 <td style={{ color: dim }}>{fmt(r.bmr)}</td>
                 <td style={{ color: dim }}>{fmt(r.baseline)}</td>
                 <td>{r.exerciseKcal ? fmt(r.exerciseKcal) : (r.trainingMissing ? <span style={{ color: coral }}>?</span> : "—")}</td>

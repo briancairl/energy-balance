@@ -2088,7 +2088,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", gap: 7 }}>
             <Icon path={ICONS.trophy} size={16} color={gold} /> Races
           </div>
-          <div style={{ display: "grid", gap: 8 }}>
+          <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
             {races.map((s) => (
               <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 }}>
                 <div style={{ flex: 1 }}>
@@ -2108,7 +2108,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
       {singles.length > 0 && (
         <div className="card" style={{ padding: 22 }}>
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Single sessions</div>
-          <div style={{ display: "grid", gap: 8 }}>
+          <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
             {singles.map((s) => (
               <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 }}>
                 <div style={{ flex: 1 }}>
@@ -2129,7 +2129,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
       {recurring.length > 0 && (
         <div className="card" style={{ padding: 22 }}>
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Recurring sessions</div>
-          <div style={{ display: "grid", gap: 8 }}>
+          <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
             {recurring.map((s) => (
               <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 }}>
                 <div style={{ flex: 1 }}>

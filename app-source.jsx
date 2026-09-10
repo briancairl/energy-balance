@@ -1858,9 +1858,35 @@ function emptyScheduleForm() {
   };
 }
 
+// Shared look for a schedule-listing row, with a temporary highlight state
+// used when jumping in from the "Upcoming" calendar (see jumpToDay below).
+function scheduleRowStyle(highlighted) {
+  return {
+    display: "flex", alignItems: "center", gap: 12, padding: "10px 12px",
+    background: highlighted ? "rgba(79,209,217,0.15)" : panel2,
+    border: `1px solid ${highlighted ? cyan : line}`,
+    borderRadius: 5, fontSize: 12.5,
+    transition: "background 0.3s, border-color 0.3s",
+  };
+}
+
 function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
   const [form, setForm] = useState(emptyScheduleForm());
   const [editingId, setEditingId] = useState(null);
+  const [highlightIds, setHighlightIds] = useState([]);
+  const itemRefs = useRef({});
+
+  // Scrolls the listing card(s) below to the session(s)/race scheduled on the
+  // clicked calendar day, and flashes them briefly so they're easy to spot.
+  function jumpToDay(day) {
+    const ids = day.sessions.map((s) => s.id).concat(day.race ? [day.race.id] : []);
+    if (!ids.length) return;
+    setHighlightIds(ids);
+    const firstEl = itemRefs.current[ids[0]];
+    if (firstEl) firstEl.scrollIntoView({ behavior: "smooth", block: "center" });
+    window.clearTimeout(jumpToDay._t);
+    jumpToDay._t = window.setTimeout(() => setHighlightIds([]), 2000);
+  }
 
   const recurring = schedule.filter((s) => s.kind !== "race" && s.kind !== "single");
   const singles = schedule.filter((s) => s.kind === "single").slice().sort((a, b) => (a.date < b.date ? -1 : 1));
@@ -1962,6 +1988,78 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
 
   return (
     <div style={{ display: "grid", gap: 20 }}>
+      <div className="card" style={{ padding: 22 }}>
+        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
+          <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
+        </div>
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <span>Next 3 weeks</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={amber} /> pre-loads the day before</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.gauge} size={10} color={lavender} /> tapering</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.trophy} size={10} color={gold} /> race day</span>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+          {WEEKDAY_LABELS.map((label) => (
+            <div key={label} style={{ fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 }}>{label}</div>
+          ))}
+          {calendarDays.map((day) => {
+            const isToday = day.key === todayKey;
+            const isFirstOfMonth = day.date.getDate() === 1;
+            const clickable = day.sessions.length > 0 || !!day.race;
+            return (
+              <div key={day.key} onClick={clickable ? () => jumpToDay(day) : undefined}
+                title={clickable ? "Jump to this session in the listings below" : undefined}
+                style={{
+                background: panel2,
+                border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
+                borderRadius: 5,
+                padding: 6,
+                minHeight: 76,
+                display: "flex",
+                flexDirection: "column",
+                gap: 3,
+                cursor: clickable ? "pointer" : "default",
+              }}>
+                <div style={{ fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 }}>
+                  {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
+                  {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
+                  {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
+                </div>
+                {day.race && (
+                  <div title={`Race: ${day.race.notes || day.race.activityType} · ${day.race.durationMin}min`}
+                    style={{
+                      background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
+                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3,
+                    }}>
+                    <Icon path={ICONS.trophy} size={9} color={ink} /> {day.race.notes || day.race.activityType}
+                  </div>
+                )}
+                {day.sessions.map((s, i) => (
+                  <div key={i} title={`${s.activityType} · ${ZONES[s.zone - 1].label.split(" · ")[1]} · ${s.durationMin}min${s.notes ? ` · ${s.notes}` : ""}${day.taper ? " · tapered" : ""}`}
+                    style={{
+                      background: ACTIVITY_COLORS[s.activityType] || dim,
+                      color: ink,
+                      borderRadius: 3,
+                      padding: "2px 5px",
+                      fontSize: 10.5,
+                      lineHeight: 1.3,
+                      fontWeight: 600,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 3,
+                      opacity: day.taper ? 0.65 : 1,
+                    }}>
+                    {s.activityType} Z{s.zone} · {s.durationMin}m
+                    {isPreloadWorthy(s) && <Icon path={ICONS.flame} size={9} color={ink} />}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
           <Icon path={form.kind === "race" ? ICONS.trophy : ICONS.calendar} size={16} color={cyan} /> {editingId ? "Edit scheduled session" : "Add to schedule"}
@@ -2090,7 +2188,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
           </div>
           <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
             {races.map((s) => (
-              <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 }}>
+              <div key={s.id} ref={(el) => { itemRefs.current[s.id] = el; }} style={scheduleRowStyle(highlightIds.includes(s.id))}>
                 <div style={{ flex: 1 }}>
                   <b>{s.notes || s.activityType}</b> · {s.activityType} · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
                   <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
@@ -2110,7 +2208,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Single sessions</div>
           <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
             {singles.map((s) => (
-              <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 }}>
+              <div key={s.id} ref={(el) => { itemRefs.current[s.id] = el; }} style={scheduleRowStyle(highlightIds.includes(s.id))}>
                 <div style={{ flex: 1 }}>
                   <b>{s.activityType}</b> · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
                   <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
@@ -2131,7 +2229,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Recurring sessions</div>
           <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
             {recurring.map((s) => (
-              <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: panel2, border: `1px solid ${line}`, borderRadius: 5, fontSize: 12.5 }}>
+              <div key={s.id} ref={(el) => { itemRefs.current[s.id] = el; }} style={scheduleRowStyle(highlightIds.includes(s.id))}>
                 <div style={{ flex: 1 }}>
                   <b>{s.activityType}</b> · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
                   <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
@@ -2147,73 +2245,6 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
         </div>
       )}
 
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
-        </div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <span>Next 3 weeks</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={amber} /> pre-loads the day before</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.gauge} size={10} color={lavender} /> tapering</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.trophy} size={10} color={gold} /> race day</span>
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
-          {WEEKDAY_LABELS.map((label) => (
-            <div key={label} style={{ fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 }}>{label}</div>
-          ))}
-          {calendarDays.map((day) => {
-            const isToday = day.key === todayKey;
-            const isFirstOfMonth = day.date.getDate() === 1;
-            return (
-              <div key={day.key} style={{
-                background: panel2,
-                border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
-                borderRadius: 5,
-                padding: 6,
-                minHeight: 76,
-                display: "flex",
-                flexDirection: "column",
-                gap: 3,
-              }}>
-                <div style={{ fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 }}>
-                  {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
-                  {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
-                  {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
-                </div>
-                {day.race && (
-                  <div title={`Race: ${day.race.notes || day.race.activityType} · ${day.race.durationMin}min`}
-                    style={{
-                      background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
-                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3,
-                    }}>
-                    <Icon path={ICONS.trophy} size={9} color={ink} /> {day.race.notes || day.race.activityType}
-                  </div>
-                )}
-                {day.sessions.map((s, i) => (
-                  <div key={i} title={`${s.activityType} · ${ZONES[s.zone - 1].label.split(" · ")[1]} · ${s.durationMin}min${s.notes ? ` · ${s.notes}` : ""}${day.taper ? " · tapered" : ""}`}
-                    style={{
-                      background: ACTIVITY_COLORS[s.activityType] || dim,
-                      color: ink,
-                      borderRadius: 3,
-                      padding: "2px 5px",
-                      fontSize: 10.5,
-                      lineHeight: 1.3,
-                      fontWeight: 600,
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 3,
-                      opacity: day.taper ? 0.65 : 1,
-                    }}>
-                    {s.activityType} Z{s.zone} · {s.durationMin}m
-                    {isPreloadWorthy(s) && <Icon path={ICONS.flame} size={9} color={ink} />}
-                  </div>
-                ))}
-              </div>
-            );
-          })}
-        </div>
-      </div>
     </div>
   );
 }

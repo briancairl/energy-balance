@@ -161,7 +161,14 @@ history and just persist as entered.
   table, `durationMin`, `daysOfWeek`, date range). Used to (a) estimate kcal for
   future/unsynced days (MET × weight × hours) and (b) drive pre-loading. Dashboard projects
   `FORWARD_DAYS` (4) days beyond today.
-- **Races + auto-taper**: races are a second `schedule` entry kind (`kind: "race"` — a single
+- **Single (non-recurring) sessions**: a third `schedule` entry kind (`kind: "single"` — one
+  `date` instead of `daysOfWeek`/`startDate`/`endDate`), for a one-off session that doesn't
+  repeat. Feeds the same `getScheduledSessionsForDate` lookup as recurring entries (matches on
+  exact date instead of weekday), but is kept in its own "Single sessions" list in
+  `ScheduleTab` — it deliberately never appears under "Recurring sessions", which used to be
+  faked by giving a recurring entry `startDate === endDate` (the `road_to_placid` sync script
+  did exactly that before it was switched to emit real `kind: "single"` entries).
+- **Races + auto-taper**: races are a third `schedule` entry kind (`kind: "race"` — a single
   `raceDate` + `taperDays` instead of a weekly recurrence) rather than a separate store key, so
   taper/carb-load math can look at the same array as recurring sessions. Inside the taper
   window, recurring sessions get duration scaled down to as low as 40% on race-eve while
@@ -232,6 +239,39 @@ looking for the longest valid-JSON prefix) — keep it around.
   (including one against a dependency-free standalone harness, since this sandbox has no
   outbound network access to load Recharts/React from CDN for a full render test) — all run
   in-conversation, not saved as a runnable suite. Worth setting one up if this keeps growing.
+
+## Road to Placid (IRONMAN training plan) integration
+
+`road_to_placid_plan.json` is a static export of the periodized training plan built in the
+"Road to Placid" artifact (Sept 2026 → IRONMAN Lake Placid, July 2027 — see the published
+Claude artifact for the human-facing checklist/notes version of the same plan).
+`sync_schedule_from_plan.py` (run it from this directory: `python3 sync_schedule_from_plan.py
+[--weeks-ahead 8] [--dry-run]`) reads that export and writes into `training-schedule`:
+
+- **Race entries** (`kind: "race"`) for every race in the plan — added once, covering the
+  whole calendar out to Lake Placid and the Long Island 70.3, since taper/carb-load math
+  looks at the nearest upcoming race regardless of distance. Skipped if a race entry with the
+  same `raceDate` already exists (so it never clobbers a race added by hand — e.g. the Olympic
+  tri entry was hand-entered before this script existed and is left alone).
+- **Single-session entries** (`kind: "single"`), one per planned session, but only for the next
+  `--weeks-ahead` weeks (default 8) — the app only ever consults the schedule for
+  `FORWARD_DAYS` (4) days of lookahead plus taper-window scaling, so encoding a full year of
+  sessions up front would be pure clutter. Re-run the script periodically (weekly is plenty) to
+  keep the near-term window current as the plan progresses. These are genuinely non-recurring
+  (a `date`, not a weekly pattern), so they show up under "Single sessions" in the app, not
+  "Recurring sessions".
+
+Every entry the script creates is tagged `"source": "road_to_placid"`, so re-running it
+replaces only its own previously-synced entries — anything added by hand in the app's UI is
+left untouched, with one exception: your own open-ended (`endDate: null`) recurring entries
+that overlap the sync window get their `endDate` capped to the day before the window starts
+(printed every time it happens), since otherwise they'd keep firing forever and double-count
+against what the script adds. It also skips generating a session for any date already covered
+by one of your own (non-`road_to_placid`) entries, so a hand-entered override is never
+double-booked.
+
+If the underlying plan changes (a re-published version of the artifact), regenerate
+`road_to_placid_plan.json` from it before the next sync.
 
 ## If you're picking this up cold
 

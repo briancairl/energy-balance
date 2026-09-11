@@ -1122,7 +1122,7 @@ function App() {
         .btn-primary:disabled { opacity: 0.5; cursor: default; }
         .btn-ghost { background: transparent; color: ${paper}; border: 1px solid ${line}; padding: 9px 16px; border-radius: 4px; font-weight:600; font-size: 13px; cursor:pointer; }
         table.data { width:100%; border-collapse: collapse; font-family: ${mono}; font-size: 12.5px; }
-        table.data th { text-align:right; padding: 8px 10px; color: ${dim}; font-weight:600; border-bottom: 1px solid ${line}; text-transform:uppercase; font-size:10.5px; letter-spacing:0.05em; }
+        table.data th { text-align:right; padding: 8px 10px; color: ${dim}; font-weight:600; border-bottom: 1px solid ${line}; text-transform:uppercase; font-size:10.5px; letter-spacing:0.05em; position: sticky; top: 0; background: ${panel}; z-index: 1; }
         table.data td { text-align:right; padding: 7px 10px; border-bottom: 1px solid ${line}; }
         table.data th:first-child, table.data td:first-child { text-align:left; font-family: ${body}; }
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
@@ -2449,8 +2449,9 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
         </div>
       )}
 
-      <div className="card" style={{ padding: 20, overflowX: "auto" }}>
+      <div className="card" style={{ padding: 20 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12 }}>Daily breakdown</div>
+        <div style={{ maxHeight: 480, overflow: "auto" }}>
         <table className="data">
           <thead>
             <tr>
@@ -2502,6 +2503,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
             ))}
           </tbody>
         </table>
+        </div>
       </div>
     </div>
   );

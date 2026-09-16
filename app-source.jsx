@@ -169,6 +169,11 @@ function activityKcal(act) {
   }
   return 0;
 }
+function stravaActivityKcal(act) {
+  if (typeof act.calories === "number" && act.calories > 0) return act.calories;
+  if (typeof act.kilojoules === "number") return act.kilojoules / 4.184 / 0.24;
+  return 0;
+}
 function intensityFactor(act) {
   if (typeof act.icu_intensity === "number") return act.icu_intensity;
   if (typeof act.icu_training_load === "number" && act.moving_time) {
@@ -241,10 +246,87 @@ const ACTIVITY_TYPES = ["Run", "Ride", "Swim", "Row", "Strength", "Other"];
 const FORWARD_DAYS = 4; // how far ahead planned sessions project into the dashboard
 const CHART_DAY_WIDTH = 70; // px per day — charts render at their full data width and scroll horizontally, showing 7 days (490px) at a time by default
 
-function estimatePlannedKcal(zoneNum, durationMin, weightKg) {
-  const z = ZONES[zoneNum - 1];
+// A schedule entry can be modeled off a real past activity instead of the
+// generic MET table (`session.sourceActivity`, set by the "from an actual
+// session" picker in ScheduleTab). That activity's own kcal/min rate is
+// trusted directly and scaled to this session's (possibly taper-adjusted)
+// duration — more accurate than MET×weight since it reflects how this
+// specific athlete actually burns energy doing this specific workout.
+function estimatePlannedKcal(session, durationMin, weightKg) {
+  const src = session.sourceActivity;
+  if (src && src.durationMin > 0 && src.kcal > 0) {
+    return (src.kcal / src.durationMin) * durationMin;
+  }
+  const z = ZONES[session.zone - 1];
   if (!z || !weightKg) return 0;
   return z.met * weightKg * (durationMin / 60);
+}
+// Rough type-string -> app ACTIVITY_TYPES mapping for activities pulled from
+// Strava/intervals.icu (whose `type` fields are much more granular, e.g.
+// "VirtualRide", "WeightTraining", "Rowing").
+function mapToActivityType(rawType) {
+  const t = (rawType || "").toLowerCase();
+  if (t.includes("run") || t.includes("hike") || t.includes("walk")) return "Run";
+  if (t.includes("ride") || t.includes("bike") || t.includes("cycl")) return "Ride";
+  if (t.includes("swim")) return "Swim";
+  if (t.includes("row")) return "Row";
+  if (t.includes("weight") || t.includes("strength") || t.includes("workout")) return "Strength";
+  return "Other";
+}
+function nearestZone(IF) {
+  let best = ZONES[0], bestDiff = Infinity;
+  for (const z of ZONES) {
+    const diff = Math.abs(z.if - IF);
+    if (diff < bestDiff) { bestDiff = diff; best = z; }
+  }
+  return best.n;
+}
+// Recent real activities (Strava preferred over intervals.icu per date, same
+// priority as the main dailyRows model), reshaped into a flat, pickable list
+// for the "model after an actual session" schedule-entry option.
+const ACTIVITY_LIBRARY_DAYS = 180;
+function getActivityLibrary(stravaData, intervalsData) {
+  const byDateStrava = {};
+  for (const a of stravaData.activities) {
+    const d = (a.start_date_local || "").slice(0, 10);
+    if (!d) continue;
+    (byDateStrava[d] || (byDateStrava[d] = [])).push(a);
+  }
+  const byDateIntervals = {};
+  for (const a of intervalsData.activities) {
+    const d = (a.start_date_local || a.start_date || "").slice(0, 10);
+    if (!d) continue;
+    (byDateIntervals[d] || (byDateIntervals[d] = [])).push(a);
+  }
+  const cutoff = toISODate(daysAgo(ACTIVITY_LIBRARY_DAYS));
+  const dates = new Set([...Object.keys(byDateStrava), ...Object.keys(byDateIntervals)].filter((d) => d >= cutoff));
+  const out = [];
+  for (const d of dates) {
+    const stravaActs = byDateStrava[d] || [];
+    const acts = stravaActs.length
+      ? stravaActs.map((a) => ({ provider: "strava", raw: a }))
+      : (byDateIntervals[d] || []).map((a) => ({ provider: "intervals", raw: a }));
+    for (const { provider, raw: a } of acts) {
+      const kcal = provider === "strava" ? stravaActivityKcal(a) : activityKcal(a);
+      const durationMin = Math.round((a.moving_time || 0) / 60);
+      if (!kcal || !durationMin) continue;
+      const IF = provider === "strava" ? stravaIntensityFactor(a) : intensityFactor(a);
+      out.push({
+        key: `${provider}-${a.id}`,
+        provider,
+        date: d,
+        name: a.name || a.type || "Activity",
+        rawType: a.type,
+        activityType: mapToActivityType(a.type),
+        durationMin,
+        kcal: Math.round(kcal),
+        intensityFactor: IF,
+        zone: nearestZone(IF),
+      });
+    }
+  }
+  out.sort((a, b) => (a.date < b.date ? 1 : -1));
+  return out;
 }
 // Sessions demanding enough to warrant boosting the PRECEDING day's carb
 // target — thresholds follow the >60–90min / higher-intensity language used
@@ -932,9 +1014,9 @@ function App() {
       } else if (scheduledSessions.length) {
         source = "planned";
         for (const s of scheduledSessions) {
-          const z = ZONES[s.zone - 1];
-          const effIF = s.taperIntensityFactor ? z.if * s.taperIntensityFactor : z.if; // tapered sessions carry a reduced effective intensity
-          const kcal = estimatePlannedKcal(s.zone, s.durationMin, weightForDay); // s.durationMin is already taper-adjusted
+          const baseIF = s.sourceActivity ? s.sourceActivity.intensityFactor : ZONES[s.zone - 1].if;
+          const effIF = s.taperIntensityFactor ? baseIF * s.taperIntensityFactor : baseIF; // tapered sessions carry a reduced effective intensity
+          const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay); // s.durationMin is already taper-adjusted
           exerciseKcal += kcal;
           epocKcal += kcal * epocFactorFor(effIF) * profile.epocSensitivity;
           durationSec += s.durationMin * 60;
@@ -945,12 +1027,12 @@ function App() {
         // be — replaced automatically once real activity data syncs in for
         // race day, same as any other planned session.
         source = "planned";
-        const z = ZONES[raceToday.zone - 1];
-        const kcal = estimatePlannedKcal(raceToday.zone, raceToday.durationMin, weightForDay);
+        const raceIF = raceToday.sourceActivity ? raceToday.sourceActivity.intensityFactor : ZONES[raceToday.zone - 1].if;
+        const kcal = estimatePlannedKcal(raceToday, raceToday.durationMin, weightForDay);
         exerciseKcal += kcal;
-        epocKcal += kcal * epocFactorFor(z.if) * profile.epocSensitivity;
+        epocKcal += kcal * epocFactorFor(raceIF) * profile.epocSensitivity;
         durationSec += raceToday.durationMin * 60;
-        ifWeightedSum += z.if * (raceToday.durationMin * 60);
+        ifWeightedSum += raceIF * (raceToday.durationMin * 60);
       } else if (stravaSynced) {
         source = "strava"; // confirmed rest day — zero is a real answer, not a gap
       }
@@ -1197,7 +1279,7 @@ function App() {
         )}
         {tab === "schedule" && (
           <ScheduleTab schedule={schedule} onAdd={addScheduleEntry} onUpdate={updateScheduleEntry}
-            onDelete={deleteScheduleEntry} />
+            onDelete={deleteScheduleEntry} stravaData={stravaData} intervalsData={intervalsData} />
         )}
         {tab === "dashboard" && (
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
@@ -1855,7 +1937,12 @@ function emptyScheduleForm() {
     date: toLocalISODate(new Date()),
     raceDate: toLocalISODate(new Date()),
     taperDays: String(DEFAULT_TAPER_DAYS),
+    sourceActivity: null,
   };
+}
+// Short display label for a session modeled after a real activity.
+function sourceActivityLabel(src) {
+  return `${src.date} · ${src.name} · ${src.durationMin}min · ${src.kcal}kcal`;
 }
 
 // Shared look for a schedule-listing row, with a temporary highlight state
@@ -1870,11 +1957,27 @@ function scheduleRowStyle(highlighted) {
   };
 }
 
-function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
+function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData }) {
   const [form, setForm] = useState(emptyScheduleForm());
   const [editingId, setEditingId] = useState(null);
   const [highlightIds, setHighlightIds] = useState([]);
   const itemRefs = useRef({});
+
+  const activityLibrary = useMemo(
+    () => getActivityLibrary(stravaData, intervalsData),
+    [stravaData, intervalsData]
+  );
+  function applySourceActivity(key) {
+    const src = activityLibrary.find((a) => a.key === key);
+    if (!src) { setForm((f) => ({ ...f, sourceActivity: null })); return; }
+    setForm((f) => ({
+      ...f,
+      activityType: src.activityType,
+      zone: src.zone,
+      durationMin: String(src.durationMin),
+      sourceActivity: { key: src.key, date: src.date, name: src.name, durationMin: src.durationMin, kcal: src.kcal, intensityFactor: src.intensityFactor },
+    }));
+  }
 
   // Scrolls the listing card(s) below to the session(s)/race scheduled on the
   // clicked calendar day, and flashes them briefly so they're easy to spot.
@@ -1906,19 +2009,20 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
         ...emptyScheduleForm(),
         kind: "race", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
         raceDate: s.raceDate, taperDays: String(s.taperDays ?? DEFAULT_TAPER_DAYS), notes: s.notes || "",
+        sourceActivity: s.sourceActivity || null,
       });
     } else if (s.kind === "single") {
       setForm({
         ...emptyScheduleForm(),
         kind: "single", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
-        date: s.date, notes: s.notes || "",
+        date: s.date, notes: s.notes || "", sourceActivity: s.sourceActivity || null,
       });
     } else {
       setForm({
         ...emptyScheduleForm(),
         kind: "recurring", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
         daysOfWeek: s.daysOfWeek, startDate: s.startDate, endDate: s.endDate || "",
-        ongoing: !s.endDate, notes: s.notes || "",
+        ongoing: !s.endDate, notes: s.notes || "", sourceActivity: s.sourceActivity || null,
       });
     }
   }
@@ -1937,6 +2041,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
         raceDate: form.raceDate,
         taperDays: Math.max(0, parseInt(form.taperDays) || 0),
         notes: form.notes,
+        sourceActivity: form.sourceActivity,
       };
       if (editingId) onUpdate(editingId, entry); else onAdd(entry);
       cancelEdit();
@@ -1950,6 +2055,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
         durationMin: parseInt(form.durationMin) || 0,
         date: form.date,
         notes: form.notes,
+        sourceActivity: form.sourceActivity,
       };
       if (editingId) onUpdate(editingId, entry); else onAdd(entry);
       cancelEdit();
@@ -1965,6 +2071,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
       startDate: form.startDate,
       endDate: form.ongoing ? null : (form.endDate || null),
       notes: form.notes,
+      sourceActivity: form.sourceActivity,
     };
     if (editingId) onUpdate(editingId, entry); else onAdd(entry);
     cancelEdit();
@@ -2096,6 +2203,25 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
           </div>
         )}
 
+        <div style={{ marginBottom: 14 }}>
+          <Field label="Model demand on">
+            <select className="inp" value={form.sourceActivity?.key || ""} onChange={(e) => applySourceActivity(e.target.value)}>
+              <option value="">Manual (MET estimate from activity type / zone / duration below)</option>
+              {activityLibrary.map((a) => (
+                <option key={a.key} value={a.key}>{sourceActivityLabel(a)}</option>
+              ))}
+            </select>
+            {form.sourceActivity ? (
+              <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
+                Demand estimate will scale from this session's actual {fmt(form.sourceActivity.kcal / form.sourceActivity.durationMin, 1)} kcal/min —
+                activity type/zone below were pre-filled from it, and duration can still be adjusted.
+              </div>
+            ) : activityLibrary.length === 0 ? (
+              <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>No synced Strava/intervals.icu activities in the last {ACTIVITY_LIBRARY_DAYS} days yet.</div>
+            ) : null}
+          </Field>
+        </div>
+
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
           <Field label="Activity type">
             <select className="inp" value={form.activityType} onChange={(e) => setForm((f) => ({ ...f, activityType: e.target.value }))}>
@@ -2193,6 +2319,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
                   <b>{s.notes || s.activityType}</b> · {s.activityType} · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
                   <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
                     {s.raceDate} · taper starts {s.taperDays}d out
+                    {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
                   </div>
                 </div>
                 <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
@@ -2214,6 +2341,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
                   <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
                     {s.date}
                     {s.notes ? ` · ${s.notes}` : ""}
+                    {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
                   </div>
                 </div>
                 <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
@@ -2235,6 +2363,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
                   <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
                     {s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", ")} · from {s.startDate}{s.endDate ? ` to ${s.endDate}` : " (ongoing)"}
                     {s.notes ? ` · ${s.notes}` : ""}
+                    {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
                   </div>
                 </div>
                 <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>

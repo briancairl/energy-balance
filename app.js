@@ -166,6 +166,11 @@
     }
     return 0;
   }
+  function stravaActivityKcal(act) {
+    if (typeof act.calories === "number" && act.calories > 0) return act.calories;
+    if (typeof act.kilojoules === "number") return act.kilojoules / 4.184 / 0.24;
+    return 0;
+  }
   function intensityFactor(act) {
     if (typeof act.icu_intensity === "number") return act.icu_intensity;
     if (typeof act.icu_training_load === "number" && act.moving_time) {
@@ -212,10 +217,76 @@
   const ACTIVITY_TYPES = ["Run", "Ride", "Swim", "Row", "Strength", "Other"];
   const FORWARD_DAYS = 4;
   const CHART_DAY_WIDTH = 70;
-  function estimatePlannedKcal(zoneNum, durationMin, weightKg) {
-    const z = ZONES[zoneNum - 1];
+  function estimatePlannedKcal(session, durationMin, weightKg) {
+    const src = session.sourceActivity;
+    if (src && src.durationMin > 0 && src.kcal > 0) {
+      return src.kcal / src.durationMin * durationMin;
+    }
+    const z = ZONES[session.zone - 1];
     if (!z || !weightKg) return 0;
     return z.met * weightKg * (durationMin / 60);
+  }
+  function mapToActivityType(rawType) {
+    const t = (rawType || "").toLowerCase();
+    if (t.includes("run") || t.includes("hike") || t.includes("walk")) return "Run";
+    if (t.includes("ride") || t.includes("bike") || t.includes("cycl")) return "Ride";
+    if (t.includes("swim")) return "Swim";
+    if (t.includes("row")) return "Row";
+    if (t.includes("weight") || t.includes("strength") || t.includes("workout")) return "Strength";
+    return "Other";
+  }
+  function nearestZone(IF) {
+    let best = ZONES[0], bestDiff = Infinity;
+    for (const z of ZONES) {
+      const diff = Math.abs(z.if - IF);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = z;
+      }
+    }
+    return best.n;
+  }
+  const ACTIVITY_LIBRARY_DAYS = 180;
+  function getActivityLibrary(stravaData, intervalsData) {
+    const byDateStrava = {};
+    for (const a of stravaData.activities) {
+      const d = (a.start_date_local || "").slice(0, 10);
+      if (!d) continue;
+      (byDateStrava[d] || (byDateStrava[d] = [])).push(a);
+    }
+    const byDateIntervals = {};
+    for (const a of intervalsData.activities) {
+      const d = (a.start_date_local || a.start_date || "").slice(0, 10);
+      if (!d) continue;
+      (byDateIntervals[d] || (byDateIntervals[d] = [])).push(a);
+    }
+    const cutoff = toISODate(daysAgo(ACTIVITY_LIBRARY_DAYS));
+    const dates = new Set([...Object.keys(byDateStrava), ...Object.keys(byDateIntervals)].filter((d) => d >= cutoff));
+    const out = [];
+    for (const d of dates) {
+      const stravaActs = byDateStrava[d] || [];
+      const acts = stravaActs.length ? stravaActs.map((a) => ({ provider: "strava", raw: a })) : (byDateIntervals[d] || []).map((a) => ({ provider: "intervals", raw: a }));
+      for (const { provider, raw: a } of acts) {
+        const kcal = provider === "strava" ? stravaActivityKcal(a) : activityKcal(a);
+        const durationMin = Math.round((a.moving_time || 0) / 60);
+        if (!kcal || !durationMin) continue;
+        const IF = provider === "strava" ? stravaIntensityFactor(a) : intensityFactor(a);
+        out.push({
+          key: `${provider}-${a.id}`,
+          provider,
+          date: d,
+          name: a.name || a.type || "Activity",
+          rawType: a.type,
+          activityType: mapToActivityType(a.type),
+          durationMin,
+          kcal: Math.round(kcal),
+          intensityFactor: IF,
+          zone: nearestZone(IF)
+        });
+      }
+    }
+    out.sort((a, b) => a.date < b.date ? 1 : -1);
+    return out;
   }
   function isPreloadWorthy(session) {
     return session.durationMin >= 90 || session.zone >= 4;
@@ -765,9 +836,9 @@
         } else if (scheduledSessions.length) {
           source = "planned";
           for (const s of scheduledSessions) {
-            const z = ZONES[s.zone - 1];
-            const effIF = s.taperIntensityFactor ? z.if * s.taperIntensityFactor : z.if;
-            const kcal = estimatePlannedKcal(s.zone, s.durationMin, weightForDay);
+            const baseIF = s.sourceActivity ? s.sourceActivity.intensityFactor : ZONES[s.zone - 1].if;
+            const effIF = s.taperIntensityFactor ? baseIF * s.taperIntensityFactor : baseIF;
+            const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay);
             exerciseKcal += kcal;
             epocKcal += kcal * epocFactorFor(effIF) * profile.epocSensitivity;
             durationSec += s.durationMin * 60;
@@ -775,12 +846,12 @@
           }
         } else if (raceToday) {
           source = "planned";
-          const z = ZONES[raceToday.zone - 1];
-          const kcal = estimatePlannedKcal(raceToday.zone, raceToday.durationMin, weightForDay);
+          const raceIF = raceToday.sourceActivity ? raceToday.sourceActivity.intensityFactor : ZONES[raceToday.zone - 1].if;
+          const kcal = estimatePlannedKcal(raceToday, raceToday.durationMin, weightForDay);
           exerciseKcal += kcal;
-          epocKcal += kcal * epocFactorFor(z.if) * profile.epocSensitivity;
+          epocKcal += kcal * epocFactorFor(raceIF) * profile.epocSensitivity;
           durationSec += raceToday.durationMin * 60;
-          ifWeightedSum += z.if * (raceToday.durationMin * 60);
+          ifWeightedSum += raceIF * (raceToday.durationMin * 60);
         } else if (stravaSynced) {
           source = "strava";
         }
@@ -1014,7 +1085,9 @@
         schedule,
         onAdd: addScheduleEntry,
         onUpdate: updateScheduleEntry,
-        onDelete: deleteScheduleEntry
+        onDelete: deleteScheduleEntry,
+        stravaData,
+        intervalsData
       }
     ), tab === "dashboard" && /* @__PURE__ */ React.createElement(
       DashboardTab,
@@ -1321,8 +1394,12 @@
       notes: "",
       date: toLocalISODate(/* @__PURE__ */ new Date()),
       raceDate: toLocalISODate(/* @__PURE__ */ new Date()),
-      taperDays: String(DEFAULT_TAPER_DAYS)
+      taperDays: String(DEFAULT_TAPER_DAYS),
+      sourceActivity: null
     };
+  }
+  function sourceActivityLabel(src) {
+    return `${src.date} \xB7 ${src.name} \xB7 ${src.durationMin}min \xB7 ${src.kcal}kcal`;
   }
   function scheduleRowStyle(highlighted) {
     return {
@@ -1337,11 +1414,30 @@
       transition: "background 0.3s, border-color 0.3s"
     };
   }
-  function ScheduleTab({ schedule, onAdd, onUpdate, onDelete }) {
+  function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData }) {
+    var _a;
     const [form, setForm] = useState(emptyScheduleForm());
     const [editingId, setEditingId] = useState(null);
     const [highlightIds, setHighlightIds] = useState([]);
     const itemRefs = useRef({});
+    const activityLibrary = useMemo(
+      () => getActivityLibrary(stravaData, intervalsData),
+      [stravaData, intervalsData]
+    );
+    function applySourceActivity(key) {
+      const src = activityLibrary.find((a) => a.key === key);
+      if (!src) {
+        setForm((f) => ({ ...f, sourceActivity: null }));
+        return;
+      }
+      setForm((f) => ({
+        ...f,
+        activityType: src.activityType,
+        zone: src.zone,
+        durationMin: String(src.durationMin),
+        sourceActivity: { key: src.key, date: src.date, name: src.name, durationMin: src.durationMin, kcal: src.kcal, intensityFactor: src.intensityFactor }
+      }));
+    }
     function jumpToDay(day) {
       const ids = day.sessions.map((s) => s.id).concat(day.race ? [day.race.id] : []);
       if (!ids.length) return;
@@ -1361,7 +1457,7 @@
       }));
     }
     function startEdit(s) {
-      var _a;
+      var _a2;
       setEditingId(s.id);
       if (s.kind === "race") {
         setForm({
@@ -1371,8 +1467,9 @@
           zone: s.zone,
           durationMin: String(s.durationMin),
           raceDate: s.raceDate,
-          taperDays: String((_a = s.taperDays) != null ? _a : DEFAULT_TAPER_DAYS),
-          notes: s.notes || ""
+          taperDays: String((_a2 = s.taperDays) != null ? _a2 : DEFAULT_TAPER_DAYS),
+          notes: s.notes || "",
+          sourceActivity: s.sourceActivity || null
         });
       } else if (s.kind === "single") {
         setForm({
@@ -1382,7 +1479,8 @@
           zone: s.zone,
           durationMin: String(s.durationMin),
           date: s.date,
-          notes: s.notes || ""
+          notes: s.notes || "",
+          sourceActivity: s.sourceActivity || null
         });
       } else {
         setForm({
@@ -1395,7 +1493,8 @@
           startDate: s.startDate,
           endDate: s.endDate || "",
           ongoing: !s.endDate,
-          notes: s.notes || ""
+          notes: s.notes || "",
+          sourceActivity: s.sourceActivity || null
         });
       }
     }
@@ -1412,7 +1511,8 @@
           durationMin: parseInt(form.durationMin) || 0,
           raceDate: form.raceDate,
           taperDays: Math.max(0, parseInt(form.taperDays) || 0),
-          notes: form.notes
+          notes: form.notes,
+          sourceActivity: form.sourceActivity
         };
         if (editingId) onUpdate(editingId, entry2);
         else onAdd(entry2);
@@ -1426,7 +1526,8 @@
           zone: form.zone,
           durationMin: parseInt(form.durationMin) || 0,
           date: form.date,
-          notes: form.notes
+          notes: form.notes,
+          sourceActivity: form.sourceActivity
         };
         if (editingId) onUpdate(editingId, entry2);
         else onAdd(entry2);
@@ -1445,7 +1546,8 @@
         daysOfWeek: form.daysOfWeek,
         startDate: form.startDate,
         endDate: form.ongoing ? null : form.endDate || null,
-        notes: form.notes
+        notes: form.notes,
+        sourceActivity: form.sourceActivity
       };
       if (editingId) onUpdate(editingId, entry);
       else onAdd(entry);
@@ -1562,7 +1664,7 @@
       },
       /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 13, color: form.kind === "race" ? ink : dim }),
       " Race"
-    )), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Activity type" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: form.activityType, onChange: (e) => setForm((f) => ({ ...f, activityType: e.target.value })) }, ACTIVITY_TYPES.map((t) => /* @__PURE__ */ React.createElement("option", { key: t, value: t }, t)))), /* @__PURE__ */ React.createElement(Field, { label: form.kind === "race" ? "Expected finish time (min)" : "Duration (min)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "1", value: form.durationMin, onChange: (e) => setForm((f) => ({ ...f, durationMin: e.target.value })) }))), /* @__PURE__ */ React.createElement(Field, { label: "Intensity zone" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, ZONES.map((z) => /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", { style: { marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Model demand on" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: ((_a = form.sourceActivity) == null ? void 0 : _a.key) || "", onChange: (e) => applySourceActivity(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Manual (MET estimate from activity type / zone / duration below)"), activityLibrary.map((a) => /* @__PURE__ */ React.createElement("option", { key: a.key, value: a.key }, sourceActivityLabel(a)))), form.sourceActivity ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Demand estimate will scale from this session's actual ", fmt(form.sourceActivity.kcal / form.sourceActivity.durationMin, 1), " kcal/min \u2014 activity type/zone below were pre-filled from it, and duration can still be adjusted.") : activityLibrary.length === 0 ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "No synced Strava/intervals.icu activities in the last ", ACTIVITY_LIBRARY_DAYS, " days yet.") : null)), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Activity type" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: form.activityType, onChange: (e) => setForm((f) => ({ ...f, activityType: e.target.value })) }, ACTIVITY_TYPES.map((t) => /* @__PURE__ */ React.createElement("option", { key: t, value: t }, t)))), /* @__PURE__ */ React.createElement(Field, { label: form.kind === "race" ? "Expected finish time (min)" : "Duration (min)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "1", value: form.durationMin, onChange: (e) => setForm((f) => ({ ...f, durationMin: e.target.value })) }))), /* @__PURE__ */ React.createElement(Field, { label: "Intensity zone" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, ZONES.map((z) => /* @__PURE__ */ React.createElement(
       "button",
       {
         key: z.n,
@@ -1594,15 +1696,15 @@
       }
     )), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.ongoing, onChange: (e) => setForm((f) => ({ ...f, ongoing: e.target.checked })) }), "Ongoing"))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Notes (optional)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: form.notes, onChange: (e) => setForm((f) => ({ ...f, notes: e.target.value })), placeholder: form.kind === "race" ? "e.g. Boston Marathon" : "e.g. track intervals" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 18 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSubmit }, editingId ? "Save changes" : form.kind === "race" ? "Add race" : "Add to schedule"), editingId && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: cancelEdit }, "Cancel"))), races.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 16, color: gold }), " Races"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 } }, races.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, ref: (el) => {
       itemRefs.current[s.id] = el;
-    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.notes || s.activityType), " \xB7 ", s.activityType, " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.raceDate, " \xB7 taper starts ", s.taperDays, "d out")), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.notes || s.activityType), " \xB7 ", s.activityType, " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.raceDate, " \xB7 taper starts ", s.taperDays, "d out", s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
       if (confirm("Delete this race?")) onDelete(s.id);
     }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))), singles.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 } }, "Single sessions"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 } }, singles.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, ref: (el) => {
       itemRefs.current[s.id] = el;
-    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.date, s.notes ? ` \xB7 ${s.notes}` : "")), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.date, s.notes ? ` \xB7 ${s.notes}` : "", s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
       if (confirm("Delete this scheduled session?")) onDelete(s.id);
     }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))), recurring.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 } }, "Recurring sessions"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 } }, recurring.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, ref: (el) => {
       itemRefs.current[s.id] = el;
-    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", "), " \xB7 from ", s.startDate, s.endDate ? ` to ${s.endDate}` : " (ongoing)", s.notes ? ` \xB7 ${s.notes}` : "")), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", "), " \xB7 from ", s.startDate, s.endDate ? ` to ${s.endDate}` : " (ongoing)", s.notes ? ` \xB7 ${s.notes}` : "", s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
       if (confirm("Delete this scheduled session?")) onDelete(s.id);
     }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))));
   }

@@ -84,6 +84,9 @@ function weightUnitLabel(units) { return units === "imperial" ? "lb" : "kg"; }
 function heightUnitLabel(units) { return units === "imperial" ? "in" : "cm"; }
 function kgToDisplay(kg, units) { return units === "imperial" ? kgToLb(kg) : kg; }
 function displayToKg(v, units) { return units === "imperial" ? lbToKg(v) : v; }
+// proteinGPerKg is stored canonically as g per kg bodyweight; g/lb is g/kg * kg-per-lb.
+function gPerKgToDisplay(g, units) { return units === "imperial" ? g * KG_PER_LB : g; }
+function displayToGPerKg(g, units) { return units === "imperial" ? g / KG_PER_LB : g; }
 function cmToDisplayLen(cm, units) { return units === "imperial" ? cmToIn(cm) : cm; }
 function displayToCm(v, units) { return units === "imperial" ? inToCm(v) : v; }
 function roundTo(n, decimals) { const f = 10 ** decimals; return Math.round(n * f) / f; }
@@ -587,11 +590,13 @@ function App() {
   }, []);
   const [profile, setProfile] = useState({
     sex: "male", weightKg: "", heightCm: "", age: "",
-    neatFactor: 1.15, epocSensitivity: 1.0, fatigueBuffer: true,
+    neatMode: "multiplier", neatFactor: 1.15, neatOffset: 400, epocSensitivity: 1.0, fatigueBuffer: true,
     goal: "maintain", buildRatePct: GOAL_DEFAULTS.build.ratePct, loseRatePct: GOAL_DEFAULTS.lose.ratePct,
     targetWeightKg: "",
     trendCalibration: true,
     proteinGPerKg: 1.0,
+    minFatG: 100,
+    maxPreloadCarbGPerKg: 12,
     preloadBorrowRatio: 1.0,
     units: "metric",
   });
@@ -1053,7 +1058,9 @@ function App() {
       const atl = w?.atl ?? null;
       const tsb = ctl !== null && atl !== null ? ctl - atl : null;
       const fatigueBuffer = profile.fatigueBuffer && tsb !== null && tsb < -10 ? dayBmr * 0.05 : 0;
-      const baseline = dayBmr * (parseFloat(profile.neatFactor) || 1.15);
+      const baseline = profile.neatMode === "offset"
+        ? dayBmr + (parseFloat(profile.neatOffset) || 0)
+        : dayBmr * (parseFloat(profile.neatFactor) || 1.15);
       const demand = baseline + exerciseKcal + epocKcal + fatigueBuffer;
       const nutritionEntry = effectiveNutritionEntry(nutrition[key]);
       const nutritionSource = nutritionEntry ? (normalizeNutritionEntry(nutrition[key]).macrosfirst ? "macrosfirst" : "manual") : null;
@@ -1093,7 +1100,16 @@ function App() {
       const blend = intensityBlend(avgIF);
       const effectiveBlend = raceLoading ? 1 : blend;
       const normalCarbTargetG = weightForDay ? weightForDay * (fuelTier.carbLo + (fuelTier.carbHi - fuelTier.carbLo) * blend) : null;
-      const carbTargetG = weightForDay ? weightForDay * (effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * effectiveBlend) : null;
+      // Sports-science consensus tops classic carb loading out around 10-12
+      // g/kg/day — beyond that, extra intake shows no further glycogen
+      // benefit and raises GI-distress risk. This cap only clips the
+      // preload/race-load bump (effectiveTier reaching above the day's own
+      // tier); a day's own actual training-driven carbs (normalCarbTargetG)
+      // are never touched by it.
+      const preloadCapGPerKg = parseFloat(profile.maxPreloadCarbGPerKg) || 12;
+      let effectiveCarbGPerKg = effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * effectiveBlend;
+      if (preloading || raceLoading) effectiveCarbGPerKg = Math.min(effectiveCarbGPerKg, preloadCapGPerKg);
+      const carbTargetG = weightForDay ? weightForDay * effectiveCarbGPerKg : null;
       const extraCarbKcal = ((preloading || raceLoading) && carbTargetG !== null && normalCarbTargetG !== null && carbTargetG > normalCarbTargetG)
         ? (carbTargetG - normalCarbTargetG) * 4 : 0;
       const borrowRatio = Math.min(1, Math.max(0, parseFloat(profile.preloadBorrowRatio)));
@@ -1105,15 +1121,35 @@ function App() {
       // Apply today: repay what yesterday borrowed from today, then borrow
       // today's own share from tomorrow.
       const repaidKcal = carryRepaymentKcal; // capture before we overwrite it below
-      const target = baseTarget - repaidKcal + borrowedKcal;
+      const carbDrivenTarget = baseTarget - repaidKcal + borrowedKcal;
       carryRepaymentKcal = raceLoading ? 0 : borrowedKcal; // tomorrow's iteration will subtract this
 
-      const gap = intake !== null ? intake - target : null;
-
-      const proteinTargetG = weightForDay ? weightForDay * (parseFloat(profile.proteinGPerKg) || 1.0) : null;
-      const fatFloorG = target * 0.20 / 9;
-      const fatRemainderG = (target - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
+      // Protein scales off goal weight (where the athlete's headed), not the
+      // day's fluctuating logged weight — unlike carbs/fat, which track
+      // actual body mass since they fuel that day's training load. Falls
+      // back to logged/profile weight when no target weight is set.
+      const proteinWeightKg = parseFloat(profile.targetWeightKg) || weightForDay;
+      const proteinTargetG = proteinWeightKg ? proteinWeightKg * (parseFloat(profile.proteinGPerKg) || 1.0) : null;
+      // 20% of Target is the usual ISSN-consensus floor, and on its own it's
+      // self-scaling — never a big deal on a low-calorie rest day. It's only
+      // on a big carb pre-load/race-load day that it can price fat down to
+      // near nothing, so the flat gram minimum (default 100g) only backstops
+      // it there; applying it on every day would flatten an absolute floor
+      // over what should be a demand-scaled number, inflating Target on
+      // easy/rest days for no training reason.
+      const fatFloorG = (preloading || raceLoading)
+        ? Math.max(carbDrivenTarget * 0.20 / 9, parseFloat(profile.minFatG) || 100)
+        : carbDrivenTarget * 0.20 / 9;
+      const fatRemainderG = (carbDrivenTarget - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
       const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;
+      // Whenever the fat floor pushes fat above what carbDrivenTarget actually
+      // leaves room for, that macro minimum — not carbDrivenTarget — is the
+      // real Target; otherwise displayed Target and carb+protein+fat kcal
+      // would silently disagree.
+      const macroFloorKcal = (carbTargetG || 0) * 4 + (proteinTargetG || 0) * 4 + (fatTargetG || 0) * 9;
+      const target = weightForDay ? Math.max(carbDrivenTarget, macroFloorKcal) : carbDrivenTarget;
+
+      const gap = intake !== null ? intake - target : null;
 
       // A day only counts as "missing training data" if we genuinely don't know
       // (no actual sync, and no plan either) — a confirmed rest day, or a
@@ -1424,25 +1460,59 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
           <Icon path={ICONS.gauge} size={16} color={amber} /> Model tuning
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 20 }}>
-          <Field label={`Non-training activity factor — ${profile.neatFactor}×`}>
-            <input type="range" min="1.0" max="1.4" step="0.01" value={profile.neatFactor}
-              onChange={(e) => setProfile((p) => ({ ...p, neatFactor: e.target.value }))} style={{ width: "100%" }} />
-            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>BMR × this factor covers daily NEAT/light activity, before training is added on top.</div>
+          <Field label="Non-training activity (NEAT)">
+            <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+              {[["multiplier", "Multiplier"], ["offset", "Fixed offset"]].map(([id, label]) => (
+                <button key={id} onClick={() => setProfile((p) => ({ ...p, neatMode: id }))}
+                  className={id === (profile.neatMode || "multiplier") ? "" : "btn-ghost"}
+                  style={id === (profile.neatMode || "multiplier")
+                    ? { flex: 1, padding: "7px 10px", borderRadius: 4, fontWeight: 700, fontSize: 12, cursor: "pointer", border: "none", background: cyan, color: ink }
+                    : { flex: 1, padding: "7px 10px", fontSize: 12 }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {(profile.neatMode || "multiplier") === "offset" ? (
+              <>
+                <input className="inp" type="number" step="25" value={profile.neatOffset}
+                  onChange={(e) => setProfile((p) => ({ ...p, neatOffset: e.target.value }))} style={{ width: "100%" }} />
+                <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>A flat kcal/day added to BMR to cover daily NEAT/light activity, before training is added on top.</div>
+              </>
+            ) : (
+              <>
+                <input type="range" min="1.0" max="1.4" step="0.01" value={profile.neatFactor}
+                  onChange={(e) => setProfile((p) => ({ ...p, neatFactor: e.target.value }))} style={{ width: "100%" }} />
+                <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>BMR × {profile.neatFactor}× covers daily NEAT/light activity, before training is added on top.</div>
+              </>
+            )}
           </Field>
           <Field label={`EPOC / recovery sensitivity — ${profile.epocSensitivity}×`}>
             <input type="range" min="0.5" max="1.5" step="0.05" value={profile.epocSensitivity}
               onChange={(e) => setProfile((p) => ({ ...p, epocSensitivity: e.target.value }))} style={{ width: "100%" }} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Scales the post-exercise afterburn estimate (5–12% of session kcal by intensity).</div>
           </Field>
-          <Field label={`Protein target — ${profile.proteinGPerKg} g/kg/day`}>
-            <input type="range" min="0.6" max="2.5" step="0.05" value={profile.proteinGPerKg}
-              onChange={(e) => setProfile((p) => ({ ...p, proteinGPerKg: e.target.value }))} style={{ width: "100%" }} />
-            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Flat daily rate, not tier-scaled like carbs. Default 1.0 g/kg; athlete guidelines typically range 1.2–2.0+ g/kg.</div>
+          <Field label={`Protein target — ${fmt(gPerKgToDisplay(parseFloat(profile.proteinGPerKg) || 0, units), 2)} g/${weightUnitLabel(units)}/day`}>
+            <input type="range" min={units === "imperial" ? 0.3 : 0.6} max={units === "imperial" ? 1.2 : 2.5} step={units === "imperial" ? 0.02 : 0.05}
+              value={gPerKgToDisplay(parseFloat(profile.proteinGPerKg) || 0, units)}
+              onChange={(e) => setProfile((p) => ({ ...p, proteinGPerKg: String(displayToGPerKg(parseFloat(e.target.value), units)) }))} style={{ width: "100%" }} />
+            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
+              Flat daily rate, not tier-scaled like carbs. Default {fmt(gPerKgToDisplay(1.0, units), 2)} g/{weightUnitLabel(units)}; athlete guidelines typically range {fmt(gPerKgToDisplay(1.2, units), 2)}–{fmt(gPerKgToDisplay(2.0, units), 2)}+ g/{weightUnitLabel(units)}.
+            </div>
+          </Field>
+          <Field label={`Max carb pre-load — ${profile.maxPreloadCarbGPerKg} g/kg/day`}>
+            <input type="range" min="6" max="14" step="0.5" value={profile.maxPreloadCarbGPerKg}
+              onChange={(e) => setProfile((p) => ({ ...p, maxPreloadCarbGPerKg: e.target.value }))} style={{ width: "100%" }} />
+            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Ceiling on the tomorrow's-session/race pre-load bump only — a day's own carbs for training actually done that day are never capped by this. Classic carb-loading protocols top out around 10–12 g/kg/day; more shows no extra glycogen benefit and raises GI-distress risk.</div>
           </Field>
           <Field label={`Pre-load funding — ${Math.round(profile.preloadBorrowRatio * 100)}% borrowed`}>
             <input type="range" min="0" max="1" step="0.05" value={profile.preloadBorrowRatio}
               onChange={(e) => setProfile((p) => ({ ...p, preloadBorrowRatio: e.target.value }))} style={{ width: "100%" }} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>How pre-loaded carbs get funded: 0% shrinks that day's fat target to make room; 100% raises that day's calorie Target instead, and debits the same amount from the next day's Target to balance it out.</div>
+          </Field>
+          <Field label={`Minimum fat target — ${profile.minFatG}g/day`}>
+            <input type="range" min="40" max="150" step="5" value={profile.minFatG}
+              onChange={(e) => setProfile((p) => ({ ...p, minFatG: e.target.value }))} style={{ width: "100%" }} />
+            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load/race-load day can still price it down near nothing — this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100–150g/day typical range for an athlete's calorie load.</div>
           </Field>
         </div>
         <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" }}>

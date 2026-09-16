@@ -596,6 +596,7 @@ function App() {
     trendCalibration: true,
     proteinGPerKg: 1.0,
     minFatG: 100,
+    maxPreloadCarbGPerKg: 12,
     preloadBorrowRatio: 1.0,
     units: "metric",
   });
@@ -1099,7 +1100,16 @@ function App() {
       const blend = intensityBlend(avgIF);
       const effectiveBlend = raceLoading ? 1 : blend;
       const normalCarbTargetG = weightForDay ? weightForDay * (fuelTier.carbLo + (fuelTier.carbHi - fuelTier.carbLo) * blend) : null;
-      const carbTargetG = weightForDay ? weightForDay * (effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * effectiveBlend) : null;
+      // Sports-science consensus tops classic carb loading out around 10-12
+      // g/kg/day — beyond that, extra intake shows no further glycogen
+      // benefit and raises GI-distress risk. This cap only clips the
+      // preload/race-load bump (effectiveTier reaching above the day's own
+      // tier); a day's own actual training-driven carbs (normalCarbTargetG)
+      // are never touched by it.
+      const preloadCapGPerKg = parseFloat(profile.maxPreloadCarbGPerKg) || 12;
+      let effectiveCarbGPerKg = effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * effectiveBlend;
+      if (preloading || raceLoading) effectiveCarbGPerKg = Math.min(effectiveCarbGPerKg, preloadCapGPerKg);
+      const carbTargetG = weightForDay ? weightForDay * effectiveCarbGPerKg : null;
       const extraCarbKcal = ((preloading || raceLoading) && carbTargetG !== null && normalCarbTargetG !== null && carbTargetG > normalCarbTargetG)
         ? (carbTargetG - normalCarbTargetG) * 4 : 0;
       const borrowRatio = Math.min(1, Math.max(0, parseFloat(profile.preloadBorrowRatio)));
@@ -1478,6 +1488,11 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
               Flat daily rate, not tier-scaled like carbs. Default {fmt(gPerKgToDisplay(1.0, units), 2)} g/{weightUnitLabel(units)}; athlete guidelines typically range {fmt(gPerKgToDisplay(1.2, units), 2)}–{fmt(gPerKgToDisplay(2.0, units), 2)}+ g/{weightUnitLabel(units)}.
             </div>
+          </Field>
+          <Field label={`Max carb pre-load — ${profile.maxPreloadCarbGPerKg} g/kg/day`}>
+            <input type="range" min="6" max="14" step="0.5" value={profile.maxPreloadCarbGPerKg}
+              onChange={(e) => setProfile((p) => ({ ...p, maxPreloadCarbGPerKg: e.target.value }))} style={{ width: "100%" }} />
+            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Ceiling on the tomorrow's-session/race pre-load bump only — a day's own carbs for training actually done that day are never capped by this. Classic carb-loading protocols top out around 10–12 g/kg/day; more shows no extra glycogen benefit and raises GI-distress risk.</div>
           </Field>
           <Field label={`Pre-load funding — ${Math.round(profile.preloadBorrowRatio * 100)}% borrowed`}>
             <input type="range" min="0" max="1" step="0.05" value={profile.preloadBorrowRatio}

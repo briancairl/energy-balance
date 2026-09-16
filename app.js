@@ -487,6 +487,7 @@
       trendCalibration: true,
       proteinGPerKg: 1,
       minFatG: 100,
+      maxPreloadCarbGPerKg: 12,
       preloadBorrowRatio: 1,
       units: "metric"
     });
@@ -892,7 +893,10 @@
         const blend = intensityBlend(avgIF);
         const effectiveBlend = raceLoading ? 1 : blend;
         const normalCarbTargetG = weightForDay ? weightForDay * (fuelTier.carbLo + (fuelTier.carbHi - fuelTier.carbLo) * blend) : null;
-        const carbTargetG = weightForDay ? weightForDay * (effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * effectiveBlend) : null;
+        const preloadCapGPerKg = parseFloat(profile.maxPreloadCarbGPerKg) || 12;
+        let effectiveCarbGPerKg = effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * effectiveBlend;
+        if (preloading || raceLoading) effectiveCarbGPerKg = Math.min(effectiveCarbGPerKg, preloadCapGPerKg);
+        const carbTargetG = weightForDay ? weightForDay * effectiveCarbGPerKg : null;
         const extraCarbKcal = (preloading || raceLoading) && carbTargetG !== null && normalCarbTargetG !== null && carbTargetG > normalCarbTargetG ? (carbTargetG - normalCarbTargetG) * 4 : 0;
         const borrowRatio = Math.min(1, Math.max(0, parseFloat(profile.preloadBorrowRatio)));
         const borrowedKcal = raceLoading ? extraCarbKcal : extraCarbKcal * (isNaN(borrowRatio) ? 1 : borrowRatio);
@@ -1193,7 +1197,18 @@
         onChange: (e) => setProfile((p) => ({ ...p, proteinGPerKg: String(displayToGPerKg(parseFloat(e.target.value), units)) })),
         style: { width: "100%" }
       }
-    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Flat daily rate, not tier-scaled like carbs. Default ", fmt(gPerKgToDisplay(1, units), 2), " g/", weightUnitLabel(units), "; athlete guidelines typically range ", fmt(gPerKgToDisplay(1.2, units), 2), "\u2013", fmt(gPerKgToDisplay(2, units), 2), "+ g/", weightUnitLabel(units), ".")), /* @__PURE__ */ React.createElement(Field, { label: `Pre-load funding \u2014 ${Math.round(profile.preloadBorrowRatio * 100)}% borrowed` }, /* @__PURE__ */ React.createElement(
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Flat daily rate, not tier-scaled like carbs. Default ", fmt(gPerKgToDisplay(1, units), 2), " g/", weightUnitLabel(units), "; athlete guidelines typically range ", fmt(gPerKgToDisplay(1.2, units), 2), "\u2013", fmt(gPerKgToDisplay(2, units), 2), "+ g/", weightUnitLabel(units), ".")), /* @__PURE__ */ React.createElement(Field, { label: `Max carb pre-load \u2014 ${profile.maxPreloadCarbGPerKg} g/kg/day` }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "range",
+        min: "6",
+        max: "14",
+        step: "0.5",
+        value: profile.maxPreloadCarbGPerKg,
+        onChange: (e) => setProfile((p) => ({ ...p, maxPreloadCarbGPerKg: e.target.value })),
+        style: { width: "100%" }
+      }
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Ceiling on the tomorrow's-session/race pre-load bump only \u2014 a day's own carbs for training actually done that day are never capped by this. Classic carb-loading protocols top out around 10\u201312 g/kg/day; more shows no extra glycogen benefit and raises GI-distress risk.")), /* @__PURE__ */ React.createElement(Field, { label: `Pre-load funding \u2014 ${Math.round(profile.preloadBorrowRatio * 100)}% borrowed` }, /* @__PURE__ */ React.createElement(
       "input",
       {
         type: "range",

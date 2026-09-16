@@ -1376,7 +1376,7 @@ function App() {
       `}</style>
 
       <div style={{ borderBottom: `1px solid ${line}` }}>
-        <div style={{ padding: "18px 28px", maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ padding: "14px clamp(12px, 4vw, 28px)", maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", rowGap: 10 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <img src="/logo-header.png" alt="" width={28} height={28} style={{ borderRadius: 6, display: "block" }} />
             <div>
@@ -1384,7 +1384,7 @@ function App() {
               <div style={{ fontSize: 11, color: dim, fontFamily: mono, marginTop: 1 }}>training demand vs. fuel intake — local build</div>
             </div>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
             {[
               { id: "setup", label: "Setup", icon: ICONS.settings },
               { id: "import", label: "Log", icon: ICONS.upload },
@@ -1417,7 +1417,7 @@ function App() {
         </div>
       </div>
 
-      <div style={{ padding: "24px 28px", maxWidth: 1080, margin: "0 auto" }}>
+      <div style={{ padding: "20px clamp(12px, 4vw, 28px)", maxWidth: 1080, margin: "0 auto" }}>
         {tab === "setup" && (
           <SetupTab profile={profile} setProfile={setProfile} bmr={bmr} onFetch={pullAll}
             fetching={fetching || stravaFetching} fetchError={fetchError} rangeDays={rangeDays} setRangeDays={setRangeDays}
@@ -1460,10 +1460,10 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
   const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
   const [heightText, onHeightChange] = useUnitInput(profile.heightCm, units, cmToDisplayLen, displayToCm, 1);
   return (
-    <div style={{ display: "grid", gap: 20 }}>
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" }}>
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16 }}>Athlete profile</div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 14 }}>
           <Field label="Sex">
             <select className="inp" value={profile.sex} onChange={set("sex")}>
               <option value="male">Male</option>
@@ -1581,7 +1581,7 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16, display: "flex", alignItems: "center", gap: 7 }}>
           <Icon path={ICONS.gauge} size={16} color={amber} /> Model tuning
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 20 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 20 }}>
           <Field label="Non-training activity (NEAT)">
             <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
               {[["multiplier", "Multiplier"], ["offset", "Fixed offset"]].map(([id, label]) => (
@@ -1738,7 +1738,7 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
   const dayCount = Object.keys(nutrition).length;
   const weightCount = Object.keys(weightLog).length;
   return (
-    <div style={{ display: "grid", gap: 20 }}>
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" }}>
       <ManualEntryCard nutrition={nutrition} onSave={onSaveManualDay} />
       <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} units={units} />
 
@@ -1815,7 +1815,7 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
         <div className="card" style={{ padding: 22 }}>
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Map columns</div>
           <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>{csvPreview.rows.length} rows found. Match the columns to the fields below.</div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 12 }}>
             {["date", "calories", "protein", "carbs", "fat"].map((k) => (
               <Field key={k} label={k}>
                 <select className="inp" value={colMap[k]} onChange={(e) => setColMap((m) => ({ ...m, [k]: e.target.value }))}>
@@ -1832,13 +1832,21 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored nutrition log</div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 }}>{dayCount} day{dayCount === 1 ? "" : "s"} of intake saved. Click a row to edit it.</div>
-        {dayCount > 0 && <NutritionLogTable nutrition={nutrition} onSave={onSaveManualDay} onDelete={onDeleteDay} />}
+        {dayCount > 0 && (
+          <div style={{ overflowX: "auto" }}>
+            <NutritionLogTable nutrition={nutrition} onSave={onSaveManualDay} onDelete={onDeleteDay} />
+          </div>
+        )}
       </div>
 
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored weight log</div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 }}>{weightCount} day{weightCount === 1 ? "" : "s"} of weight saved. Click a row to edit it.</div>
-        {weightCount > 0 && <WeightLogTable weightLog={weightLog} onSave={onSaveWeight} onDelete={onDeleteWeight} units={units} />}
+        {weightCount > 0 && (
+          <div style={{ overflowX: "auto" }}>
+            <WeightLogTable weightLog={weightLog} onSave={onSaveWeight} onDelete={onDeleteWeight} units={units} />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1915,7 +1923,7 @@ function ManualEntryCard({ nutrition, onSave }) {
         computed automatically (4 kcal/g protein & carbs, 9 kcal/g fat). Pick a date that's already logged
         to edit it. A MacrosFirst import always takes priority over a manual entry for the same day.
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(90px, 1fr))", gap: 14 }}>
         <Field label="Date">
           <input className="inp" type="date" value={date} max={toISODate(new Date())} onChange={(e) => setDate(e.target.value)} />
         </Field>
@@ -2119,7 +2127,7 @@ function WeightEntryCard({ weightLog, onSave, units }) {
         Feeds directly into BMR and fueling targets for that day — body weight shifts across a training
         block, so this keeps demand and g/kg targets tracking you rather than a fixed Setup value.
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, alignItems: "end" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 14, alignItems: "end" }}>
         <Field label="Date">
           <input className="inp" type="date" value={date} max={toISODate(new Date())} onChange={(e) => setDate(e.target.value)} />
         </Field>
@@ -2406,7 +2414,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
   const todayKey = toLocalISODate(new Date());
 
   return (
-    <div style={{ display: "grid", gap: 20 }}>
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" }}>
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
           <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
@@ -2534,7 +2542,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           </Field>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginBottom: 14 }}>
           <Field label="Activity type">
             <select className="inp" value={form.activityType} onChange={(e) => setForm((f) => ({ ...f, activityType: e.target.value }))}>
               {ACTIVITY_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
@@ -2561,7 +2569,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
         </Field>
 
         {form.kind === "race" ? (
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginTop: 14 }}>
             <Field label="Race date">
               <input className="inp" type="date" value={form.raceDate} onChange={(e) => setForm((f) => ({ ...f, raceDate: e.target.value }))} />
             </Field>
@@ -2591,14 +2599,18 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
               </div>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 14, marginTop: 14, alignItems: "end" }}>
-              <Field label="Start date">
-                <input className="inp" type="date" value={form.startDate} onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value }))} />
-              </Field>
-              <Field label="End date">
-                <input className="inp" type="date" value={form.endDate} disabled={form.ongoing}
-                  onChange={(e) => setForm((f) => ({ ...f, endDate: e.target.value }))} style={{ opacity: form.ongoing ? 0.5 : 1 }} />
-              </Field>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" }}>
+              <div style={{ flex: "1 1 140px" }}>
+                <Field label="Start date">
+                  <input className="inp" type="date" value={form.startDate} onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value }))} />
+                </Field>
+              </div>
+              <div style={{ flex: "1 1 140px" }}>
+                <Field label="End date">
+                  <input className="inp" type="date" value={form.endDate} disabled={form.ongoing}
+                    onChange={(e) => setForm((f) => ({ ...f, endDate: e.target.value }))} style={{ opacity: form.ongoing ? 0.5 : 1 }} />
+                </Field>
+              </div>
               <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
                 <input type="checkbox" checked={form.ongoing} onChange={(e) => setForm((f) => ({ ...f, ongoing: e.target.checked }))} />
                 Ongoing
@@ -2779,7 +2791,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
       )}
 
       {!summary.noIntake && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14 }}>
           <StatCard label="Avg. daily target" value={`${fmt(summary.avgTarget)} kcal`} color={cyan} />
           <StatCard label="Avg. daily intake" value={`${fmt(summary.avgIntake)} kcal`} color={paper} />
           <StatCard label="Avg. gap" value={`${summary.avgGap >= 0 ? "+" : ""}${fmt(summary.avgGap)} kcal`} color={summary.avgGap < -200 ? coral : summary.avgGap > 200 ? amber : mint} />
@@ -2991,7 +3003,7 @@ function FuelingInfoPopout({ proteinGPerKg, onClose }) {
 function FuelingReferencePanel({ fuelingByTier }) {
   return (
     <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${line}` }}>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: fuelingByTier.length ? 18 : 0 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10, marginBottom: fuelingByTier.length ? 18 : 0 }}>
         {FUEL_TIERS.map((t) => (
           <div key={t.tier} style={{ background: panel2, border: `1px solid ${line}`, borderRadius: 5, padding: "10px 12px" }}>
             <div style={{ fontSize: 11, color: dim, marginBottom: 4 }}>{t.label}</div>
@@ -3005,15 +3017,15 @@ function FuelingReferencePanel({ fuelingByTier }) {
           <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 10 }}>Your averages by tier, this window</div>
           <div style={{ display: "grid", gap: 8 }}>
             {fuelingByTier.map((g) => (
-              <div key={g.tier} style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 12.5 }}>
+              <div key={g.tier} style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 12, fontSize: 12.5 }}>
                 <div style={{ width: 130, color: dim, flexShrink: 0 }}>{g.label} <span style={{ fontFamily: mono }}>({g.n}d)</span></div>
-                <div style={{ flex: 1 }}>
+                <div style={{ flex: "1 1 100px" }}>
                   Carb: <MacroCell actual={g.avgCarb} target={g.avgCarbTarget} /> g
                 </div>
-                <div style={{ flex: 1 }}>
+                <div style={{ flex: "1 1 100px" }}>
                   Protein: <MacroCell actual={g.avgProtein} target={g.avgProteinTarget} /> g
                 </div>
-                <div style={{ flex: 1 }}>
+                <div style={{ flex: "1 1 100px" }}>
                   Fat: <MacroCell actual={g.avgFat} target={g.avgFatTarget} /> g
                 </div>
               </div>

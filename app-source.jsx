@@ -1121,10 +1121,8 @@ function App() {
       // Apply today: repay what yesterday borrowed from today, then borrow
       // today's own share from tomorrow.
       const repaidKcal = carryRepaymentKcal; // capture before we overwrite it below
-      const target = baseTarget - repaidKcal + borrowedKcal;
+      const carbDrivenTarget = baseTarget - repaidKcal + borrowedKcal;
       carryRepaymentKcal = raceLoading ? 0 : borrowedKcal; // tomorrow's iteration will subtract this
-
-      const gap = intake !== null ? intake - target : null;
 
       // Protein scales off goal weight (where the athlete's headed), not the
       // day's fluctuating logged weight — unlike carbs/fat, which track
@@ -1137,9 +1135,17 @@ function App() {
       // near nothing — so it's floored again against a flat gram minimum
       // (default 100g, comfortably inside the ~100-150g/day typical for an
       // athlete's calorie range) for essential-fatty-acid/vitamin intake.
-      const fatFloorG = Math.max(target * 0.20 / 9, parseFloat(profile.minFatG) || 100);
-      const fatRemainderG = (target - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
+      const fatFloorG = Math.max(carbDrivenTarget * 0.20 / 9, parseFloat(profile.minFatG) || 100);
+      const fatRemainderG = (carbDrivenTarget - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
       const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;
+      // Whenever the fat floor pushes fat above what carbDrivenTarget actually
+      // leaves room for, that macro minimum — not carbDrivenTarget — is the
+      // real Target; otherwise displayed Target and carb+protein+fat kcal
+      // would silently disagree.
+      const macroFloorKcal = (carbTargetG || 0) * 4 + (proteinTargetG || 0) * 4 + (fatTargetG || 0) * 9;
+      const target = weightForDay ? Math.max(carbDrivenTarget, macroFloorKcal) : carbDrivenTarget;
+
+      const gap = intake !== null ? intake - target : null;
 
       // A day only counts as "missing training data" if we genuinely don't know
       // (no actual sync, and no plan either) — a confirmed rest day, or a

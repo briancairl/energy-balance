@@ -595,6 +595,7 @@ function App() {
     targetWeightKg: "",
     trendCalibration: true,
     proteinGPerKg: 1.0,
+    minFatG: 100,
     preloadBorrowRatio: 1.0,
     units: "metric",
   });
@@ -1121,7 +1122,12 @@ function App() {
       // back to logged/profile weight when no target weight is set.
       const proteinWeightKg = parseFloat(profile.targetWeightKg) || weightForDay;
       const proteinTargetG = proteinWeightKg ? proteinWeightKg * (parseFloat(profile.proteinGPerKg) || 1.0) : null;
-      const fatFloorG = target * 0.20 / 9;
+      // 20% of Target is the usual ISSN-consensus floor, but on a big carb
+      // pre-load/race-load day that percentage can still price fat down to
+      // near nothing — so it's floored again against a flat gram minimum
+      // (default 100g, comfortably inside the ~100-150g/day typical for an
+      // athlete's calorie range) for essential-fatty-acid/vitamin intake.
+      const fatFloorG = Math.max(target * 0.20 / 9, parseFloat(profile.minFatG) || 100);
       const fatRemainderG = (target - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
       const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;
 
@@ -1477,6 +1483,11 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
             <input type="range" min="0" max="1" step="0.05" value={profile.preloadBorrowRatio}
               onChange={(e) => setProfile((p) => ({ ...p, preloadBorrowRatio: e.target.value }))} style={{ width: "100%" }} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>How pre-loaded carbs get funded: 0% shrinks that day's fat target to make room; 100% raises that day's calorie Target instead, and debits the same amount from the next day's Target to balance it out.</div>
+          </Field>
+          <Field label={`Minimum fat target — ${profile.minFatG}g/day`}>
+            <input type="range" min="40" max="150" step="5" value={profile.minFatG}
+              onChange={(e) => setProfile((p) => ({ ...p, minFatG: e.target.value }))} style={{ width: "100%" }} />
+            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load/race-load day can still price it down near nothing — this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100–150g/day typical range for an athlete's calorie load.</div>
           </Field>
         </div>
         <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" }}>

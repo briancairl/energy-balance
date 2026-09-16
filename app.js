@@ -486,6 +486,7 @@
       targetWeightKg: "",
       trendCalibration: true,
       proteinGPerKg: 1,
+      minFatG: 100,
       preloadBorrowRatio: 1,
       units: "metric"
     });
@@ -901,7 +902,7 @@
         const gap = intake !== null ? intake - target : null;
         const proteinWeightKg = parseFloat(profile.targetWeightKg) || weightForDay;
         const proteinTargetG = proteinWeightKg ? proteinWeightKg * (parseFloat(profile.proteinGPerKg) || 1) : null;
-        const fatFloorG = target * 0.2 / 9;
+        const fatFloorG = Math.max(target * 0.2 / 9, parseFloat(profile.minFatG) || 100);
         const fatRemainderG = (target - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
         const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;
         const trainingMissing = !stravaSynced && intervalsActs.length === 0 && source !== "planned";
@@ -1203,7 +1204,18 @@
         onChange: (e) => setProfile((p) => ({ ...p, preloadBorrowRatio: e.target.value })),
         style: { width: "100%" }
       }
-    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "How pre-loaded carbs get funded: 0% shrinks that day's fat target to make room; 100% raises that day's calorie Target instead, and debits the same amount from the next day's Target to balance it out."))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.fatigueBuffer, onChange: (e) => setProfile((p) => ({ ...p, fatigueBuffer: e.target.checked })) }), "Add a +5% BMR recovery buffer on days with a strongly negative training stress balance (TSB < \u221210)")), /* @__PURE__ */ React.createElement(
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "How pre-loaded carbs get funded: 0% shrinks that day's fat target to make room; 100% raises that day's calorie Target instead, and debits the same amount from the next day's Target to balance it out.")), /* @__PURE__ */ React.createElement(Field, { label: `Minimum fat target \u2014 ${profile.minFatG}g/day` }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "range",
+        min: "40",
+        max: "150",
+        step: "5",
+        value: profile.minFatG,
+        onChange: (e) => setProfile((p) => ({ ...p, minFatG: e.target.value })),
+        style: { width: "100%" }
+      }
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load/race-load day can still price it down near nothing \u2014 this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100\u2013150g/day typical range for an athlete's calorie load."))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.fatigueBuffer, onChange: (e) => setProfile((p) => ({ ...p, fatigueBuffer: e.target.checked })) }), "Add a +5% BMR recovery buffer on days with a strongly negative training stress balance (TSB < \u221210)")), /* @__PURE__ */ React.createElement(
       GoalCard,
       {
         profile,

@@ -125,9 +125,26 @@
     }
     return [text, onChange];
   }
+  async function fetchWithRetry(url, options, retries = 2, backoffMs = 300) {
+    for (let attempt = 0; ; attempt++) {
+      let res;
+      try {
+        res = await fetch(url, options);
+      } catch (e) {
+        if (attempt >= retries) throw e;
+        await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
+        continue;
+      }
+      if (res.status >= 500 && attempt < retries) {
+        await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
+        continue;
+      }
+      return res;
+    }
+  }
   async function storageGet(key, fallback) {
     try {
-      const res = await fetch(`/api/store?key=${encodeURIComponent(key)}`);
+      const res = await fetchWithRetry(`/api/store?key=${encodeURIComponent(key)}`);
       if (!res.ok) return fallback;
       const data = await res.json();
       return data.value !== null && data.value !== void 0 ? data.value : fallback;
@@ -138,13 +155,57 @@
   }
   async function storageSet(key, value) {
     try {
-      await fetch(`/api/store?key=${encodeURIComponent(key)}`, {
+      await fetchWithRetry(`/api/store?key=${encodeURIComponent(key)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(value)
       });
     } catch (e) {
       console.error("storage set failed", key, e);
+    }
+  }
+  async function apiSaveNutritionDay(date, manual) {
+    const res = await fetchWithRetry(`/api/nutrition/day?date=${date}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manual })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+    return data.entry;
+  }
+  async function apiDeleteNutritionDay(date) {
+    const res = await fetchWithRetry(`/api/nutrition/day/delete?date=${date}`, { method: "POST" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `Delete failed (${res.status}).`);
+    }
+  }
+  async function apiSaveNutritionBulk(days) {
+    const res = await fetchWithRetry("/api/nutrition/bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ days })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Import failed (${res.status}).`);
+    return data.count;
+  }
+  async function apiSaveWeightDay(date, kg) {
+    const res = await fetchWithRetry(`/api/weight/day?date=${date}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kg })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+    return data.kg;
+  }
+  async function apiDeleteWeightDay(date) {
+    const res = await fetchWithRetry(`/api/weight/day/delete?date=${date}`, { method: "POST" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `Delete failed (${res.status}).`);
     }
   }
   function normalizeNutritionEntry(raw) {
@@ -459,6 +520,17 @@
   };
   const SEVERITY_COLOR = { low: cyan, medium: amber, high: coral };
   const SEVERITY_BG = { low: "rgba(79,209,217,0.08)", medium: "rgba(232,163,61,0.1)", high: "rgba(225,96,77,0.12)" };
+  const BANNER_STYLE = {
+    info: { color: cyan, bg: "rgba(79,209,217,0.08)" },
+    success: { color: mint, bg: "rgba(127,200,169,0.12)" },
+    warning: { color: amber, bg: "rgba(232,163,61,0.1)" },
+    error: { color: coral, bg: "rgba(225,96,77,0.12)" }
+  };
+  function Banner({ kind = "info", children }) {
+    const s = BANNER_STYLE[kind] || BANNER_STYLE.info;
+    const iconPath = kind === "success" ? ICONS.check : ICONS.warn;
+    return /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: s.bg, border: `1px solid ${s.color}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: iconPath, size: 14, color: s.color }), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }, children));
+  }
   function App() {
     const [tab, setTab] = useState("setup");
     const [theme, setTheme] = useState(() => document.documentElement.dataset.theme === "light" ? "light" : "dark");
@@ -563,14 +635,8 @@
     useEffect(() => {
       if (loaded) storageSet("profile", profile);
     }, [profile, loaded]);
-    const saveNutrition = useCallback((next) => {
-      setNutrition(next);
-      storageSet("nutrition-log", next);
-    }, []);
-    const saveWeightLog = useCallback((next) => {
-      setWeightLog(next);
-      storageSet("weight-log", next);
-    }, []);
+    const [importError, setImportError] = useState(null);
+    const [importNotice, setImportNotice] = useState(null);
     const saveSchedule = useCallback((next) => {
       setSchedule(next);
       storageSet("training-schedule", next);
@@ -617,8 +683,9 @@
           setColMap(guessColumnMapping(fields));
           setCsvPreview({ fields, rows: res.data });
           setCsvPreviewSource("csv");
+          setImportError(null);
         },
-        error: (err) => alert("Could not parse CSV: " + err.message)
+        error: (err) => setImportError("Could not parse CSV: " + err.message)
       });
     }
     async function syncGoogleSheet() {
@@ -646,16 +713,15 @@
         setGoogleFetching(false);
       }
     }
-    function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
+    async function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
       var _a, _b, _c, _d, _e, _f;
       if (!preview || !map.date || !map.calories) {
-        alert("Map at least the date and calories columns first.");
+        setImportError("Map at least the date and calories columns first.");
         return;
       }
-      const next = { ...nutrition };
-      const importedDates = [];
+      setImportError(null);
+      const days = {};
       const skippedExamples = [];
-      let count = 0;
       for (const row of preview.rows) {
         const rawDate = row[map.date];
         const d = parseFlexibleDate(rawDate);
@@ -664,59 +730,75 @@
           continue;
         }
         const key = toISODate(d);
-        const existing = normalizeNutritionEntry(next[key]);
-        next[key] = {
-          ...existing,
-          macrosfirst: {
-            calories: parseFloat(row[map.calories]) || 0,
-            protein: map.protein ? parseFloat(row[map.protein]) || 0 : (_b = (_a = existing.macrosfirst) == null ? void 0 : _a.protein) != null ? _b : 0,
-            carbs: map.carbs ? parseFloat(row[map.carbs]) || 0 : (_d = (_c = existing.macrosfirst) == null ? void 0 : _c.carbs) != null ? _d : 0,
-            fat: map.fat ? parseFloat(row[map.fat]) || 0 : (_f = (_e = existing.macrosfirst) == null ? void 0 : _e.fat) != null ? _f : 0
-          }
+        const existing = normalizeNutritionEntry(nutrition[key]);
+        days[key] = {
+          calories: parseFloat(row[map.calories]) || 0,
+          protein: map.protein ? parseFloat(row[map.protein]) || 0 : (_b = (_a = existing.macrosfirst) == null ? void 0 : _a.protein) != null ? _b : 0,
+          carbs: map.carbs ? parseFloat(row[map.carbs]) || 0 : (_d = (_c = existing.macrosfirst) == null ? void 0 : _c.carbs) != null ? _d : 0,
+          fat: map.fat ? parseFloat(row[map.fat]) || 0 : (_f = (_e = existing.macrosfirst) == null ? void 0 : _e.fat) != null ? _f : 0
         };
-        importedDates.push(key);
-        count++;
       }
-      saveNutrition(next);
+      const importedDates = Object.keys(days);
+      if (importedDates.length) {
+        try {
+          await apiSaveNutritionBulk(days);
+        } catch (e) {
+          setImportError(e.message || "Could not import \u2014 the local server's /api/nutrition/bulk request failed.");
+          return;
+        }
+        setNutrition((prev) => {
+          const next = { ...prev };
+          for (const key of importedDates) {
+            next[key] = { ...normalizeNutritionEntry(next[key]), macrosfirst: days[key] };
+          }
+          return next;
+        });
+      }
       setCsvPreview(null);
+      setCsvPreviewSource(null);
       if (source === "sheet") {
         storageSet("google-sheet-colmap", map);
       }
-      setCsvPreviewSource(null);
-      if (count === 0 && skippedExamples.length) {
-        alert(`0 rows imported \u2014 the date column's values couldn't be parsed. Example raw value(s): ${skippedExamples.join(", ")}. Double-check the date column is mapped correctly, or tell me what format that is and I'll add support for it.`);
+      if (importedDates.length === 0) {
+        setImportNotice(null);
+        setImportError(`0 rows imported \u2014 the date column's values couldn't be parsed. Example raw value(s): ${skippedExamples.join(", ")}. Double-check the date column is mapped correctly, or tell me what format that is and I'll add support for it.`);
       } else {
-        alert(`Imported ${count} day(s) of nutrition data from MacrosFirst${skippedExamples.length ? ` (${skippedExamples.length} row(s) skipped \u2014 unparseable date)` : ""}. These take priority over any manual entries for the same days.`);
+        setImportNotice(`Imported ${importedDates.length} day(s) of nutrition data from MacrosFirst${skippedExamples.length ? ` (${skippedExamples.length} row(s) skipped \u2014 unparseable date)` : ""}. These take priority over any manual entries for the same days.`);
       }
-      const newDates = Array.from(new Set(importedDates));
       if (stravaStatus.connected) {
-        const missing = newDates.filter((d) => !stravaData.syncedDates.includes(d));
+        const missing = importedDates.filter((d) => !stravaData.syncedDates.includes(d));
         if (missing.length) fetchStrava(missing);
       }
       if (intervalsStatus.configured) {
-        const missing = newDates.filter((d) => !intervalsData.syncedDates.includes(d));
+        const missing = importedDates.filter((d) => !intervalsData.syncedDates.includes(d));
         if (missing.length) fetchIntervals(missing);
       }
     }
-    function saveManualDay(date, entry) {
-      const existing = normalizeNutritionEntry(nutrition[date]);
-      const next = { ...nutrition, [date]: { ...existing, manual: entry } };
-      saveNutrition(next);
+    async function saveManualDay(date, entry) {
+      const merged = await apiSaveNutritionDay(date, entry);
+      setNutrition((prev) => ({ ...prev, [date]: merged }));
       if (stravaStatus.connected && !stravaData.syncedDates.includes(date)) fetchStrava([date]);
       if (intervalsStatus.configured && !intervalsData.syncedDates.includes(date)) fetchIntervals([date]);
     }
-    function deleteNutritionDay(date) {
-      const next = { ...nutrition };
-      delete next[date];
-      saveNutrition(next);
+    async function deleteNutritionDay(date) {
+      await apiDeleteNutritionDay(date);
+      setNutrition((prev) => {
+        const next = { ...prev };
+        delete next[date];
+        return next;
+      });
     }
-    function saveManualWeight(date, kg) {
-      saveWeightLog({ ...weightLog, [date]: kg });
+    async function saveManualWeight(date, kg) {
+      const savedKg = await apiSaveWeightDay(date, kg);
+      setWeightLog((prev) => ({ ...prev, [date]: savedKg }));
     }
-    function deleteWeightDay(date) {
-      const next = { ...weightLog };
-      delete next[date];
-      saveWeightLog(next);
+    async function deleteWeightDay(date) {
+      await apiDeleteWeightDay(date);
+      setWeightLog((prev) => {
+        const next = { ...prev };
+        delete next[date];
+        return next;
+      });
     }
     async function fetchIntervals(dates) {
       if (!intervalsStatus.configured) return [];
@@ -1093,6 +1175,8 @@
         googleError,
         onSyncGoogleSheet: syncGoogleSheet,
         googleLastAutoSync,
+        importError,
+        importNotice,
         units
       }
     ), tab === "schedule" && /* @__PURE__ */ React.createElement(
@@ -1281,11 +1365,11 @@
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Safe range ", range.min, "\u2013", range.max, "%/week. Faster ", profile.goal === "build" ? "gains skew toward fat" : "loss risks muscle and performance", ".")), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.trendCalibration, onChange: (e) => setProfile((p) => ({ ...p, trendCalibration: e.target.checked })) }), "Auto-calibrate the target from your logged weight trend"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 6, marginLeft: 24, lineHeight: 1.5 } }, "Compares your actual weight trend (needs ~10+ days logged) against the ", goalParams.label.toLowerCase(), " rate above, and nudges the daily target toward what your real data says you need \u2014 rather than trusting the formula alone."), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries logged so far, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`));
   }
-  function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, units }) {
+  function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, importError, importNotice, units }) {
     const [dragOver, setDragOver] = useState(false);
     const dayCount = Object.keys(nutrition).length;
     const weightCount = Object.keys(weightLog).length;
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20 } }, /* @__PURE__ */ React.createElement(ManualEntryCard, { nutrition, onSave: onSaveManualDay }), /* @__PURE__ */ React.createElement(WeightEntryCard, { weightLog, onSave: onSaveWeight, units }), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " MacrosFirst via Google Sheets"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst's own API is partner-gated, but its Premium Google Sheets Importer already writes your daily log to a Sheet you own \u2014 this connects to that Sheet directly, through", /* @__PURE__ */ React.createElement("code", null, " server.py"), ", the same pattern as Strava. See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup."), !googleStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : googleStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : googleStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "google_client_id"), ", ", /* @__PURE__ */ React.createElement("code", null, "google_client_secret"), ", and ", /* @__PURE__ */ React.createElement("code", null, "google_sheet_id"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server.") : googleStatus.connected ? /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected")), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: onSyncGoogleSheet, disabled: googleFetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), " ", googleFetching ? "Syncing\u2026" : "Sync from Google Sheet")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, googleLastAutoSync ? `Last automatic sync: ${new Date(googleLastAutoSync).toLocaleString()}` : "No automatic sync yet \u2014 runs daily once you've imported at least once (set google_sync_time in config.json, default 04:00).")) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? /* @__PURE__ */ React.createElement("a", { className: "btn-primary", href: "/google/login", style: { textDecoration: "none", width: "fit-content", display: "inline-flex" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 13, color: ink }), " Connect Google Sheets") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, "Connect from ", /* @__PURE__ */ React.createElement("code", null, "http://localhost:", window.location.port, "/"), " on the computer running ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " \u2014 Google's OAuth callback only works there. Every device on this network shares that connection automatically once it's made."), googleError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: coral }), /* @__PURE__ */ React.createElement("span", null, googleError))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Or import a CSV manually"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst Premium \u2192 Download Food Log (Excel), or export any spreadsheet as CSV. Drop the file here and map its columns below."), /* @__PURE__ */ React.createElement(
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20 } }, /* @__PURE__ */ React.createElement(ManualEntryCard, { nutrition, onSave: onSaveManualDay }), /* @__PURE__ */ React.createElement(WeightEntryCard, { weightLog, onSave: onSaveWeight, units }), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " MacrosFirst via Google Sheets"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst's own API is partner-gated, but its Premium Google Sheets Importer already writes your daily log to a Sheet you own \u2014 this connects to that Sheet directly, through", /* @__PURE__ */ React.createElement("code", null, " server.py"), ", the same pattern as Strava. See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup."), !googleStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : googleStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : googleStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "google_client_id"), ", ", /* @__PURE__ */ React.createElement("code", null, "google_client_secret"), ", and ", /* @__PURE__ */ React.createElement("code", null, "google_sheet_id"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server.") : googleStatus.connected ? /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected")), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: onSyncGoogleSheet, disabled: googleFetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), " ", googleFetching ? "Syncing\u2026" : "Sync from Google Sheet")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, googleLastAutoSync ? `Last automatic sync: ${new Date(googleLastAutoSync).toLocaleString()}` : "No automatic sync yet \u2014 runs daily once you've imported at least once (set google_sync_time in config.json, default 04:00).")) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? /* @__PURE__ */ React.createElement("a", { className: "btn-primary", href: "/google/login", style: { textDecoration: "none", width: "fit-content", display: "inline-flex" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 13, color: ink }), " Connect Google Sheets") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, "Connect from ", /* @__PURE__ */ React.createElement("code", null, "http://localhost:", window.location.port, "/"), " on the computer running ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " \u2014 Google's OAuth callback only works there. Every device on this network shares that connection automatically once it's made."), googleError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, googleError)), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Or import a CSV manually"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst Premium \u2192 Download Food Log (Excel), or export any spreadsheet as CSV. Drop the file here and map its columns below."), /* @__PURE__ */ React.createElement(
       "div",
       {
         onDragOver: (e) => {
@@ -1310,7 +1394,7 @@
       /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "center", marginBottom: 10 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 22, color: dim })),
       /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, marginBottom: 12 } }, "Drop your CSV export here, or"),
       /* @__PURE__ */ React.createElement("label", { className: "btn-ghost", style: { display: "inline-block" } }, "Choose file", /* @__PURE__ */ React.createElement("input", { type: "file", accept: ".csv", style: { display: "none" }, onChange: (e) => e.target.files[0] && onFile(e.target.files[0]) }))
-    )), csvPreview && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Map columns"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16 } }, csvPreview.rows.length, " rows found. Match the columns to the fields below."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 } }, ["date", "calories", "protein", "carbs", "fat"].map((k) => /* @__PURE__ */ React.createElement(Field, { key: k, label: k }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: colMap[k], onChange: (e) => setColMap((m) => ({ ...m, [k]: e.target.value })) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "\u2014 none \u2014"), csvPreview.fields.map((f) => /* @__PURE__ */ React.createElement("option", { key: f, value: f }, f)))))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { marginTop: 18 }, onClick: () => onImport() }, "Import ", csvPreview.rows.length, " rows")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored nutrition log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 } }, dayCount, " day", dayCount === 1 ? "" : "s", " of intake saved. Click a row to edit it."), dayCount > 0 && /* @__PURE__ */ React.createElement(NutritionLogTable, { nutrition, onSave: onSaveManualDay, onDelete: onDeleteDay })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored weight log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 } }, weightCount, " day", weightCount === 1 ? "" : "s", " of weight saved. Click a row to edit it."), weightCount > 0 && /* @__PURE__ */ React.createElement(WeightLogTable, { weightLog, onSave: onSaveWeight, onDelete: onDeleteWeight, units })));
+    ), importError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, importError), !importError && importNotice && /* @__PURE__ */ React.createElement(Banner, { kind: "success" }, importNotice)), csvPreview && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Map columns"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16 } }, csvPreview.rows.length, " rows found. Match the columns to the fields below."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 } }, ["date", "calories", "protein", "carbs", "fat"].map((k) => /* @__PURE__ */ React.createElement(Field, { key: k, label: k }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: colMap[k], onChange: (e) => setColMap((m) => ({ ...m, [k]: e.target.value })) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "\u2014 none \u2014"), csvPreview.fields.map((f) => /* @__PURE__ */ React.createElement("option", { key: f, value: f }, f)))))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { marginTop: 18 }, onClick: () => onImport() }, "Import ", csvPreview.rows.length, " rows")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored nutrition log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 } }, dayCount, " day", dayCount === 1 ? "" : "s", " of intake saved. Click a row to edit it."), dayCount > 0 && /* @__PURE__ */ React.createElement(NutritionLogTable, { nutrition, onSave: onSaveManualDay, onDelete: onDeleteDay })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored weight log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 } }, weightCount, " day", weightCount === 1 ? "" : "s", " of weight saved. Click a row to edit it."), weightCount > 0 && /* @__PURE__ */ React.createElement(WeightLogTable, { weightLog, onSave: onSaveWeight, onDelete: onDeleteWeight, units })));
   }
   function macroCalories(protein, carbs, fat) {
     return protein * 4 + carbs * 4 + fat * 9;
@@ -1320,29 +1404,46 @@
     const [protein, setProtein] = useState("");
     const [carbs, setCarbs] = useState("");
     const [fat, setFat] = useState("");
-    const [saved, setSaved] = useState(false);
+    const [status, setStatus] = useState("idle");
+    const [errorMsg, setErrorMsg] = useState(null);
+    const dateRef = useRef(date);
     const normalized = normalizeNutritionEntry(nutrition[date]);
     const hasMacrosFirst = !!normalized.macrosfirst;
     useEffect(() => {
-      var _a, _b, _c;
-      const existing = normalizeNutritionEntry(nutrition[date]);
-      const prefill = existing.macrosfirst || existing.manual;
-      setProtein(prefill ? String((_a = prefill.protein) != null ? _a : "") : "");
-      setCarbs(prefill ? String((_b = prefill.carbs) != null ? _b : "") : "");
-      setFat(prefill ? String((_c = prefill.fat) != null ? _c : "") : "");
-      setSaved(false);
+      dateRef.current = date;
+      const applyPrefill = (source) => {
+        var _a, _b, _c;
+        const existing = normalizeNutritionEntry(source[date]);
+        const prefill = existing.macrosfirst || existing.manual;
+        setProtein(prefill ? String((_a = prefill.protein) != null ? _a : "") : "");
+        setCarbs(prefill ? String((_b = prefill.carbs) != null ? _b : "") : "");
+        setFat(prefill ? String((_c = prefill.fat) != null ? _c : "") : "");
+      };
+      applyPrefill(nutrition);
+      setStatus("idle");
+      setErrorMsg(null);
+      storageGet("nutrition-log", null).then((fresh) => {
+        if (dateRef.current === date && fresh) applyPrefill(fresh);
+      });
     }, [date]);
     const p = parseFloat(protein) || 0;
     const c = parseFloat(carbs) || 0;
     const f = parseFloat(fat) || 0;
     const calories = macroCalories(p, c, f);
     const hasAny = protein !== "" || carbs !== "" || fat !== "";
-    function handleSave() {
-      onSave(date, { calories, protein: p, carbs: c, fat: f });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1500);
+    async function handleSave() {
+      setStatus("saving");
+      setErrorMsg(null);
+      try {
+        await onSave(date, { calories, protein: p, carbs: c, fat: f });
+        setStatus("saved");
+        setTimeout(() => setStatus((s) => s === "saved" ? "idle" : s), 1500);
+      } catch (e) {
+        setStatus("error");
+        setErrorMsg(e.message || "Save failed \u2014 check the local server connection and retry.");
+      }
     }
-    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 16, color: cyan }), " Enter a day's macros directly"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Skip the CSV for a single day \u2014 type in totals from MacrosFirst (or anywhere) and calories are computed automatically (4 kcal/g protein & carbs, 9 kcal/g fat). Pick a date that's already logged to edit it. A MacrosFirst import always takes priority over a manual entry for the same day."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: date, max: toISODate(/* @__PURE__ */ new Date()), onChange: (e) => setDate(e.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Protein (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: protein, onChange: (e) => setProtein(e.target.value), placeholder: "0" })), /* @__PURE__ */ React.createElement(Field, { label: "Carbs (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: carbs, onChange: (e) => setCarbs(e.target.value), placeholder: "0" })), /* @__PURE__ */ React.createElement(Field, { label: "Fat (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: fat, onChange: (e) => setFat(e.target.value), placeholder: "0" }))), hasMacrosFirst && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(232,163,61,0.1)", border: `1px solid ${amber}`, borderRadius: 4, padding: "9px 12px", fontSize: 12, color: paper, display: "flex", gap: 8, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 14, color: amber }), /* @__PURE__ */ React.createElement("span", null, "MacrosFirst data already exists for this day and will be used everywhere in the app instead of what you save here \u2014 unless that import is later removed.")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, marginTop: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: mono, fontSize: 13, color: amber } }, "\u2248 ", fmt(calories), " kcal"), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSave, disabled: !hasAny }, normalized.manual ? "Update manual entry" : "Save this day"), saved && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 13, color: mint }), " Saved")));
+    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 16, color: cyan }), " Enter a day's macros directly"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Skip the CSV for a single day \u2014 type in totals from MacrosFirst (or anywhere) and calories are computed automatically (4 kcal/g protein & carbs, 9 kcal/g fat). Pick a date that's already logged to edit it. A MacrosFirst import always takes priority over a manual entry for the same day."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: date, max: toISODate(/* @__PURE__ */ new Date()), onChange: (e) => setDate(e.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Protein (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: protein, onChange: (e) => setProtein(e.target.value), placeholder: "0" })), /* @__PURE__ */ React.createElement(Field, { label: "Carbs (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: carbs, onChange: (e) => setCarbs(e.target.value), placeholder: "0" })), /* @__PURE__ */ React.createElement(Field, { label: "Fat (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: fat, onChange: (e) => setFat(e.target.value), placeholder: "0" }))), hasMacrosFirst && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(232,163,61,0.1)", border: `1px solid ${amber}`, borderRadius: 4, padding: "9px 12px", fontSize: 12, color: paper, display: "flex", gap: 8, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 14, color: amber }), /* @__PURE__ */ React.createElement("span", null, "MacrosFirst data already exists for this day and will be used everywhere in the app instead of what you save here \u2014 unless that import is later removed.")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, marginTop: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: mono, fontSize: 13, color: amber } }, "\u2248 ", fmt(calories), " kcal"), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSave, disabled: !hasAny || status === "saving" }, status === "saving" ? "Saving\u2026" : normalized.manual ? "Update manual entry" : "Save this day"), status === "saved" && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 13, color: mint }), " Saved")), status === "error" && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, errorMsg, " ", /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "2px 8px", marginLeft: 8 }, onClick: handleSave }, "Retry")));
   }
   function SourceBadge({ source }) {
     const isMF = source === "macrosfirst";
@@ -1360,79 +1461,145 @@
   }
   function NutritionLogTable({ nutrition, onSave, onDelete }) {
     const [editingDate, setEditingDate] = useState(null);
+    const editingDateRef = useRef(null);
     const [draft, setDraft] = useState({ protein: "", carbs: "", fat: "" });
+    const [status, setStatus] = useState("idle");
+    const [errorMsg, setErrorMsg] = useState(null);
     const dates = Object.keys(nutrition).sort().reverse();
     function startEdit(date) {
       var _a, _b, _c;
-      const eff = effectiveNutritionEntry(nutrition[date]);
+      editingDateRef.current = date;
       setEditingDate(date);
+      setStatus("idle");
+      setErrorMsg(null);
+      const eff = effectiveNutritionEntry(nutrition[date]);
       setDraft({ protein: String((_a = eff == null ? void 0 : eff.protein) != null ? _a : ""), carbs: String((_b = eff == null ? void 0 : eff.carbs) != null ? _b : ""), fat: String((_c = eff == null ? void 0 : eff.fat) != null ? _c : "") });
+      storageGet("nutrition-log", null).then((fresh) => {
+        var _a2, _b2, _c2;
+        if (editingDateRef.current !== date || !fresh) return;
+        const freshEff = effectiveNutritionEntry(fresh[date]);
+        setDraft({ protein: String((_a2 = freshEff == null ? void 0 : freshEff.protein) != null ? _a2 : ""), carbs: String((_b2 = freshEff == null ? void 0 : freshEff.carbs) != null ? _b2 : ""), fat: String((_c2 = freshEff == null ? void 0 : freshEff.fat) != null ? _c2 : "") });
+      });
     }
-    function commitEdit(date) {
+    function cancelEdit() {
+      editingDateRef.current = null;
+      setEditingDate(null);
+    }
+    async function commitEdit(date) {
       const p = parseFloat(draft.protein) || 0;
       const c = parseFloat(draft.carbs) || 0;
       const f = parseFloat(draft.fat) || 0;
-      onSave(date, { calories: macroCalories(p, c, f), protein: p, carbs: c, fat: f });
-      setEditingDate(null);
+      setStatus("saving");
+      setErrorMsg(null);
+      try {
+        await onSave(date, { calories: macroCalories(p, c, f), protein: p, carbs: c, fat: f });
+        editingDateRef.current = null;
+        setEditingDate(null);
+        setStatus("idle");
+      } catch (e) {
+        setStatus("error");
+        setErrorMsg(e.message || "Save failed \u2014 check the local server connection and retry.");
+      }
     }
     return /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Date"), /* @__PURE__ */ React.createElement("th", null, "Protein (g)"), /* @__PURE__ */ React.createElement("th", null, "Carbs (g)"), /* @__PURE__ */ React.createElement("th", null, "Fat (g)"), /* @__PURE__ */ React.createElement("th", null, "Calories"), /* @__PURE__ */ React.createElement("th", null))), /* @__PURE__ */ React.createElement("tbody", null, dates.map((date) => {
       const normalized = normalizeNutritionEntry(nutrition[date]);
       const e = normalized.macrosfirst || normalized.manual;
       const source = normalized.macrosfirst ? "macrosfirst" : "manual";
       const editing = editingDate === date;
-      return /* @__PURE__ */ React.createElement("tr", { key: date }, /* @__PURE__ */ React.createElement("td", null, date, /* @__PURE__ */ React.createElement(SourceBadge, { source })), editing ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.protein, onChange: (ev) => setDraft((d) => ({ ...d, protein: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.carbs, onChange: (ev) => setDraft((d) => ({ ...d, carbs: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.fat, onChange: (ev) => setDraft((d) => ({ ...d, fat: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, "\u2248 ", fmt(macroCalories(parseFloat(draft.protein) || 0, parseFloat(draft.carbs) || 0, parseFloat(draft.fat) || 0))), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement(
+      return /* @__PURE__ */ React.createElement(React.Fragment, { key: date }, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, date, /* @__PURE__ */ React.createElement(SourceBadge, { source })), editing ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.protein, onChange: (ev) => setDraft((d) => ({ ...d, protein: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.carbs, onChange: (ev) => setDraft((d) => ({ ...d, carbs: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.fat, onChange: (ev) => setDraft((d) => ({ ...d, fat: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, "\u2248 ", fmt(macroCalories(parseFloat(draft.protein) || 0, parseFloat(draft.carbs) || 0, parseFloat(draft.fat) || 0))), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement(
         "button",
         {
           className: "btn-ghost",
           style: { padding: "4px 10px", marginRight: 6 },
           onClick: () => commitEdit(date),
+          disabled: status === "saving",
           title: source === "macrosfirst" ? "Saves as a manual fallback \u2014 MacrosFirst data still takes priority for this day" : void 0
         },
-        "Save"
-      ), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px" }, onClick: () => setEditingDate(null) }, "Cancel"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, fmt(e.protein)), /* @__PURE__ */ React.createElement("td", null, fmt(e.carbs)), /* @__PURE__ */ React.createElement("td", null, fmt(e.fat)), /* @__PURE__ */ React.createElement("td", { style: { color: amber } }, fmt(e.calories)), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(date), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+        status === "saving" ? "Saving\u2026" : "Save"
+      ), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px" }, onClick: cancelEdit, disabled: status === "saving" }, "Cancel"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, fmt(e.protein)), /* @__PURE__ */ React.createElement("td", null, fmt(e.carbs)), /* @__PURE__ */ React.createElement("td", null, fmt(e.fat)), /* @__PURE__ */ React.createElement("td", { style: { color: amber } }, fmt(e.calories)), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(date), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
         if (confirm(`Delete ${source === "macrosfirst" ? "the MacrosFirst import and any manual entry" : "the manual entry"} for ${date}?`)) onDelete(date);
-      }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))));
+      }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral }))))), editing && status === "error" && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 6, style: { padding: 0 } }, /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, errorMsg, " ", /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "2px 8px", marginLeft: 8 }, onClick: () => commitEdit(date) }, "Retry")))));
     })));
   }
   function WeightEntryCard({ weightLog, onSave, units }) {
     const [date, setDate] = useState(() => toISODate(/* @__PURE__ */ new Date()));
     const [metricKg, setMetricKg] = useState("");
-    const [saved, setSaved] = useState(false);
+    const [status, setStatus] = useState("idle");
+    const [errorMsg, setErrorMsg] = useState(null);
+    const dateRef = useRef(date);
     useEffect(() => {
+      dateRef.current = date;
       const existingKg = weightLog[date];
       setMetricKg(existingKg === void 0 ? "" : String(existingKg));
-      setSaved(false);
+      setStatus("idle");
+      setErrorMsg(null);
+      storageGet("weight-log", null).then((fresh) => {
+        if (dateRef.current !== date || !fresh) return;
+        const freshKg = fresh[date];
+        setMetricKg(freshKg === void 0 ? "" : String(freshKg));
+      });
     }, [date]);
     const [text, onChange] = useUnitInput(metricKg, units, kgToDisplay, displayToKg, 1);
     const wUnit = weightUnitLabel(units);
-    function handleSave() {
+    async function handleSave() {
       const kg = parseFloat(metricKg);
       if (Number.isNaN(kg) || kg <= 0) return;
-      onSave(date, Math.round(kg * 100) / 100);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1500);
+      setStatus("saving");
+      setErrorMsg(null);
+      try {
+        await onSave(date, Math.round(kg * 100) / 100);
+        setStatus("saved");
+        setTimeout(() => setStatus((s) => s === "saved" ? "idle" : s), 1500);
+      } catch (e) {
+        setStatus("error");
+        setErrorMsg(e.message || "Save failed \u2014 check the local server connection and retry.");
+      }
     }
-    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 16, color: cyan }), " Log today's weight"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Feeds directly into BMR and fueling targets for that day \u2014 body weight shifts across a training block, so this keeps demand and g/kg targets tracking you rather than a fixed Setup value."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: date, max: toISODate(/* @__PURE__ */ new Date()), onChange: (e) => setDate(e.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: `Weight (${wUnit})` }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "0.1", value: text, onChange: (e) => onChange(e, setMetricKg), placeholder: units === "imperial" ? "154.0" : "70.0" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, marginTop: 16 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSave, disabled: !text }, weightLog[date] !== void 0 ? "Update this day" : "Save this day"), saved && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 13, color: mint }), " Saved")));
+    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 16, color: cyan }), " Log today's weight"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Feeds directly into BMR and fueling targets for that day \u2014 body weight shifts across a training block, so this keeps demand and g/kg targets tracking you rather than a fixed Setup value."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: date, max: toISODate(/* @__PURE__ */ new Date()), onChange: (e) => setDate(e.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: `Weight (${wUnit})` }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "0.1", value: text, onChange: (e) => onChange(e, setMetricKg), placeholder: units === "imperial" ? "154.0" : "70.0" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, marginTop: 16 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSave, disabled: !text || status === "saving" }, status === "saving" ? "Saving\u2026" : weightLog[date] !== void 0 ? "Update this day" : "Save this day"), status === "saved" && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 13, color: mint }), " Saved")), status === "error" && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, errorMsg, " ", /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "2px 8px", marginLeft: 8 }, onClick: handleSave }, "Retry")));
   }
   function WeightLogTable({ weightLog, onSave, onDelete, units }) {
     const [editingDate, setEditingDate] = useState(null);
+    const editingDateRef = useRef(null);
     const [draft, setDraft] = useState("");
+    const [status, setStatus] = useState("idle");
+    const [errorMsg, setErrorMsg] = useState(null);
     const dates = Object.keys(weightLog).sort().reverse();
     function startEdit(date) {
+      editingDateRef.current = date;
       setEditingDate(date);
+      setStatus("idle");
+      setErrorMsg(null);
       setDraft(String(roundTo(kgToDisplay(weightLog[date], units), 1)));
+      storageGet("weight-log", null).then((fresh) => {
+        if (editingDateRef.current !== date || !fresh || fresh[date] === void 0) return;
+        setDraft(String(roundTo(kgToDisplay(fresh[date], units), 1)));
+      });
     }
-    function commitEdit(date) {
-      const v = parseFloat(draft);
-      if (!Number.isNaN(v) && v > 0) onSave(date, Math.round(displayToKg(v, units) * 100) / 100);
+    function cancelEdit() {
+      editingDateRef.current = null;
       setEditingDate(null);
+    }
+    async function commitEdit(date) {
+      const v = parseFloat(draft);
+      if (Number.isNaN(v) || v <= 0) return;
+      setStatus("saving");
+      setErrorMsg(null);
+      try {
+        await onSave(date, Math.round(displayToKg(v, units) * 100) / 100);
+        editingDateRef.current = null;
+        setEditingDate(null);
+        setStatus("idle");
+      } catch (e) {
+        setStatus("error");
+        setErrorMsg(e.message || "Save failed \u2014 check the local server connection and retry.");
+      }
     }
     return /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Date"), /* @__PURE__ */ React.createElement("th", null, "Weight (", weightUnitLabel(units), ")"), /* @__PURE__ */ React.createElement("th", null))), /* @__PURE__ */ React.createElement("tbody", null, dates.map((date) => {
       const kg = weightLog[date];
       const editing = editingDate === date;
-      return /* @__PURE__ */ React.createElement("tr", { key: date }, /* @__PURE__ */ React.createElement("td", null, date), editing ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", step: "0.1", value: draft, onChange: (ev) => setDraft(ev.target.value) })), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px", marginRight: 6 }, onClick: () => commitEdit(date) }, "Save"), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px" }, onClick: () => setEditingDate(null) }, "Cancel"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, fmt(kgToDisplay(kg, units), 1)), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(date), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+      return /* @__PURE__ */ React.createElement(React.Fragment, { key: date }, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, date), editing ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", step: "0.1", value: draft, onChange: (ev) => setDraft(ev.target.value) })), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px", marginRight: 6 }, onClick: () => commitEdit(date), disabled: status === "saving" }, status === "saving" ? "Saving\u2026" : "Save"), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px" }, onClick: cancelEdit, disabled: status === "saving" }, "Cancel"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, fmt(kgToDisplay(kg, units), 1)), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(date), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
         if (confirm(`Delete weight entry for ${date}?`)) onDelete(date);
-      }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))));
+      }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral }))))), editing && status === "error" && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 3, style: { padding: 0 } }, /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, errorMsg, " ", /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "2px 8px", marginLeft: 8 }, onClick: () => commitEdit(date) }, "Retry")))));
     })));
   }
   const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];

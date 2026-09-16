@@ -457,6 +457,19 @@ def normalize_nutrition_entry(raw):
     return {"manual": raw, "macrosfirst": None}  # legacy flat shape
 
 
+def merge_macrosfirst_into_nutrition(nutrition, updates):
+    """Merges {date: {calories,protein,carbs,fat}} into nutrition-log's
+    macrosfirst slot per date, preserving each date's manual entry (never
+    touching it). Mutates and returns `nutrition`. Shared by the Google
+    auto-sync background job and the client-triggered CSV/Sheet bulk import,
+    so the two merge rules can't drift apart."""
+    for date_key, macros in updates.items():
+        existing = normalize_nutrition_entry(nutrition.get(date_key))
+        existing["macrosfirst"] = macros
+        nutrition[date_key] = existing
+    return nutrition
+
+
 def auto_sync_google_sheet():
     """Fetches the sheet, applies the column mapping saved from the last
     manual "Sync from Google Sheet" + import, and writes results straight
@@ -502,10 +515,7 @@ def auto_sync_google_sheet():
     # other date (e.g. a manual entry from the browser) can't get clobbered.
     def mutate(s):
         nutrition = s.get("nutrition-log") or {}
-        for date_key, macros in updates.items():
-            existing = normalize_nutrition_entry(nutrition.get(date_key))
-            existing["macrosfirst"] = macros
-            nutrition[date_key] = existing
+        merge_macrosfirst_into_nutrition(nutrition, updates)
         s["nutrition-log"] = nutrition
         s["google-last-auto-sync"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         return s
@@ -595,6 +605,9 @@ def ensure_fresh_token(cfg):
     return tokens
 
 
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print("[server]", fmt % args)
@@ -648,6 +661,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_json_body(self):
+        """Raises json.JSONDecodeError on bad input — callers turn that into
+        a 400, same convention everywhere this is used."""
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b"null"
+        return json.loads(raw.decode())
 
     def do_GET(self):
         if not self._check_auth():
@@ -1015,10 +1035,8 @@ class Handler(BaseHTTPRequestHandler):
             key = qs.get("key", [None])[0]
             if not key:
                 return self._send_json({"error": "missing key"}, 400)
-            length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(length) if length else b"null"
             try:
-                value = json.loads(raw.decode())
+                value = self._read_json_body()
             except json.JSONDecodeError:
                 return self._send_json({"error": "invalid JSON body"}, 400)
 
@@ -1027,6 +1045,98 @@ class Handler(BaseHTTPRequestHandler):
                 return s
             update_store(mutate)
             return self._send_json({"ok": True, "key": key})
+
+        # ---- Per-date merge endpoints for nutrition-log / weight-log ----
+        # Unlike the generic /api/store above (which trusts the client's whole
+        # object wholesale — fine for keys only ever edited from one place at
+        # a time), these re-read the store fresh under update_store's lock and
+        # merge just the one date touched, the same pattern already proven in
+        # auto_sync_google_sheet. This is what actually stops a stale client
+        # (a second device, or a browser tab left open across the nightly
+        # Google auto-sync) from wholesale-overwriting every other date's data
+        # with its own out-of-date in-memory copy.
+        if path == "/api/nutrition/day":
+            date = qs.get("date", [None])[0]
+            if not date or not DATE_RE.match(date):
+                return self._send_json({"error": "missing or invalid date (expected YYYY-MM-DD)"}, 400)
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError:
+                return self._send_json({"error": "invalid JSON body"}, 400)
+            manual = body.get("manual") if isinstance(body, dict) else None
+
+            def mutate(s):
+                nutrition = s.get("nutrition-log") or {}
+                existing = normalize_nutrition_entry(nutrition.get(date))
+                existing["manual"] = manual
+                nutrition[date] = existing
+                s["nutrition-log"] = nutrition
+                return s
+            result = update_store(mutate)
+            return self._send_json({"ok": True, "date": date, "entry": result["nutrition-log"][date]})
+
+        if path == "/api/nutrition/day/delete":
+            date = qs.get("date", [None])[0]
+            if not date:
+                return self._send_json({"error": "missing date"}, 400)
+
+            def mutate(s):
+                nutrition = s.get("nutrition-log") or {}
+                nutrition.pop(date, None)
+                s["nutrition-log"] = nutrition
+                return s
+            update_store(mutate)
+            return self._send_json({"ok": True, "date": date})
+
+        if path == "/api/nutrition/bulk":
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError:
+                return self._send_json({"error": "invalid JSON body"}, 400)
+            days = body.get("days") if isinstance(body, dict) else None
+            if not isinstance(days, dict):
+                return self._send_json({"error": "missing 'days' object"}, 400)
+
+            def mutate(s):
+                nutrition = s.get("nutrition-log") or {}
+                merge_macrosfirst_into_nutrition(nutrition, days)
+                s["nutrition-log"] = nutrition
+                return s
+            update_store(mutate)
+            return self._send_json({"ok": True, "count": len(days)})
+
+        if path == "/api/weight/day":
+            date = qs.get("date", [None])[0]
+            if not date or not DATE_RE.match(date):
+                return self._send_json({"error": "missing or invalid date (expected YYYY-MM-DD)"}, 400)
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError:
+                return self._send_json({"error": "invalid JSON body"}, 400)
+            kg = body.get("kg") if isinstance(body, dict) else None
+            if not isinstance(kg, (int, float)):
+                return self._send_json({"error": "missing numeric 'kg'"}, 400)
+
+            def mutate(s):
+                weight = s.get("weight-log") or {}
+                weight[date] = kg
+                s["weight-log"] = weight
+                return s
+            update_store(mutate)
+            return self._send_json({"ok": True, "date": date, "kg": kg})
+
+        if path == "/api/weight/day/delete":
+            date = qs.get("date", [None])[0]
+            if not date:
+                return self._send_json({"error": "missing date"}, 400)
+
+            def mutate(s):
+                weight = s.get("weight-log") or {}
+                weight.pop(date, None)
+                s["weight-log"] = weight
+                return s
+            update_store(mutate)
+            return self._send_json({"ok": True, "date": date})
 
         self.send_response(404)
         self.end_headers()

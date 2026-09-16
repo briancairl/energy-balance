@@ -119,9 +119,33 @@ function useUnitInput(metricStr, units, toDisplay, toMetric, decimals = 1) {
 
 // ---------- persistence: server-side (/api/store), shared across every device
 // pointed at this server instance, instead of per-browser localStorage ----------
+
+// Retries a transient failure (network drop, 5xx) a couple times with a short
+// backoff before giving up — the main failure mode in practice is a phone
+// briefly leaving wifi/Tailscale range mid-request, not a real server error.
+// Never retries a 4xx: that's a request the server actively rejected, not one
+// that'll succeed on a second try.
+async function fetchWithRetry(url, options, retries = 2, backoffMs = 300) {
+  for (let attempt = 0; ; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, options);
+    } catch (e) {
+      if (attempt >= retries) throw e;
+      await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
+      continue;
+    }
+    if (res.status >= 500 && attempt < retries) {
+      await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
+      continue;
+    }
+    return res;
+  }
+}
+
 async function storageGet(key, fallback) {
   try {
-    const res = await fetch(`/api/store?key=${encodeURIComponent(key)}`);
+    const res = await fetchWithRetry(`/api/store?key=${encodeURIComponent(key)}`);
     if (!res.ok) return fallback;
     const data = await res.json();
     return data.value !== null && data.value !== undefined ? data.value : fallback;
@@ -132,13 +156,67 @@ async function storageGet(key, fallback) {
 }
 async function storageSet(key, value) {
   try {
-    await fetch(`/api/store?key=${encodeURIComponent(key)}`, {
+    await fetchWithRetry(`/api/store?key=${encodeURIComponent(key)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(value),
     });
   } catch (e) {
     console.error("storage set failed", key, e);
+  }
+}
+
+// ---------- per-date nutrition/weight persistence ----------
+// Unlike storageSet above (which PUTs a whole collection and trusts the
+// client's copy of it completely — fine for keys only ever edited from one
+// place, like training-schedule or profile), these merge just the one date
+// server-side, so a stale client (a second device, or a tab left open across
+// the nightly Google auto-sync in server.py) can never wholesale-overwrite
+// every other date's data with its own out-of-date snapshot. These throw on
+// failure (after the same retry treatment) so callers can show a real
+// save-failed state instead of a silent no-op.
+async function apiSaveNutritionDay(date, manual) {
+  const res = await fetchWithRetry(`/api/nutrition/day?date=${date}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ manual }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+  return data.entry;
+}
+async function apiDeleteNutritionDay(date) {
+  const res = await fetchWithRetry(`/api/nutrition/day/delete?date=${date}`, { method: "POST" });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Delete failed (${res.status}).`);
+  }
+}
+async function apiSaveNutritionBulk(days) {
+  const res = await fetchWithRetry("/api/nutrition/bulk", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ days }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Import failed (${res.status}).`);
+  return data.count;
+}
+async function apiSaveWeightDay(date, kg) {
+  const res = await fetchWithRetry(`/api/weight/day?date=${date}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kg }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+  return data.kg;
+}
+async function apiDeleteWeightDay(date) {
+  const res = await fetchWithRetry(`/api/weight/day/delete?date=${date}`, { method: "POST" });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Delete failed (${res.status}).`);
   }
 }
 
@@ -577,6 +655,28 @@ const ICONS = {
 const SEVERITY_COLOR = { low: cyan, medium: amber, high: coral };
 const SEVERITY_BG = { low: "rgba(79,209,217,0.08)", medium: "rgba(232,163,61,0.1)", high: "rgba(225,96,77,0.12)" };
 
+// Shared inline banner — replaces several duplicated ad-hoc style blocks and
+// the alert()-based feedback in the Log tab's import flow, using the same
+// cyan/amber/coral/mint grammar already used for status everywhere else.
+// rgba values are the dark-theme hex for each color (same convention already
+// used by the blocks this replaces, which don't re-tint for light mode either).
+const BANNER_STYLE = {
+  info: { color: cyan, bg: "rgba(79,209,217,0.08)" },
+  success: { color: mint, bg: "rgba(127,200,169,0.12)" },
+  warning: { color: amber, bg: "rgba(232,163,61,0.1)" },
+  error: { color: coral, bg: "rgba(225,96,77,0.12)" },
+};
+function Banner({ kind = "info", children }) {
+  const s = BANNER_STYLE[kind] || BANNER_STYLE.info;
+  const iconPath = kind === "success" ? ICONS.check : ICONS.warn;
+  return (
+    <div style={{ marginTop: 14, background: s.bg, border: `1px solid ${s.color}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8, alignItems: "flex-start" }}>
+      <Icon path={iconPath} size={14} color={s.color} />
+      <span style={{ flex: 1 }}>{children}</span>
+    </div>
+  );
+}
+
 function App() {
   const [tab, setTab] = useState("setup");
   const [theme, setTheme] = useState(() => (document.documentElement.dataset.theme === "light" ? "light" : "dark"));
@@ -688,15 +788,8 @@ function App() {
 
   useEffect(() => { if (loaded) storageSet("profile", profile); }, [profile, loaded]);
 
-  const saveNutrition = useCallback((next) => {
-    setNutrition(next);
-    storageSet("nutrition-log", next);
-  }, []);
-
-  const saveWeightLog = useCallback((next) => {
-    setWeightLog(next);
-    storageSet("weight-log", next);
-  }, []);
+  const [importError, setImportError] = useState(null);
+  const [importNotice, setImportNotice] = useState(null);
 
   const saveSchedule = useCallback((next) => {
     setSchedule(next);
@@ -748,8 +841,9 @@ function App() {
         setColMap(guessColumnMapping(fields));
         setCsvPreview({ fields, rows: res.data });
         setCsvPreviewSource("csv");
+        setImportError(null);
       },
-      error: (err) => alert("Could not parse CSV: " + err.message),
+      error: (err) => setImportError("Could not parse CSV: " + err.message),
     });
   }
 
@@ -791,15 +885,19 @@ function App() {
   // Takes explicit preview/map/source rather than always reading state, so
   // syncGoogleSheet's cached-mapping fast path can import immediately with
   // freshly-fetched data instead of waiting a render cycle for state to catch up.
-  function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
+  //
+  // Sends the parsed rows to the server's /api/nutrition/bulk, which merges
+  // each date's macrosfirst slot in under the store's lock — the client's own
+  // possibly-stale copy of *other* dates is never sent back, unlike a plain
+  // storageSet('nutrition-log', wholeObject) would.
+  async function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
     if (!preview || !map.date || !map.calories) {
-      alert("Map at least the date and calories columns first.");
+      setImportError("Map at least the date and calories columns first.");
       return;
     }
-    const next = { ...nutrition };
-    const importedDates = [];
+    setImportError(null);
+    const days = {};
     const skippedExamples = [];
-    let count = 0;
     for (const row of preview.rows) {
       const rawDate = row[map.date];
       const d = parseFlexibleDate(rawDate);
@@ -808,67 +906,91 @@ function App() {
         continue;
       }
       const key = toISODate(d);
-      const existing = normalizeNutritionEntry(next[key]);
-      next[key] = {
-        ...existing,
-        macrosfirst: {
-          calories: parseFloat(row[map.calories]) || 0,
-          protein: map.protein ? parseFloat(row[map.protein]) || 0 : (existing.macrosfirst?.protein ?? 0),
-          carbs: map.carbs ? parseFloat(row[map.carbs]) || 0 : (existing.macrosfirst?.carbs ?? 0),
-          fat: map.fat ? parseFloat(row[map.fat]) || 0 : (existing.macrosfirst?.fat ?? 0),
-        },
+      const existing = normalizeNutritionEntry(nutrition[key]);
+      days[key] = {
+        calories: parseFloat(row[map.calories]) || 0,
+        protein: map.protein ? parseFloat(row[map.protein]) || 0 : (existing.macrosfirst?.protein ?? 0),
+        carbs: map.carbs ? parseFloat(row[map.carbs]) || 0 : (existing.macrosfirst?.carbs ?? 0),
+        fat: map.fat ? parseFloat(row[map.fat]) || 0 : (existing.macrosfirst?.fat ?? 0),
       };
-      importedDates.push(key);
-      count++;
     }
-    saveNutrition(next);
+    const importedDates = Object.keys(days);
+
+    if (importedDates.length) {
+      try {
+        await apiSaveNutritionBulk(days);
+      } catch (e) {
+        // Leave the preview open so the mapped rows aren't lost — the user can
+        // just hit Import again once the local server's reachable.
+        setImportError(e.message || "Could not import — the local server's /api/nutrition/bulk request failed.");
+        return;
+      }
+      setNutrition((prev) => {
+        const next = { ...prev };
+        for (const key of importedDates) {
+          next[key] = { ...normalizeNutritionEntry(next[key]), macrosfirst: days[key] };
+        }
+        return next;
+      });
+    }
+
     setCsvPreview(null);
+    setCsvPreviewSource(null);
     if (source === "sheet") {
       storageSet("google-sheet-colmap", map); // lets the server's auto-sync reuse this mapping
     }
-    setCsvPreviewSource(null);
-    if (count === 0 && skippedExamples.length) {
-      alert(`0 rows imported — the date column's values couldn't be parsed. Example raw value(s): ${skippedExamples.join(", ")}. Double-check the date column is mapped correctly, or tell me what format that is and I'll add support for it.`);
+    if (importedDates.length === 0) {
+      setImportNotice(null);
+      setImportError(`0 rows imported — the date column's values couldn't be parsed. Example raw value(s): ${skippedExamples.join(", ")}. Double-check the date column is mapped correctly, or tell me what format that is and I'll add support for it.`);
     } else {
-      alert(`Imported ${count} day(s) of nutrition data from MacrosFirst${skippedExamples.length ? ` (${skippedExamples.length} row(s) skipped — unparseable date)` : ""}. These take priority over any manual entries for the same days.`);
+      setImportNotice(`Imported ${importedDates.length} day(s) of nutrition data from MacrosFirst${skippedExamples.length ? ` (${skippedExamples.length} row(s) skipped — unparseable date)` : ""}. These take priority over any manual entries for the same days.`);
     }
 
     // A newly-logged nutrition day is a signal this day matters — make sure we
     // also have training data for it (Strava + intervals.icu), without
     // re-syncing days we already have.
-    const newDates = Array.from(new Set(importedDates));
     if (stravaStatus.connected) {
-      const missing = newDates.filter((d) => !stravaData.syncedDates.includes(d));
+      const missing = importedDates.filter((d) => !stravaData.syncedDates.includes(d));
       if (missing.length) fetchStrava(missing);
     }
     if (intervalsStatus.configured) {
-      const missing = newDates.filter((d) => !intervalsData.syncedDates.includes(d));
+      const missing = importedDates.filter((d) => !intervalsData.syncedDates.includes(d));
       if (missing.length) fetchIntervals(missing);
     }
   }
 
-  function saveManualDay(date, entry) {
-    const existing = normalizeNutritionEntry(nutrition[date]);
-    const next = { ...nutrition, [date]: { ...existing, manual: entry } };
-    saveNutrition(next);
+  // Each returns a promise that resolves once the server has actually
+  // confirmed the write (see apiSaveNutritionDay/apiSaveWeightDay et al. —
+  // per-date merges, not a whole-collection overwrite) so callers can show a
+  // real saved/failed state instead of an optimistic one.
+  async function saveManualDay(date, entry) {
+    const merged = await apiSaveNutritionDay(date, entry);
+    setNutrition((prev) => ({ ...prev, [date]: merged }));
     if (stravaStatus.connected && !stravaData.syncedDates.includes(date)) fetchStrava([date]);
     if (intervalsStatus.configured && !intervalsData.syncedDates.includes(date)) fetchIntervals([date]);
   }
 
-  function deleteNutritionDay(date) {
-    const next = { ...nutrition };
-    delete next[date];
-    saveNutrition(next);
+  async function deleteNutritionDay(date) {
+    await apiDeleteNutritionDay(date);
+    setNutrition((prev) => {
+      const next = { ...prev };
+      delete next[date];
+      return next;
+    });
   }
 
-  function saveManualWeight(date, kg) {
-    saveWeightLog({ ...weightLog, [date]: kg });
+  async function saveManualWeight(date, kg) {
+    const savedKg = await apiSaveWeightDay(date, kg);
+    setWeightLog((prev) => ({ ...prev, [date]: savedKg }));
   }
 
-  function deleteWeightDay(date) {
-    const next = { ...weightLog };
-    delete next[date];
-    saveWeightLog(next);
+  async function deleteWeightDay(date) {
+    await apiDeleteWeightDay(date);
+    setWeightLog((prev) => {
+      const next = { ...prev };
+      delete next[date];
+      return next;
+    });
   }
 
   async function fetchIntervals(dates) {
@@ -1311,7 +1433,7 @@ function App() {
             onDeleteDay={deleteNutritionDay} weightLog={weightLog} onSaveWeight={saveManualWeight}
             onDeleteWeight={deleteWeightDay} googleStatus={googleStatus} googleFetching={googleFetching}
             googleError={googleError} onSyncGoogleSheet={syncGoogleSheet} googleLastAutoSync={googleLastAutoSync}
-            units={units} />
+            importError={importError} importNotice={importNotice} units={units} />
         )}
         {tab === "schedule" && (
           <ScheduleTab schedule={schedule} onAdd={addScheduleEntry} onUpdate={updateScheduleEntry}
@@ -1611,7 +1733,7 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
   );
 }
 
-function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, units }) {
+function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, importError, importNotice, units }) {
   const [dragOver, setDragOver] = useState(false);
   const dayCount = Object.keys(nutrition).length;
   const weightCount = Object.keys(weightLog).length;
@@ -1661,12 +1783,7 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
             Every device on this network shares that connection automatically once it's made.
           </div>
         )}
-        {googleError && (
-          <div style={{ marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 }}>
-            <Icon path={ICONS.warn} size={15} color={coral} />
-            <span>{googleError}</span>
-          </div>
-        )}
+        {googleError && <Banner kind="error">{googleError}</Banner>}
       </div>
 
       <div className="card" style={{ padding: 22 }}>
@@ -1690,6 +1807,8 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
             <input type="file" accept=".csv" style={{ display: "none" }} onChange={(e) => e.target.files[0] && onFile(e.target.files[0])} />
           </label>
         </div>
+        {importError && <Banner kind="error">{importError}</Banner>}
+        {!importError && importNotice && <Banner kind="success">{importNotice}</Banner>}
       </div>
 
       {csvPreview && (
@@ -1734,7 +1853,9 @@ function ManualEntryCard({ nutrition, onSave }) {
   const [protein, setProtein] = useState("");
   const [carbs, setCarbs] = useState("");
   const [fat, setFat] = useState("");
-  const [saved, setSaved] = useState(false);
+  const [status, setStatus] = useState("idle"); // idle | saving | saved | error
+  const [errorMsg, setErrorMsg] = useState(null);
+  const dateRef = useRef(date);
 
   const normalized = normalizeNutritionEntry(nutrition[date]);
   const hasMacrosFirst = !!normalized.macrosfirst;
@@ -1742,13 +1863,26 @@ function ManualEntryCard({ nutrition, onSave }) {
   // Prefill from whichever entry is currently effective, so editing shows
   // what you'd actually see elsewhere in the app — but Save always writes
   // to the manual slot, never overwrites a MacrosFirst import in place.
+  // Prefills immediately from (possibly slightly stale) props for
+  // responsiveness, then reconciles against a fresh fetch — this app is
+  // used from multiple devices against the same server-side log, so the
+  // in-memory copy here can be behind whatever another device (or the
+  // nightly Google auto-sync) has already written for this date.
   useEffect(() => {
-    const existing = normalizeNutritionEntry(nutrition[date]);
-    const prefill = existing.macrosfirst || existing.manual;
-    setProtein(prefill ? String(prefill.protein ?? "") : "");
-    setCarbs(prefill ? String(prefill.carbs ?? "") : "");
-    setFat(prefill ? String(prefill.fat ?? "") : "");
-    setSaved(false);
+    dateRef.current = date;
+    const applyPrefill = (source) => {
+      const existing = normalizeNutritionEntry(source[date]);
+      const prefill = existing.macrosfirst || existing.manual;
+      setProtein(prefill ? String(prefill.protein ?? "") : "");
+      setCarbs(prefill ? String(prefill.carbs ?? "") : "");
+      setFat(prefill ? String(prefill.fat ?? "") : "");
+    };
+    applyPrefill(nutrition);
+    setStatus("idle");
+    setErrorMsg(null);
+    storageGet("nutrition-log", null).then((fresh) => {
+      if (dateRef.current === date && fresh) applyPrefill(fresh);
+    });
     // eslint-disable-next-line
   }, [date]);
 
@@ -1758,10 +1892,17 @@ function ManualEntryCard({ nutrition, onSave }) {
   const calories = macroCalories(p, c, f);
   const hasAny = protein !== "" || carbs !== "" || fat !== "";
 
-  function handleSave() {
-    onSave(date, { calories, protein: p, carbs: c, fat: f });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1500);
+  async function handleSave() {
+    setStatus("saving");
+    setErrorMsg(null);
+    try {
+      await onSave(date, { calories, protein: p, carbs: c, fat: f });
+      setStatus("saved");
+      setTimeout(() => setStatus((s) => (s === "saved" ? "idle" : s)), 1500);
+    } catch (e) {
+      setStatus("error");
+      setErrorMsg(e.message || "Save failed — check the local server connection and retry.");
+    }
   }
 
   return (
@@ -1796,11 +1937,16 @@ function ManualEntryCard({ nutrition, onSave }) {
       )}
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 16 }}>
         <div style={{ fontFamily: mono, fontSize: 13, color: amber }}>≈ {fmt(calories)} kcal</div>
-        <button className="btn-primary" onClick={handleSave} disabled={!hasAny}>
-          {normalized.manual ? "Update manual entry" : "Save this day"}
+        <button className="btn-primary" onClick={handleSave} disabled={!hasAny || status === "saving"}>
+          {status === "saving" ? "Saving…" : normalized.manual ? "Update manual entry" : "Save this day"}
         </button>
-        {saved && <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint }}><Icon path={ICONS.check} size={13} color={mint} /> Saved</div>}
+        {status === "saved" && <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint }}><Icon path={ICONS.check} size={13} color={mint} /> Saved</div>}
       </div>
+      {status === "error" && (
+        <Banner kind="error">
+          {errorMsg} <button className="btn-ghost" style={{ padding: "2px 8px", marginLeft: 8 }} onClick={handleSave}>Retry</button>
+        </Banner>
+      )}
     </div>
   );
 }
@@ -1821,20 +1967,47 @@ function SourceBadge({ source }) {
 
 function NutritionLogTable({ nutrition, onSave, onDelete }) {
   const [editingDate, setEditingDate] = useState(null);
+  const editingDateRef = useRef(null);
   const [draft, setDraft] = useState({ protein: "", carbs: "", fat: "" });
+  const [status, setStatus] = useState("idle"); // idle | saving | error
+  const [errorMsg, setErrorMsg] = useState(null);
   const dates = Object.keys(nutrition).sort().reverse();
 
   function startEdit(date) {
-    const eff = effectiveNutritionEntry(nutrition[date]);
+    editingDateRef.current = date;
     setEditingDate(date);
+    setStatus("idle");
+    setErrorMsg(null);
+    const eff = effectiveNutritionEntry(nutrition[date]);
     setDraft({ protein: String(eff?.protein ?? ""), carbs: String(eff?.carbs ?? ""), fat: String(eff?.fat ?? "") });
+    // Another device (or the nightly Google auto-sync) may have changed this
+    // day since this table's props were loaded — refresh before editing so a
+    // stale prefill can't get submitted back as an "intentional" edit.
+    storageGet("nutrition-log", null).then((fresh) => {
+      if (editingDateRef.current !== date || !fresh) return;
+      const freshEff = effectiveNutritionEntry(fresh[date]);
+      setDraft({ protein: String(freshEff?.protein ?? ""), carbs: String(freshEff?.carbs ?? ""), fat: String(freshEff?.fat ?? "") });
+    });
   }
-  function commitEdit(date) {
+  function cancelEdit() {
+    editingDateRef.current = null;
+    setEditingDate(null);
+  }
+  async function commitEdit(date) {
     const p = parseFloat(draft.protein) || 0;
     const c = parseFloat(draft.carbs) || 0;
     const f = parseFloat(draft.fat) || 0;
-    onSave(date, { calories: macroCalories(p, c, f), protein: p, carbs: c, fat: f });
-    setEditingDate(null);
+    setStatus("saving");
+    setErrorMsg(null);
+    try {
+      await onSave(date, { calories: macroCalories(p, c, f), protein: p, carbs: c, fat: f });
+      editingDateRef.current = null;
+      setEditingDate(null);
+      setStatus("idle");
+    } catch (e) {
+      setStatus("error");
+      setErrorMsg(e.message || "Save failed — check the local server connection and retry.");
+    }
   }
 
   return (
@@ -1851,7 +2024,8 @@ function NutritionLogTable({ nutrition, onSave, onDelete }) {
           const source = normalized.macrosfirst ? "macrosfirst" : "manual";
           const editing = editingDate === date;
           return (
-            <tr key={date}>
+            <React.Fragment key={date}>
+            <tr>
               <td>{date}<SourceBadge source={source} /></td>
               {editing ? (
                 <>
@@ -1860,9 +2034,9 @@ function NutritionLogTable({ nutrition, onSave, onDelete }) {
                   <td><input className="inp" style={{ padding: "4px 6px", textAlign: "right" }} type="number" value={draft.fat} onChange={(ev) => setDraft((d) => ({ ...d, fat: ev.target.value }))} /></td>
                   <td style={{ color: dim }}>≈ {fmt(macroCalories(parseFloat(draft.protein) || 0, parseFloat(draft.carbs) || 0, parseFloat(draft.fat) || 0))}</td>
                   <td style={{ textAlign: "left", whiteSpace: "nowrap" }}>
-                    <button className="btn-ghost" style={{ padding: "4px 10px", marginRight: 6 }} onClick={() => commitEdit(date)}
-                      title={source === "macrosfirst" ? "Saves as a manual fallback — MacrosFirst data still takes priority for this day" : undefined}>Save</button>
-                    <button className="btn-ghost" style={{ padding: "4px 10px" }} onClick={() => setEditingDate(null)}>Cancel</button>
+                    <button className="btn-ghost" style={{ padding: "4px 10px", marginRight: 6 }} onClick={() => commitEdit(date)} disabled={status === "saving"}
+                      title={source === "macrosfirst" ? "Saves as a manual fallback — MacrosFirst data still takes priority for this day" : undefined}>{status === "saving" ? "Saving…" : "Save"}</button>
+                    <button className="btn-ghost" style={{ padding: "4px 10px" }} onClick={cancelEdit} disabled={status === "saving"}>Cancel</button>
                   </td>
                 </>
               ) : (
@@ -1878,6 +2052,16 @@ function NutritionLogTable({ nutrition, onSave, onDelete }) {
                 </>
               )}
             </tr>
+            {editing && status === "error" && (
+              <tr>
+                <td colSpan={6} style={{ padding: 0 }}>
+                  <Banner kind="error">
+                    {errorMsg} <button className="btn-ghost" style={{ padding: "2px 8px", marginLeft: 8 }} onClick={() => commitEdit(date)}>Retry</button>
+                  </Banner>
+                </td>
+              </tr>
+            )}
+            </React.Fragment>
           );
         })}
       </tbody>
@@ -1888,24 +2072,42 @@ function NutritionLogTable({ nutrition, onSave, onDelete }) {
 function WeightEntryCard({ weightLog, onSave, units }) {
   const [date, setDate] = useState(() => toISODate(new Date()));
   const [metricKg, setMetricKg] = useState(""); // canonical (kg) buffer for the currently edited date
-  const [saved, setSaved] = useState(false);
+  const [status, setStatus] = useState("idle"); // idle | saving | saved | error
+  const [errorMsg, setErrorMsg] = useState(null);
+  const dateRef = useRef(date);
 
   useEffect(() => {
+    dateRef.current = date;
     const existingKg = weightLog[date];
     setMetricKg(existingKg === undefined ? "" : String(existingKg));
-    setSaved(false);
+    setStatus("idle");
+    setErrorMsg(null);
+    // Same reasoning as ManualEntryCard: refresh against the server in case
+    // another device (or an in-progress sync) has a newer value for this day.
+    storageGet("weight-log", null).then((fresh) => {
+      if (dateRef.current !== date || !fresh) return;
+      const freshKg = fresh[date];
+      setMetricKg(freshKg === undefined ? "" : String(freshKg));
+    });
     // eslint-disable-next-line
   }, [date]);
 
   const [text, onChange] = useUnitInput(metricKg, units, kgToDisplay, displayToKg, 1);
   const wUnit = weightUnitLabel(units);
 
-  function handleSave() {
+  async function handleSave() {
     const kg = parseFloat(metricKg);
     if (Number.isNaN(kg) || kg <= 0) return;
-    onSave(date, Math.round(kg * 100) / 100);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1500);
+    setStatus("saving");
+    setErrorMsg(null);
+    try {
+      await onSave(date, Math.round(kg * 100) / 100);
+      setStatus("saved");
+      setTimeout(() => setStatus((s) => (s === "saved" ? "idle" : s)), 1500);
+    } catch (e) {
+      setStatus("error");
+      setErrorMsg(e.message || "Save failed — check the local server connection and retry.");
+    }
   }
 
   return (
@@ -1926,28 +2128,57 @@ function WeightEntryCard({ weightLog, onSave, units }) {
         </Field>
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 16 }}>
-        <button className="btn-primary" onClick={handleSave} disabled={!text}>
-          {weightLog[date] !== undefined ? "Update this day" : "Save this day"}
+        <button className="btn-primary" onClick={handleSave} disabled={!text || status === "saving"}>
+          {status === "saving" ? "Saving…" : weightLog[date] !== undefined ? "Update this day" : "Save this day"}
         </button>
-        {saved && <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint }}><Icon path={ICONS.check} size={13} color={mint} /> Saved</div>}
+        {status === "saved" && <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint }}><Icon path={ICONS.check} size={13} color={mint} /> Saved</div>}
       </div>
+      {status === "error" && (
+        <Banner kind="error">
+          {errorMsg} <button className="btn-ghost" style={{ padding: "2px 8px", marginLeft: 8 }} onClick={handleSave}>Retry</button>
+        </Banner>
+      )}
     </div>
   );
 }
 
 function WeightLogTable({ weightLog, onSave, onDelete, units }) {
   const [editingDate, setEditingDate] = useState(null);
+  const editingDateRef = useRef(null);
   const [draft, setDraft] = useState("");
+  const [status, setStatus] = useState("idle"); // idle | saving | error
+  const [errorMsg, setErrorMsg] = useState(null);
   const dates = Object.keys(weightLog).sort().reverse();
 
   function startEdit(date) {
+    editingDateRef.current = date;
     setEditingDate(date);
+    setStatus("idle");
+    setErrorMsg(null);
     setDraft(String(roundTo(kgToDisplay(weightLog[date], units), 1)));
+    storageGet("weight-log", null).then((fresh) => {
+      if (editingDateRef.current !== date || !fresh || fresh[date] === undefined) return;
+      setDraft(String(roundTo(kgToDisplay(fresh[date], units), 1)));
+    });
   }
-  function commitEdit(date) {
-    const v = parseFloat(draft);
-    if (!Number.isNaN(v) && v > 0) onSave(date, Math.round(displayToKg(v, units) * 100) / 100);
+  function cancelEdit() {
+    editingDateRef.current = null;
     setEditingDate(null);
+  }
+  async function commitEdit(date) {
+    const v = parseFloat(draft);
+    if (Number.isNaN(v) || v <= 0) return;
+    setStatus("saving");
+    setErrorMsg(null);
+    try {
+      await onSave(date, Math.round(displayToKg(v, units) * 100) / 100);
+      editingDateRef.current = null;
+      setEditingDate(null);
+      setStatus("idle");
+    } catch (e) {
+      setStatus("error");
+      setErrorMsg(e.message || "Save failed — check the local server connection and retry.");
+    }
   }
 
   return (
@@ -1960,14 +2191,15 @@ function WeightLogTable({ weightLog, onSave, onDelete, units }) {
           const kg = weightLog[date];
           const editing = editingDate === date;
           return (
-            <tr key={date}>
+            <React.Fragment key={date}>
+            <tr>
               <td>{date}</td>
               {editing ? (
                 <>
                   <td><input className="inp" style={{ padding: "4px 6px", textAlign: "right" }} type="number" step="0.1" value={draft} onChange={(ev) => setDraft(ev.target.value)} /></td>
                   <td style={{ textAlign: "left", whiteSpace: "nowrap" }}>
-                    <button className="btn-ghost" style={{ padding: "4px 10px", marginRight: 6 }} onClick={() => commitEdit(date)}>Save</button>
-                    <button className="btn-ghost" style={{ padding: "4px 10px" }} onClick={() => setEditingDate(null)}>Cancel</button>
+                    <button className="btn-ghost" style={{ padding: "4px 10px", marginRight: 6 }} onClick={() => commitEdit(date)} disabled={status === "saving"}>{status === "saving" ? "Saving…" : "Save"}</button>
+                    <button className="btn-ghost" style={{ padding: "4px 10px" }} onClick={cancelEdit} disabled={status === "saving"}>Cancel</button>
                   </td>
                 </>
               ) : (
@@ -1980,6 +2212,16 @@ function WeightLogTable({ weightLog, onSave, onDelete, units }) {
                 </>
               )}
             </tr>
+            {editing && status === "error" && (
+              <tr>
+                <td colSpan={3} style={{ padding: 0 }}>
+                  <Banner kind="error">
+                    {errorMsg} <button className="btn-ghost" style={{ padding: "2px 8px", marginLeft: 8 }} onClick={() => commitEdit(date)}>Retry</button>
+                  </Banner>
+                </td>
+              </tr>
+            )}
+            </React.Fragment>
           );
         })}
       </tbody>

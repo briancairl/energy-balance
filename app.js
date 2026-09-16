@@ -899,7 +899,8 @@
         const target = baseTarget - repaidKcal + borrowedKcal;
         carryRepaymentKcal = raceLoading ? 0 : borrowedKcal;
         const gap = intake !== null ? intake - target : null;
-        const proteinTargetG = weightForDay ? weightForDay * (parseFloat(profile.proteinGPerKg) || 1) : null;
+        const proteinWeightKg = parseFloat(profile.targetWeightKg) || weightForDay;
+        const proteinTargetG = proteinWeightKg ? proteinWeightKg * (parseFloat(profile.proteinGPerKg) || 1) : null;
         const fatFloorG = target * 0.2 / 9;
         const fatRemainderG = (target - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
         const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;

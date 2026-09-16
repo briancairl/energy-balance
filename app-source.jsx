@@ -1115,7 +1115,12 @@ function App() {
 
       const gap = intake !== null ? intake - target : null;
 
-      const proteinTargetG = weightForDay ? weightForDay * (parseFloat(profile.proteinGPerKg) || 1.0) : null;
+      // Protein scales off goal weight (where the athlete's headed), not the
+      // day's fluctuating logged weight — unlike carbs/fat, which track
+      // actual body mass since they fuel that day's training load. Falls
+      // back to logged/profile weight when no target weight is set.
+      const proteinWeightKg = parseFloat(profile.targetWeightKg) || weightForDay;
+      const proteinTargetG = proteinWeightKg ? proteinWeightKg * (parseFloat(profile.proteinGPerKg) || 1.0) : null;
       const fatFloorG = target * 0.20 / 9;
       const fatRemainderG = (target - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
       const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;

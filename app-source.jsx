@@ -1130,12 +1130,16 @@ function App() {
       // back to logged/profile weight when no target weight is set.
       const proteinWeightKg = parseFloat(profile.targetWeightKg) || weightForDay;
       const proteinTargetG = proteinWeightKg ? proteinWeightKg * (parseFloat(profile.proteinGPerKg) || 1.0) : null;
-      // 20% of Target is the usual ISSN-consensus floor, but on a big carb
-      // pre-load/race-load day that percentage can still price fat down to
-      // near nothing — so it's floored again against a flat gram minimum
-      // (default 100g, comfortably inside the ~100-150g/day typical for an
-      // athlete's calorie range) for essential-fatty-acid/vitamin intake.
-      const fatFloorG = Math.max(carbDrivenTarget * 0.20 / 9, parseFloat(profile.minFatG) || 100);
+      // 20% of Target is the usual ISSN-consensus floor, and on its own it's
+      // self-scaling — never a big deal on a low-calorie rest day. It's only
+      // on a big carb pre-load/race-load day that it can price fat down to
+      // near nothing, so the flat gram minimum (default 100g) only backstops
+      // it there; applying it on every day would flatten an absolute floor
+      // over what should be a demand-scaled number, inflating Target on
+      // easy/rest days for no training reason.
+      const fatFloorG = (preloading || raceLoading)
+        ? Math.max(carbDrivenTarget * 0.20 / 9, parseFloat(profile.minFatG) || 100)
+        : carbDrivenTarget * 0.20 / 9;
       const fatRemainderG = (carbDrivenTarget - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
       const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;
       // Whenever the fat floor pushes fat above what carbDrivenTarget actually

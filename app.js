@@ -905,7 +905,7 @@
         carryRepaymentKcal = raceLoading ? 0 : borrowedKcal;
         const proteinWeightKg = parseFloat(profile.targetWeightKg) || weightForDay;
         const proteinTargetG = proteinWeightKg ? proteinWeightKg * (parseFloat(profile.proteinGPerKg) || 1) : null;
-        const fatFloorG = Math.max(carbDrivenTarget * 0.2 / 9, parseFloat(profile.minFatG) || 100);
+        const fatFloorG = preloading || raceLoading ? Math.max(carbDrivenTarget * 0.2 / 9, parseFloat(profile.minFatG) || 100) : carbDrivenTarget * 0.2 / 9;
         const fatRemainderG = (carbDrivenTarget - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
         const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;
         const macroFloorKcal = (carbTargetG || 0) * 4 + (proteinTargetG || 0) * 4 + (fatTargetG || 0) * 9;

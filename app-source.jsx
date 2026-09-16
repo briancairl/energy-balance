@@ -84,6 +84,9 @@ function weightUnitLabel(units) { return units === "imperial" ? "lb" : "kg"; }
 function heightUnitLabel(units) { return units === "imperial" ? "in" : "cm"; }
 function kgToDisplay(kg, units) { return units === "imperial" ? kgToLb(kg) : kg; }
 function displayToKg(v, units) { return units === "imperial" ? lbToKg(v) : v; }
+// proteinGPerKg is stored canonically as g per kg bodyweight; g/lb is g/kg * kg-per-lb.
+function gPerKgToDisplay(g, units) { return units === "imperial" ? g * KG_PER_LB : g; }
+function displayToGPerKg(g, units) { return units === "imperial" ? g / KG_PER_LB : g; }
 function cmToDisplayLen(cm, units) { return units === "imperial" ? cmToIn(cm) : cm; }
 function displayToCm(v, units) { return units === "imperial" ? inToCm(v) : v; }
 function roundTo(n, decimals) { const f = 10 ** decimals; return Math.round(n * f) / f; }
@@ -587,7 +590,7 @@ function App() {
   }, []);
   const [profile, setProfile] = useState({
     sex: "male", weightKg: "", heightCm: "", age: "",
-    neatFactor: 1.15, epocSensitivity: 1.0, fatigueBuffer: true,
+    neatMode: "multiplier", neatFactor: 1.15, neatOffset: 400, epocSensitivity: 1.0, fatigueBuffer: true,
     goal: "maintain", buildRatePct: GOAL_DEFAULTS.build.ratePct, loseRatePct: GOAL_DEFAULTS.lose.ratePct,
     targetWeightKg: "",
     trendCalibration: true,
@@ -1053,7 +1056,9 @@ function App() {
       const atl = w?.atl ?? null;
       const tsb = ctl !== null && atl !== null ? ctl - atl : null;
       const fatigueBuffer = profile.fatigueBuffer && tsb !== null && tsb < -10 ? dayBmr * 0.05 : 0;
-      const baseline = dayBmr * (parseFloat(profile.neatFactor) || 1.15);
+      const baseline = profile.neatMode === "offset"
+        ? dayBmr + (parseFloat(profile.neatOffset) || 0)
+        : dayBmr * (parseFloat(profile.neatFactor) || 1.15);
       const demand = baseline + exerciseKcal + epocKcal + fatigueBuffer;
       const nutritionEntry = effectiveNutritionEntry(nutrition[key]);
       const nutritionSource = nutritionEntry ? (normalizeNutritionEntry(nutrition[key]).macrosfirst ? "macrosfirst" : "manual") : null;
@@ -1424,20 +1429,44 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
           <Icon path={ICONS.gauge} size={16} color={amber} /> Model tuning
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 20 }}>
-          <Field label={`Non-training activity factor — ${profile.neatFactor}×`}>
-            <input type="range" min="1.0" max="1.4" step="0.01" value={profile.neatFactor}
-              onChange={(e) => setProfile((p) => ({ ...p, neatFactor: e.target.value }))} style={{ width: "100%" }} />
-            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>BMR × this factor covers daily NEAT/light activity, before training is added on top.</div>
+          <Field label="Non-training activity (NEAT)">
+            <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+              {[["multiplier", "Multiplier"], ["offset", "Fixed offset"]].map(([id, label]) => (
+                <button key={id} onClick={() => setProfile((p) => ({ ...p, neatMode: id }))}
+                  className={id === (profile.neatMode || "multiplier") ? "" : "btn-ghost"}
+                  style={id === (profile.neatMode || "multiplier")
+                    ? { flex: 1, padding: "7px 10px", borderRadius: 4, fontWeight: 700, fontSize: 12, cursor: "pointer", border: "none", background: cyan, color: ink }
+                    : { flex: 1, padding: "7px 10px", fontSize: 12 }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {(profile.neatMode || "multiplier") === "offset" ? (
+              <>
+                <input className="inp" type="number" step="25" value={profile.neatOffset}
+                  onChange={(e) => setProfile((p) => ({ ...p, neatOffset: e.target.value }))} style={{ width: "100%" }} />
+                <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>A flat kcal/day added to BMR to cover daily NEAT/light activity, before training is added on top.</div>
+              </>
+            ) : (
+              <>
+                <input type="range" min="1.0" max="1.4" step="0.01" value={profile.neatFactor}
+                  onChange={(e) => setProfile((p) => ({ ...p, neatFactor: e.target.value }))} style={{ width: "100%" }} />
+                <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>BMR × {profile.neatFactor}× covers daily NEAT/light activity, before training is added on top.</div>
+              </>
+            )}
           </Field>
           <Field label={`EPOC / recovery sensitivity — ${profile.epocSensitivity}×`}>
             <input type="range" min="0.5" max="1.5" step="0.05" value={profile.epocSensitivity}
               onChange={(e) => setProfile((p) => ({ ...p, epocSensitivity: e.target.value }))} style={{ width: "100%" }} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Scales the post-exercise afterburn estimate (5–12% of session kcal by intensity).</div>
           </Field>
-          <Field label={`Protein target — ${profile.proteinGPerKg} g/kg/day`}>
-            <input type="range" min="0.6" max="2.5" step="0.05" value={profile.proteinGPerKg}
-              onChange={(e) => setProfile((p) => ({ ...p, proteinGPerKg: e.target.value }))} style={{ width: "100%" }} />
-            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Flat daily rate, not tier-scaled like carbs. Default 1.0 g/kg; athlete guidelines typically range 1.2–2.0+ g/kg.</div>
+          <Field label={`Protein target — ${fmt(gPerKgToDisplay(parseFloat(profile.proteinGPerKg) || 0, units), 2)} g/${weightUnitLabel(units)}/day`}>
+            <input type="range" min={units === "imperial" ? 0.3 : 0.6} max={units === "imperial" ? 1.2 : 2.5} step={units === "imperial" ? 0.02 : 0.05}
+              value={gPerKgToDisplay(parseFloat(profile.proteinGPerKg) || 0, units)}
+              onChange={(e) => setProfile((p) => ({ ...p, proteinGPerKg: String(displayToGPerKg(parseFloat(e.target.value), units)) }))} style={{ width: "100%" }} />
+            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
+              Flat daily rate, not tier-scaled like carbs. Default {fmt(gPerKgToDisplay(1.0, units), 2)} g/{weightUnitLabel(units)}; athlete guidelines typically range {fmt(gPerKgToDisplay(1.2, units), 2)}–{fmt(gPerKgToDisplay(2.0, units), 2)}+ g/{weightUnitLabel(units)}.
+            </div>
           </Field>
           <Field label={`Pre-load funding — ${Math.round(profile.preloadBorrowRatio * 100)}% borrowed`}>
             <input type="range" min="0" max="1" step="0.05" value={profile.preloadBorrowRatio}

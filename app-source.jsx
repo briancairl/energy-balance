@@ -212,6 +212,20 @@ async function apiImportScheduleFile(filename, data) {
   if (!res.ok) throw new Error(result.error || `Import failed (${res.status}).`);
   return result;
 }
+// actualKey: a specific activity key forces that match; null forces "no
+// match"; omitted entirely clears the override, reverting to the auto-guess.
+async function apiSetScheduleMatchOverride(date, plannedKey, actualKey) {
+  const body = { plannedKey };
+  if (actualKey !== undefined) body.actualKey = actualKey;
+  const res = await fetchWithRetry(`/api/schedule/match-override?date=${date}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+  return data;
+}
 async function apiSaveWeightDay(date, kg) {
   const res = await fetchWithRetry(`/api/weight/day?date=${date}`, {
     method: "POST",
@@ -517,6 +531,15 @@ function getCarbLoadState(schedule, dateStr) {
   return { race, daysToRace };
 }
 
+// Stable per-day key for a planned item (a scheduled session or that day's
+// race), used to store a manual match correction. A recurring session's `id`
+// repeats on every date it recurs — that's fine here because overrides are
+// always looked up scoped to one date first (schedule-match-overrides[date]),
+// so the same session id on two different dates never collides.
+function plannedMatchKey(planned) {
+  return planned.isRace ? `race:${planned.id}` : `session:${planned.id}`;
+}
+
 // Pairs each planned item (a scheduled session, or that day's race) for one
 // calendar day against the real activities synced from Strava/intervals.icu
 // for that same date, so the calendar can show planned-vs-actual side by
@@ -526,10 +549,33 @@ function getCarbLoadState(schedule, dateStr) {
 // candidate of that type, e.g. two runs logged the same day) picks whichever
 // actual duration is closest to what was planned. Greedy and order-dependent,
 // but a single day rarely has enough same-type activities for that to matter.
-function matchDayActivities(plannedItems, actuals) {
-  const remaining = actuals.slice();
+//
+// `overrides` (schedule-match-overrides[date], from the "correct a match" UI)
+// take priority over the guess: a plannedMatchKey present with a specific
+// actual key forces that pairing (and reserves the activity so the auto
+// heuristic can't also hand it to something else); present with `null` means
+// "confirmed no match" even if the heuristic would have guessed one; absent
+// entirely means "let the heuristic decide", the original behavior.
+function matchDayActivities(plannedItems, actuals, overrides) {
+  overrides = overrides || {};
+  const byKey = {};
+  for (const a of actuals) byKey[a.key] = a;
+
+  const claimed = new Set();
+  for (const planned of plannedItems) {
+    const forced = overrides[plannedMatchKey(planned)];
+    if (forced) claimed.add(forced);
+  }
+  const remaining = actuals.filter((a) => !claimed.has(a.key));
+
   const pairs = [];
   for (const planned of plannedItems) {
+    const pk = plannedMatchKey(planned);
+    if (Object.prototype.hasOwnProperty.call(overrides, pk)) {
+      const forced = overrides[pk];
+      pairs.push({ planned, actual: forced ? (byKey[forced] || null) : null, manual: true });
+      continue;
+    }
     const candidates = remaining.filter((a) => a.activityType === planned.activityType);
     let match = null;
     if (candidates.length) {
@@ -538,7 +584,7 @@ function matchDayActivities(plannedItems, actuals) {
       match = candidates[0];
       remaining.splice(remaining.indexOf(match), 1);
     }
-    pairs.push({ planned, actual: match });
+    pairs.push({ planned, actual: match, manual: false });
   }
   return { pairs, extras: remaining };
 }
@@ -744,6 +790,9 @@ function App() {
   const [nutrition, setNutrition] = useState({});
   const [weightLog, setWeightLog] = useState({}); // { 'YYYY-MM-DD': kg }
   const [schedule, setSchedule] = useState([]);
+  // { 'YYYY-MM-DD': { [plannedMatchKey]: actualKey | null } } — manual
+  // corrections to the Schedule tab's auto planned-vs-actual matching.
+  const [matchOverrides, setMatchOverrides] = useState({});
   // Recurring: { id, kind: "recurring", activityType, zone, durationMin, daysOfWeek, startDate, endDate, notes }
   // Single:    { id, kind: "single", activityType, zone, durationMin, date, notes } — one-off, non-repeating
   // Race:      { id, kind: "race", activityType, zone, durationMin, raceDate, taperDays, notes }
@@ -770,11 +819,12 @@ function App() {
 
   useEffect(() => {
     (async () => {
-      const [p, n, w, sched, cached, stravaCached, gLastSync] = await Promise.all([
+      const [p, n, w, sched, matchOv, cached, stravaCached, gLastSync] = await Promise.all([
         storageGet("profile", null),
         storageGet("nutrition-log", {}),
         storageGet("weight-log", {}),
         storageGet("training-schedule", []),
+        storageGet("schedule-match-overrides", {}),
         storageGet("intervals-cache", null),
         storageGet("strava-cache", null),
         storageGet("google-last-auto-sync", null),
@@ -782,6 +832,7 @@ function App() {
       setNutrition(n);
       setWeightLog(w);
       setSchedule(sched);
+      setMatchOverrides(matchOv);
       setGoogleLastAutoSync(gLastSync);
 
       // Weight always reflects the most recent logged entry, so a fresh
@@ -839,6 +890,21 @@ function App() {
   }
   function deleteScheduleEntry(id) {
     saveSchedule(schedule.filter((s) => s.id !== id));
+  }
+
+  // actualKey: a specific activity key forces that match; null forces "no
+  // match"; undefined clears the override, reverting to the auto-guess.
+  // Per-date merge (like nutrition/weight day saves) rather than a wholesale
+  // overwrite of the whole overrides object, so correcting one day can't
+  // race with — and clobber — a correction on another day from another tab.
+  async function setScheduleMatchOverride(date, plannedKey, actualKey) {
+    const data = await apiSetScheduleMatchOverride(date, plannedKey, actualKey);
+    setMatchOverrides((prev) => {
+      const next = { ...prev };
+      if (data.overrides && Object.keys(data.overrides).length) next[date] = data.overrides;
+      else delete next[date];
+      return next;
+    });
   }
 
   const bmr = useMemo(
@@ -1503,7 +1569,8 @@ function App() {
           <ScheduleTab schedule={schedule} onAdd={addScheduleEntry} onUpdate={updateScheduleEntry}
             onDelete={deleteScheduleEntry} stravaData={stravaData} intervalsData={intervalsData}
             onImportFile={handleScheduleFile} importFileError={scheduleImportError}
-            importFileNotice={scheduleImportNotice} />
+            importFileNotice={scheduleImportNotice} matchOverrides={matchOverrides}
+            onSetMatchOverride={setScheduleMatchOverride} />
         )}
         {tab === "dashboard" && (
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
@@ -2344,11 +2411,12 @@ function scheduleRowStyle(highlighted) {
 }
 
 function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData,
-  onImportFile, importFileError, importFileNotice }) {
+  onImportFile, importFileError, importFileNotice, matchOverrides, onSetMatchOverride }) {
   const [form, setForm] = useState(emptyScheduleForm());
   const [editingId, setEditingId] = useState(null);
   const [highlightIds, setHighlightIds] = useState([]);
   const [scheduleDragOver, setScheduleDragOver] = useState(false);
+  const [editingMatchDay, setEditingMatchDay] = useState(null); // date key, or null
   const itemRefs = useRef({});
 
   const activityLibrary = useMemo(
@@ -2483,8 +2551,9 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
     const raceToday = races.find((r) => r.raceDate === key);
     const carbLoad = getCarbLoadState(schedule, key);
     const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
-    const { pairs, extras } = matchDayActivities(plannedItems, actualsByDate[key] || []);
-    calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras });
+    const dayActuals = actualsByDate[key] || [];
+    const { pairs, extras } = matchDayActivities(plannedItems, dayActuals, matchOverrides[key]);
+    calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras, dayActuals });
   }
   const todayKey = toLocalISODate(new Date());
 
@@ -2501,6 +2570,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.trophy} size={10} color={gold} /> race day</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}>solid = planned, outline = actual <Icon path={ICONS.check} size={10} color={mint} /> matched</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.pencil} size={10} color={dim} /> click to correct a match</span>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
           {WEEKDAY_LABELS.map((label) => (
@@ -2548,11 +2618,11 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
             // apart from "actual" (outline) even before reading either chip —
             // the checkmark then further distinguishes a real match from an
             // extra, unscheduled activity that just happens to share a slot.
-            function actualChip(actual, matched, i) {
+            function actualChip(actual, matched, i, manual) {
               const color = ACTIVITY_COLORS[actual.activityType] || dim;
               return (
                 <div key={`a${i}`}
-                  title={`${actual.name} · ${actual.activityType} · ${actual.durationMin}min${matched ? " · matched to the plan" : " · not on the schedule"}`}
+                  title={`${actual.name} · ${actual.activityType} · ${actual.durationMin}min${matched ? " · matched to the plan" : " · not on the schedule"}${manual ? " · manually corrected" : ""}`}
                   style={{
                     border: `1px solid ${color}`,
                     color,
@@ -2567,6 +2637,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                   }}>
                   {matched && <Icon path={ICONS.check} size={9} color={color} />}
                   {actual.activityType} · {actual.durationMin}m
+                  {manual && <Icon path={ICONS.pencil} size={8} color={color} />}
                 </div>
               );
             }
@@ -2590,11 +2661,18 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                   {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
                   {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
                   {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
+                  {(day.pairs.length > 0 || day.dayActuals.length > 0) && (
+                    <button type="button" title="Correct planned/actual matches for this day"
+                      onClick={(e) => { e.stopPropagation(); setEditingMatchDay(day.key); }}
+                      style={{ marginLeft: "auto", background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }}>
+                      <Icon path={ICONS.pencil} size={10} color={dim} />
+                    </button>
+                  )}
                 </div>
-                {day.pairs.map(({ planned, actual }, i) => (
+                {day.pairs.map(({ planned, actual, manual }, i) => (
                   <div key={`pair${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
                     {plannedChip(planned, i)}
-                    {actual ? actualChip(actual, true, i) : (day.key <= todayKey
+                    {actual ? actualChip(actual, true, i, manual) : (day.key <= todayKey
                       ? <div style={{ fontSize: 10, color: dim, display: "flex", alignItems: "center" }}>not logged</div>
                       : null)}
                   </div>
@@ -2610,6 +2688,79 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           })}
         </div>
       </div>
+
+      {editingMatchDay && (() => {
+        const day = calendarDays.find((d) => d.key === editingMatchDay);
+        if (!day) return null;
+        const dayOverrides = matchOverrides[day.key] || {};
+        return (
+          <div style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 50,
+            display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
+          }} onClick={() => setEditingMatchDay(null)}>
+            <div onClick={(e) => e.stopPropagation()} style={{
+              background: panel2, border: `1px solid ${line}`, borderRadius: 8, padding: 20,
+              width: 420, maxWidth: "100%", maxHeight: "80vh", overflowY: "auto",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 14 }}>
+                  {day.date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}
+                </div>
+                <button onClick={() => setEditingMatchDay(null)}
+                  style={{ background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }}>×</button>
+              </div>
+              <div style={{ fontSize: 12, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+                Correct which logged activity matches each planned session, if the automatic guess got it wrong.
+              </div>
+              {day.pairs.length === 0 && (
+                <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>Nothing scheduled this day.</div>
+              )}
+              {day.pairs.map(({ planned, actual }, i) => {
+                const pk = plannedMatchKey(planned);
+                const label = planned.isRace
+                  ? `Race: ${planned.notes || planned.activityType}`
+                  : `${planned.activityType} Z${planned.zone} · ${planned.durationMin}m${planned.notes ? ` · ${planned.notes}` : ""}`;
+                const hasOverride = Object.prototype.hasOwnProperty.call(dayOverrides, pk);
+                const overrideValue = dayOverrides[pk];
+                const selectValue = !hasOverride ? "__auto__" : (overrideValue === null ? "__none__" : overrideValue);
+                return (
+                  <div key={i} style={{ marginBottom: 14 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{
+                        width: 8, height: 8, borderRadius: 2,
+                        background: planned.isRace ? gold : (ACTIVITY_COLORS[planned.activityType] || dim),
+                        display: "inline-block",
+                      }} />
+                      {label}
+                    </div>
+                    <select value={selectValue} onChange={(e) => {
+                        const v = e.target.value;
+                        if (v === "__auto__") onSetMatchOverride(day.key, pk, undefined);
+                        else if (v === "__none__") onSetMatchOverride(day.key, pk, null);
+                        else onSetMatchOverride(day.key, pk, v);
+                      }}
+                      style={{ width: "100%", padding: "6px 8px", borderRadius: 4, background: panel, border: `1px solid ${line}`, color: paper, fontSize: 12.5 }}>
+                      <option value="__auto__">Auto (let the app guess)</option>
+                      <option value="__none__">No match</option>
+                      {day.dayActuals.map((a) => (
+                        <option key={a.key} value={a.key}>{a.activityType} · {a.durationMin}m · {a.name}</option>
+                      ))}
+                    </select>
+                    {!hasOverride && (
+                      <div style={{ fontSize: 10.5, color: dim, marginTop: 2 }}>
+                        Auto-detected{actual ? ` — matched to "${actual.name}"` : " — no match found"}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {day.dayActuals.length === 0 && day.pairs.length > 0 && (
+                <div style={{ fontSize: 11, color: dim }}>No Strava/intervals.icu activities synced for this day.</div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>

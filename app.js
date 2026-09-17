@@ -201,6 +201,18 @@
     if (!res.ok) throw new Error(result.error || `Import failed (${res.status}).`);
     return result;
   }
+  async function apiSetScheduleMatchOverride(date, plannedKey, actualKey) {
+    const body2 = { plannedKey };
+    if (actualKey !== void 0) body2.actualKey = actualKey;
+    const res = await fetchWithRetry(`/api/schedule/match-override?date=${date}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body2)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+    return data;
+  }
   async function apiSaveWeightDay(date, kg) {
     const res = await fetchWithRetry(`/api/weight/day?date=${date}`, {
       method: "POST",
@@ -422,10 +434,27 @@
     if (daysToRace <= 0 || daysToRace > CARB_LOAD_DAYS) return null;
     return { race, daysToRace };
   }
-  function matchDayActivities(plannedItems, actuals) {
-    const remaining = actuals.slice();
+  function plannedMatchKey(planned) {
+    return planned.isRace ? `race:${planned.id}` : `session:${planned.id}`;
+  }
+  function matchDayActivities(plannedItems, actuals, overrides) {
+    overrides = overrides || {};
+    const byKey = {};
+    for (const a of actuals) byKey[a.key] = a;
+    const claimed = /* @__PURE__ */ new Set();
+    for (const planned of plannedItems) {
+      const forced = overrides[plannedMatchKey(planned)];
+      if (forced) claimed.add(forced);
+    }
+    const remaining = actuals.filter((a) => !claimed.has(a.key));
     const pairs = [];
     for (const planned of plannedItems) {
+      const pk = plannedMatchKey(planned);
+      if (Object.prototype.hasOwnProperty.call(overrides, pk)) {
+        const forced = overrides[pk];
+        pairs.push({ planned, actual: forced ? byKey[forced] || null : null, manual: true });
+        continue;
+      }
       const candidates = remaining.filter((a) => a.activityType === planned.activityType);
       let match = null;
       if (candidates.length) {
@@ -433,7 +462,7 @@
         match = candidates[0];
         remaining.splice(remaining.indexOf(match), 1);
       }
-      pairs.push({ planned, actual: match });
+      pairs.push({ planned, actual: match, manual: false });
     }
     return { pairs, extras: remaining };
   }
@@ -596,6 +625,7 @@
     const [nutrition, setNutrition] = useState({});
     const [weightLog, setWeightLog] = useState({});
     const [schedule, setSchedule] = useState([]);
+    const [matchOverrides, setMatchOverrides] = useState({});
     const [csvPreview, setCsvPreview] = useState(null);
     const [csvPreviewSource, setCsvPreviewSource] = useState(null);
     const [colMap, setColMap] = useState({ date: "", calories: "", protein: "", carbs: "", fat: "" });
@@ -616,11 +646,12 @@
     const [googleError, setGoogleError] = useState(null);
     useEffect(() => {
       (async () => {
-        const [p, n, w, sched, cached, stravaCached, gLastSync] = await Promise.all([
+        const [p, n, w, sched, matchOv, cached, stravaCached, gLastSync] = await Promise.all([
           storageGet("profile", null),
           storageGet("nutrition-log", {}),
           storageGet("weight-log", {}),
           storageGet("training-schedule", []),
+          storageGet("schedule-match-overrides", {}),
           storageGet("intervals-cache", null),
           storageGet("strava-cache", null),
           storageGet("google-last-auto-sync", null)
@@ -628,6 +659,7 @@
         setNutrition(n);
         setWeightLog(w);
         setSchedule(sched);
+        setMatchOverrides(matchOv);
         setGoogleLastAutoSync(gLastSync);
         const latestWeightDate = Object.keys(w).sort().pop();
         const merged = { ...p || {} };
@@ -674,6 +706,15 @@
     }
     function deleteScheduleEntry(id) {
       saveSchedule(schedule.filter((s) => s.id !== id));
+    }
+    async function setScheduleMatchOverride(date, plannedKey, actualKey) {
+      const data = await apiSetScheduleMatchOverride(date, plannedKey, actualKey);
+      setMatchOverrides((prev) => {
+        const next = { ...prev };
+        if (data.overrides && Object.keys(data.overrides).length) next[date] = data.overrides;
+        else delete next[date];
+        return next;
+      });
     }
     const bmr = useMemo(
       () => calcBMR(profile.sex, parseFloat(profile.weightKg), parseFloat(profile.heightCm), parseFloat(profile.age)),
@@ -1236,7 +1277,9 @@
         intervalsData,
         onImportFile: handleScheduleFile,
         importFileError: scheduleImportError,
-        importFileNotice: scheduleImportNotice
+        importFileNotice: scheduleImportNotice,
+        matchOverrides,
+        onSetMatchOverride: setScheduleMatchOverride
       }
     ), tab === "dashboard" && /* @__PURE__ */ React.createElement(
       DashboardTab,
@@ -1696,13 +1739,16 @@
     intervalsData,
     onImportFile,
     importFileError,
-    importFileNotice
+    importFileNotice,
+    matchOverrides,
+    onSetMatchOverride
   }) {
     var _a;
     const [form, setForm] = useState(emptyScheduleForm());
     const [editingId, setEditingId] = useState(null);
     const [highlightIds, setHighlightIds] = useState([]);
     const [scheduleDragOver, setScheduleDragOver] = useState(false);
+    const [editingMatchDay, setEditingMatchDay] = useState(null);
     const itemRefs = useRef({});
     const activityLibrary = useMemo(
       () => getActivityLibrary(stravaData, intervalsData),
@@ -1852,11 +1898,12 @@
       const raceToday = races.find((r) => r.raceDate === key);
       const carbLoad = getCarbLoadState(schedule, key);
       const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
-      const { pairs, extras } = matchDayActivities(plannedItems, actualsByDate[key] || []);
-      calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras });
+      const dayActuals = actualsByDate[key] || [];
+      const { pairs, extras } = matchDayActivities(plannedItems, dayActuals, matchOverrides[key]);
+      calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras, dayActuals });
     }
     const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "Next 3 weeks"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, "solid = planned, outline = actual ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 10, color: mint }), " matched")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "Next 3 weeks"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, "solid = planned, outline = actual ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 10, color: mint }), " matched"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim }), " click to correct a match")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
       const isToday = day.key === todayKey;
       const isPast = day.key < todayKey;
       const isFirstOfMonth = day.date.getDate() === 1;
@@ -1914,13 +1961,13 @@
           isPreloadWorthy(planned) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink })
         );
       }
-      function actualChip(actual, matched, i) {
+      function actualChip(actual, matched, i, manual) {
         const color = ACTIVITY_COLORS[actual.activityType] || dim;
         return /* @__PURE__ */ React.createElement(
           "div",
           {
             key: `a${i}`,
-            title: `${actual.name} \xB7 ${actual.activityType} \xB7 ${actual.durationMin}min${matched ? " \xB7 matched to the plan" : " \xB7 not on the schedule"}`,
+            title: `${actual.name} \xB7 ${actual.activityType} \xB7 ${actual.durationMin}min${matched ? " \xB7 matched to the plan" : " \xB7 not on the schedule"}${manual ? " \xB7 manually corrected" : ""}`,
             style: {
               border: `1px solid ${color}`,
               color,
@@ -1938,7 +1985,8 @@
           actual.activityType,
           " \xB7 ",
           actual.durationMin,
-          "m"
+          "m",
+          manual && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 8, color })
         );
       }
       return /* @__PURE__ */ React.createElement(
@@ -1960,11 +2008,81 @@
             opacity: isPast ? 0.5 : 1
           }
         },
-        /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold }))),
-        day.pairs.map(({ planned, actual }, i) => /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i), actual ? actualChip(actual, true, i) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null)),
+        /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold })), (day.pairs.length > 0 || day.dayActuals.length > 0) && /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            title: "Correct planned/actual matches for this day",
+            onClick: (e) => {
+              e.stopPropagation();
+              setEditingMatchDay(day.key);
+            },
+            style: { marginLeft: "auto", background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }
+          },
+          /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim })
+        )),
+        day.pairs.map(({ planned, actual, manual }, i) => /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i), actual ? actualChip(actual, true, i, manual) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null)),
         day.extras.map((actual, i) => /* @__PURE__ */ React.createElement("div", { key: `extra${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, /* @__PURE__ */ React.createElement("div", null), actualChip(actual, false, i)))
       );
-    }))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " Import schedule from file"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file. It's saved under ", /* @__PURE__ */ React.createElement("code", null, "schedule_sources/"), " and re-imported automatically from then on whenever that file's contents change \u2014 no need to come back here and re-upload it."), /* @__PURE__ */ React.createElement(
+    }))), editingMatchDay && (() => {
+      const day = calendarDays.find((d) => d.key === editingMatchDay);
+      if (!day) return null;
+      const dayOverrides = matchOverrides[day.key] || {};
+      return /* @__PURE__ */ React.createElement("div", { style: {
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        zIndex: 50,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20
+      }, onClick: () => setEditingMatchDay(null) }, /* @__PURE__ */ React.createElement("div", { onClick: (e) => e.stopPropagation(), style: {
+        background: panel2,
+        border: `1px solid ${line}`,
+        borderRadius: 8,
+        padding: 20,
+        width: 420,
+        maxWidth: "100%",
+        maxHeight: "80vh",
+        overflowY: "auto"
+      } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 14 } }, day.date.toLocaleDateString(void 0, { weekday: "long", month: "short", day: "numeric" })), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => setEditingMatchDay(null),
+          style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }
+        },
+        "\xD7"
+      )), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Correct which logged activity matches each planned session, if the automatic guess got it wrong."), day.pairs.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16 } }, "Nothing scheduled this day."), day.pairs.map(({ planned, actual }, i) => {
+        const pk = plannedMatchKey(planned);
+        const label = planned.isRace ? `Race: ${planned.notes || planned.activityType}` : `${planned.activityType} Z${planned.zone} \xB7 ${planned.durationMin}m${planned.notes ? ` \xB7 ${planned.notes}` : ""}`;
+        const hasOverride = Object.prototype.hasOwnProperty.call(dayOverrides, pk);
+        const overrideValue = dayOverrides[pk];
+        const selectValue = !hasOverride ? "__auto__" : overrideValue === null ? "__none__" : overrideValue;
+        return /* @__PURE__ */ React.createElement("div", { key: i, style: { marginBottom: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, fontWeight: 600, marginBottom: 4, display: "flex", alignItems: "center", gap: 6 } }, /* @__PURE__ */ React.createElement("span", { style: {
+          width: 8,
+          height: 8,
+          borderRadius: 2,
+          background: planned.isRace ? gold : ACTIVITY_COLORS[planned.activityType] || dim,
+          display: "inline-block"
+        } }), label), /* @__PURE__ */ React.createElement(
+          "select",
+          {
+            value: selectValue,
+            onChange: (e) => {
+              const v = e.target.value;
+              if (v === "__auto__") onSetMatchOverride(day.key, pk, void 0);
+              else if (v === "__none__") onSetMatchOverride(day.key, pk, null);
+              else onSetMatchOverride(day.key, pk, v);
+            },
+            style: { width: "100%", padding: "6px 8px", borderRadius: 4, background: panel, border: `1px solid ${line}`, color: paper, fontSize: 12.5 }
+          },
+          /* @__PURE__ */ React.createElement("option", { value: "__auto__" }, "Auto (let the app guess)"),
+          /* @__PURE__ */ React.createElement("option", { value: "__none__" }, "No match"),
+          day.dayActuals.map((a) => /* @__PURE__ */ React.createElement("option", { key: a.key, value: a.key }, a.activityType, " \xB7 ", a.durationMin, "m \xB7 ", a.name))
+        ), !hasOverride && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: dim, marginTop: 2 } }, "Auto-detected", actual ? ` \u2014 matched to "${actual.name}"` : " \u2014 no match found"));
+      }), day.dayActuals.length === 0 && day.pairs.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim } }, "No Strava/intervals.icu activities synced for this day.")));
+    })(), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " Import schedule from file"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file. It's saved under ", /* @__PURE__ */ React.createElement("code", null, "schedule_sources/"), " and re-imported automatically from then on whenever that file's contents change \u2014 no need to come back here and re-upload it."), /* @__PURE__ */ React.createElement(
       "div",
       {
         onDragOver: (e) => {

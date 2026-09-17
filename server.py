@@ -1159,6 +1159,49 @@ class Handler(BaseHTTPRequestHandler):
             update_store(mutate)
             return self._send_json({"ok": True, "date": date})
 
+        # Manual correction for the Schedule tab's auto-matched planned-vs-
+        # actual pairing (which is only ever a same-activity-type-plus-
+        # closest-duration guess). Per-date merge, same reasoning as the
+        # nutrition/weight endpoints above: two devices/tabs correcting
+        # different days at once must not clobber each other.
+        #   {"plannedKey": "...", "actualKey": "<key>"}      -> force that match
+        #   {"plannedKey": "...", "actualKey": null}         -> force "no match"
+        #   {"plannedKey": "..."}  (no actualKey field at all) -> clear the
+        #     override for that plannedKey, reverting to the auto-guess
+        if path == "/api/schedule/match-override":
+            date = qs.get("date", [None])[0]
+            if not date or not DATE_RE.match(date):
+                return self._send_json({"error": "missing or invalid date (expected YYYY-MM-DD)"}, 400)
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError:
+                return self._send_json({"error": "invalid JSON body"}, 400)
+            planned_key = body.get("plannedKey") if isinstance(body, dict) else None
+            if not planned_key:
+                return self._send_json({"error": "missing plannedKey"}, 400)
+            clear = not (isinstance(body, dict) and "actualKey" in body)
+            actual_key = None if clear else body.get("actualKey")
+
+            def mutate(s):
+                overrides = s.get("schedule-match-overrides") or {}
+                day = dict(overrides.get(date) or {})
+                if clear:
+                    day.pop(planned_key, None)
+                else:
+                    day[planned_key] = actual_key
+                if day:
+                    overrides[date] = day
+                else:
+                    overrides.pop(date, None)
+                s["schedule-match-overrides"] = overrides
+                return s
+            result = update_store(mutate)
+            return self._send_json({
+                "ok": True,
+                "date": date,
+                "overrides": result.get("schedule-match-overrides", {}).get(date, {}),
+            })
+
         if path == "/api/nutrition/bulk":
             try:
                 body = self._read_json_body()

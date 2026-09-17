@@ -191,6 +191,16 @@
     if (!res.ok) throw new Error(data.error || `Import failed (${res.status}).`);
     return data.count;
   }
+  async function apiImportScheduleFile(filename, data) {
+    const res = await fetchWithRetry("/api/schedule/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename, data })
+    });
+    const result = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(result.error || `Import failed (${res.status}).`);
+    return result;
+  }
   async function apiSaveWeightDay(date, kg) {
     const res = await fetchWithRetry(`/api/weight/day?date=${date}`, {
       method: "POST",
@@ -687,6 +697,27 @@
         },
         error: (err) => setImportError("Could not parse CSV: " + err.message)
       });
+    }
+    const [scheduleImportError, setScheduleImportError] = useState(null);
+    const [scheduleImportNotice, setScheduleImportNotice] = useState(null);
+    async function handleScheduleFile(file) {
+      setScheduleImportError(null);
+      setScheduleImportNotice(null);
+      try {
+        let parsed;
+        try {
+          parsed = JSON.parse(await file.text());
+        } catch (e) {
+          throw new Error(`"${file.name}" isn't valid JSON.`);
+        }
+        const result = await apiImportScheduleFile(file.name, parsed);
+        setSchedule(result.schedule);
+        setScheduleImportNotice(
+          `Imported "${result.filename}" as source "${result.source}" \u2014 it'll auto-reimport from now on whenever that file's contents change.`
+        );
+      } catch (e) {
+        setScheduleImportError(e.message || "Import failed.");
+      }
     }
     async function syncGoogleSheet() {
       if (!googleStatus.connected) return;
@@ -1187,7 +1218,10 @@
         onUpdate: updateScheduleEntry,
         onDelete: deleteScheduleEntry,
         stravaData,
-        intervalsData
+        intervalsData,
+        onImportFile: handleScheduleFile,
+        importFileError: scheduleImportError,
+        importFileNotice: scheduleImportNotice
       }
     ), tab === "dashboard" && /* @__PURE__ */ React.createElement(
       DashboardTab,
@@ -1638,11 +1672,22 @@
       transition: "background 0.3s, border-color 0.3s"
     };
   }
-  function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData }) {
+  function ScheduleTab({
+    schedule,
+    onAdd,
+    onUpdate,
+    onDelete,
+    stravaData,
+    intervalsData,
+    onImportFile,
+    importFileError,
+    importFileNotice
+  }) {
     var _a;
     const [form, setForm] = useState(emptyScheduleForm());
     const [editingId, setEditingId] = useState(null);
     const [highlightIds, setHighlightIds] = useState([]);
+    const [scheduleDragOver, setScheduleDragOver] = useState(false);
     const itemRefs = useRef({});
     const activityLibrary = useMemo(
       () => getActivityLibrary(stravaData, intervalsData),
@@ -1861,7 +1906,43 @@
           isPreloadWorthy(s) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink })
         ))
       );
-    }))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: form.kind === "race" ? ICONS.trophy : ICONS.calendar, size: 16, color: cyan }), " ", editingId ? "Edit scheduled session" : "Add to schedule"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, form.kind === "race" ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days." : form.kind === "single" ? "A single session on one specific date \u2014 doesn't repeat, and won't affect any other day." : /* @__PURE__ */ React.createElement(React.Fragment, null, "Repeats on the days you pick, within the date range. Projects up to ", FORWARD_DAYS, " days ahead on the dashboard as an estimate \u2014 once a real activity syncs in for that day, it takes over automatically.")), !editingId && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4, marginBottom: 16 } }, /* @__PURE__ */ React.createElement(
+    }))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " Import schedule from file"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file. It's saved under ", /* @__PURE__ */ React.createElement("code", null, "schedule_sources/"), " and re-imported automatically from then on whenever that file's contents change \u2014 no need to come back here and re-upload it."), /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        onDragOver: (e) => {
+          e.preventDefault();
+          setScheduleDragOver(true);
+        },
+        onDragLeave: () => setScheduleDragOver(false),
+        onDrop: (e) => {
+          e.preventDefault();
+          setScheduleDragOver(false);
+          if (e.dataTransfer.files[0]) onImportFile(e.dataTransfer.files[0]);
+        },
+        style: {
+          border: `1.5px dashed ${scheduleDragOver ? cyan : line}`,
+          borderRadius: 6,
+          padding: "28px 20px",
+          textAlign: "center",
+          background: scheduleDragOver ? "rgba(79,209,217,0.05)" : "transparent",
+          transition: "all 0.15s"
+        }
+      },
+      /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "center", marginBottom: 10 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 22, color: dim })),
+      /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, marginBottom: 12 } }, "Drop a .json schedule file here, or"),
+      /* @__PURE__ */ React.createElement("label", { className: "btn-ghost", style: { display: "inline-block" } }, "Choose file", /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "file",
+          accept: ".json,application/json",
+          style: { display: "none" },
+          onChange: (e) => {
+            if (e.target.files[0]) onImportFile(e.target.files[0]);
+            e.target.value = "";
+          }
+        }
+      ))
+    ), importFileError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, importFileError), !importFileError && importFileNotice && /* @__PURE__ */ React.createElement(Banner, { kind: "success" }, importFileNotice)), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: form.kind === "race" ? ICONS.trophy : ICONS.calendar, size: 16, color: cyan }), " ", editingId ? "Edit scheduled session" : "Add to schedule"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, form.kind === "race" ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days." : form.kind === "single" ? "A single session on one specific date \u2014 doesn't repeat, and won't affect any other day." : /* @__PURE__ */ React.createElement(React.Fragment, null, "Repeats on the days you pick, within the date range. Projects up to ", FORWARD_DAYS, " days ahead on the dashboard as an estimate \u2014 once a real activity syncs in for that day, it takes over automatically.")), !editingId && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4, marginBottom: 16 } }, /* @__PURE__ */ React.createElement(
       "button",
       {
         type: "button",

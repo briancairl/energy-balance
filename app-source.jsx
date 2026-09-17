@@ -202,6 +202,16 @@ async function apiSaveNutritionBulk(days) {
   if (!res.ok) throw new Error(data.error || `Import failed (${res.status}).`);
   return data.count;
 }
+async function apiImportScheduleFile(filename, data) {
+  const res = await fetchWithRetry("/api/schedule/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename, data }),
+  });
+  const result = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(result.error || `Import failed (${res.status}).`);
+  return result;
+}
 async function apiSaveWeightDay(date, kg) {
   const res = await fetchWithRetry(`/api/weight/day?date=${date}`, {
     method: "POST",
@@ -847,6 +857,34 @@ function App() {
     });
   }
 
+  const [scheduleImportError, setScheduleImportError] = useState(null);
+  const [scheduleImportNotice, setScheduleImportNotice] = useState(null);
+  async function handleScheduleFile(file) {
+    setScheduleImportError(null);
+    setScheduleImportNotice(null);
+    try {
+      let parsed;
+      try {
+        parsed = JSON.parse(await file.text());
+      } catch (e) {
+        throw new Error(`"${file.name}" isn't valid JSON.`);
+      }
+      const result = await apiImportScheduleFile(file.name, parsed);
+      // The server already wrote this into the store — updating local state
+      // straight from its response (rather than re-running storageSet, which
+      // would just PUT the same array right back) keeps this tab in sync so
+      // the next hand-edit's wholesale save can't clobber what was just
+      // imported with a stale in-memory copy.
+      setSchedule(result.schedule);
+      setScheduleImportNotice(
+        `Imported "${result.filename}" as source "${result.source}" — ` +
+        `it'll auto-reimport from now on whenever that file's contents change.`
+      );
+    } catch (e) {
+      setScheduleImportError(e.message || "Import failed.");
+    }
+  }
+
   async function syncGoogleSheet() {
     if (!googleStatus.connected) return;
     setGoogleFetching(true);
@@ -1437,7 +1475,9 @@ function App() {
         )}
         {tab === "schedule" && (
           <ScheduleTab schedule={schedule} onAdd={addScheduleEntry} onUpdate={updateScheduleEntry}
-            onDelete={deleteScheduleEntry} stravaData={stravaData} intervalsData={intervalsData} />
+            onDelete={deleteScheduleEntry} stravaData={stravaData} intervalsData={intervalsData}
+            onImportFile={handleScheduleFile} importFileError={scheduleImportError}
+            importFileNotice={scheduleImportNotice} />
         )}
         {tab === "dashboard" && (
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
@@ -2277,10 +2317,12 @@ function scheduleRowStyle(highlighted) {
   };
 }
 
-function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData }) {
+function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData,
+  onImportFile, importFileError, importFileNotice }) {
   const [form, setForm] = useState(emptyScheduleForm());
   const [editingId, setEditingId] = useState(null);
   const [highlightIds, setHighlightIds] = useState([]);
+  const [scheduleDragOver, setScheduleDragOver] = useState(false);
   const itemRefs = useRef({});
 
   const activityLibrary = useMemo(
@@ -2485,6 +2527,36 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
             );
           })}
         </div>
+      </div>
+
+      <div className="card" style={{ padding: 22 }}>
+        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
+          <Icon path={ICONS.upload} size={16} color={cyan} /> Import schedule from file
+        </div>
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+          Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file.
+          It's saved under <code>schedule_sources/</code> and re-imported automatically from then on
+          whenever that file's contents change — no need to come back here and re-upload it.
+        </div>
+        <div
+          onDragOver={(e) => { e.preventDefault(); setScheduleDragOver(true); }}
+          onDragLeave={() => setScheduleDragOver(false)}
+          onDrop={(e) => { e.preventDefault(); setScheduleDragOver(false); if (e.dataTransfer.files[0]) onImportFile(e.dataTransfer.files[0]); }}
+          style={{
+            border: `1.5px dashed ${scheduleDragOver ? cyan : line}`, borderRadius: 6, padding: "28px 20px",
+            textAlign: "center", background: scheduleDragOver ? "rgba(79,209,217,0.05)" : "transparent", transition: "all 0.15s",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}><Icon path={ICONS.upload} size={22} color={dim} /></div>
+          <div style={{ fontSize: 13, marginBottom: 12 }}>Drop a .json schedule file here, or</div>
+          <label className="btn-ghost" style={{ display: "inline-block" }}>
+            Choose file
+            <input type="file" accept=".json,application/json" style={{ display: "none" }}
+              onChange={(e) => { if (e.target.files[0]) onImportFile(e.target.files[0]); e.target.value = ""; }} />
+          </label>
+        </div>
+        {importFileError && <Banner kind="error">{importFileError}</Banner>}
+        {!importFileError && importFileNotice && <Banner kind="success">{importFileNotice}</Banner>}
       </div>
 
       <div className="card" style={{ padding: 22 }}>

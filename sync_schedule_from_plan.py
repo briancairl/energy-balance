@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-sync_schedule_from_plan.py — feed the "Road to Placid" IRONMAN training plan
-into energy-balance's `training-schedule` store key.
+sync_schedule_from_plan.py — manually run (or dry-run) the training-plan
+import that server.py otherwise does automatically in the background.
 
 WHAT THIS DOES
 ---------------
@@ -11,68 +11,43 @@ energy-balance only ever consults `training-schedule` for two things:
      that date (see getScheduledSessionsForDate / dailyRows in app-source.jsx).
   2. Auto-taper and carb-loading, which look at the *nearest upcoming race*
      regardless of how far out it is (getUpcomingRace).
-So this script does two different things on two different time horizons:
-  - RACES: every race in the plan gets a `kind: "race"` entry, added once,
-    since taper/carb-load math needs the full race calendar no matter how
-    far away the race is. Skipped if a race entry with the same date already
-    exists (so it never clobbers a race you entered by hand).
-  - SESSIONS: only the next `--weeks-ahead` weeks (default 8) of the plan get
-    turned into schedule entries, one per session, as `kind: "single"`
-    entries (a `date`, not a weekly recurrence) — these don't repeat and
-    don't show up in the app's "Recurring sessions" list, since each one
-    really is a one-off day out of the plan, not an actual weekly pattern.
-    That's plenty for the 4-day lookahead + preload logic, and re-running
-    this script periodically (weekly is plenty) keeps the window fresh as
-    the plan progresses — there's no point encoding a year of sessions up
-    front when the app never looks more than a few days into the future for
-    them.
+So importing a plan does two different things on two different time horizons
+— see schedule_sync.sync_plan_into_store for the full logic (shared with the
+background importer in server.py, not duplicated here):
+  - RACES: every race in the plan gets a `kind: "race"` entry, added once.
+  - SESSIONS: only the next `--weeks-ahead` weeks (default 8) become
+    `kind: "single"` schedule entries.
 
-Every entry this script creates is tagged `"source": "road_to_placid"` so a
-re-run can cleanly replace its own old entries without touching anything you
-added by hand in the app's UI. Entries without that tag are never touched or
-removed — except: any of YOUR OWN open-ended recurring entries (endDate is
-null) that overlap the sync window get their endDate capped to the day
-before the window starts, since otherwise they'd keep firing forever and
-double-count against what this script adds. This is printed every time it
-happens — nothing is silently changed.
+Every plan file in schedule_sources/ is tagged with its own source (its
+filename minus ".json"), so importing several plans at once never confuses
+one file's entries for another's, and re-importing a file only replaces that
+file's own previously-synced entries — anything you added by hand in the
+app's UI is left untouched.
+
+AUTOMATIC IMPORTS
+------------------
+server.py already watches every schedule_sources/*.json file and re-imports
+one automatically (via content hash, not mtime) within ~30s of it changing —
+no restart needed, and this script does NOT need to be run for that to work.
+This script exists for manual/offline use: previewing what a change would do
+before saving it (--dry-run), or forcing a re-import without waiting.
 
 USAGE
 -----
     python3 sync_schedule_from_plan.py [--weeks-ahead 8] [--dry-run]
+    python3 sync_schedule_from_plan.py --file some_plan.json [--dry-run]
 
-Run it from inside the energy-balance project directory (it looks for
-app_store.json and road_to_placid_plan.json next to itself). The server
-(server.py) reads app_store.json fresh on every request — no restart needed
-after this runs.
-
-Re-generate road_to_placid_plan.json whenever the underlying plan changes
-(e.g. a re-published version of the "Road to Placid" artifact) — this
-script only reads it, it doesn't fetch anything live.
+With no --file, every schedule_sources/*.json file is synced. Run it from
+inside the energy-balance project directory (it looks for app_store.json and
+schedule_sources/ next to itself).
 """
-import json, os, sys, argparse, random, string, datetime as dt
+import json, os, sys, argparse
+
+import schedule_sync
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STORE_PATH = os.path.join(HERE, "app_store.json")
-PLAN_PATH = os.path.join(HERE, "road_to_placid_plan.json")
-SOURCE_TAG = "road_to_placid"
-
-DISC_TO_ACTIVITY = {"swim": "Swim", "bike": "Ride", "run": "Run", "strength": "Strength"}
-SKIP_DISC = {"rest", "walk"}
-
-RACE_TUNING = {
-    # plan race id -> (taperDays, zone)
-    "oly2026": (7, 2),        # already hand-entered by the athlete; left alone if present
-    "half2026": (4, 3),
-    "marathon2026": (10, 3),
-    "lp2027": (14, 3),
-    "li703_2027": (7, 3),
-}
-
-
-def gen_id(offset=0):
-    ms = int(dt.datetime.now().timestamp() * 1000) + offset
-    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
-    return f"{ms}-{suffix}"
+SOURCES_DIR = os.path.join(HERE, "schedule_sources")
 
 
 def load_json(path, default):
@@ -89,155 +64,38 @@ def save_json_atomic(path, data):
     os.replace(tmp, path)
 
 
-def classify_zone(disc, title, detail):
-    if disc == "strength":
-        return 1
-    text = f"{title} {detail}".lower()
-    if "recovery" in text and "spin" in text:
-        return 1
-    if any(k in text for k in ["dress rehearsal", "marathon pace", "tempo", "race power",
-                                "race-pace", "race pace", "hills", "surges", "70.3 pace"]):
-        return 3
-    return 2
-
-
-def short_note(title):
-    # "Swim — Technique" -> "Technique", "Bike — Long w/ Climbing" -> "Long w/ Climbing"
-    if "—" in title:
-        return title.split("—", 1)[1].strip()
-    return title
-
-
-def covered_by_existing(session_date, kept_entries):
-    """True if a KEPT (hand-entered, non-road_to_placid) recurring or single
-    entry already applies to this date — regardless of activity type.
-    Prevents double-counting a day the athlete already has their own entry
-    for, which matters on the very first sync (today can fall inside a
-    hand-managed near-term window, e.g. a taper the athlete already set up
-    before this script ever ran)."""
-    js_weekday = (session_date.weekday() + 1) % 7
-    iso = session_date.isoformat()
-    for e in kept_entries:
-        if e.get("kind") == "race":
-            continue
-        if e.get("kind") == "single":
-            if e.get("date") == iso:
-                return True
-            continue
-        days = e.get("daysOfWeek") or []
-        if js_weekday not in days:
-            continue
-        if iso < e.get("startDate", "0000-00-00"):
-            continue
-        end = e.get("endDate")
-        if end and iso > end:
-            continue
-        return True
-    return False
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weeks-ahead", type=int, default=8,
                      help="How many weeks of recurring sessions to sync from today (default 8).")
+    ap.add_argument("--file", help="Sync just this one plan file instead of every "
+                                    "schedule_sources/*.json file. Its source tag is its "
+                                    "filename minus '.json'.")
     ap.add_argument("--dry-run", action="store_true", help="Print what would change, write nothing.")
     args = ap.parse_args()
 
-    if not os.path.exists(PLAN_PATH):
-        sys.exit(f"Missing {PLAN_PATH} — copy the Road to Placid plan export here first.")
-    plan = load_json(PLAN_PATH, None)
+    if args.file:
+        path = os.path.abspath(args.file)
+        if not os.path.exists(path):
+            sys.exit(f"Missing {path}")
+        sources = [(path, os.path.basename(path).removesuffix(".json"))]
+    else:
+        sources = schedule_sync.discover_schedule_sources(SOURCES_DIR)
+        if not sources:
+            sys.exit(f"No *.json files found in {SOURCES_DIR} — drop a plan export there first.")
+
     store = load_json(STORE_PATH, {})
-    schedule = store.get("training-schedule", [])
 
-    today = dt.date.today()
-    window_start = today
-    window_end = today + dt.timedelta(weeks=args.weeks_ahead)
-
-    existing_race_dates = {e["raceDate"] for e in schedule if e.get("kind") == "race"}
-
-    kept = [e for e in schedule if e.get("source") != SOURCE_TAG]
-    capped_log = []
-    for e in kept:
-        if e.get("kind") in ("race", "single"):
+    for path, source_tag in sources:
+        plan = load_json(path, None)
+        if plan is None:
+            print(f"[{source_tag}] skipped — {path} not found")
             continue
-        if e.get("endDate") in (None, ""):
-            new_end = (window_start - dt.timedelta(days=1)).isoformat()
-            capped_log.append((e.get("id"), e.get("notes") or e.get("activityType"), new_end))
-            e["endDate"] = new_end
-
-    new_entries = []
-
-    # --- races (whole calendar, not window-limited) ---
-    for race in plan["meta"]["races"]:
-        if race["date"] in existing_race_dates:
-            continue
-        taper_days, zone = RACE_TUNING.get(race["id"], (7, 3))
-        duration_lookup = {
-            "oly2026": 100, "half2026": 105, "marathon2026": 240,
-            "lp2027": 720, "li703_2027": 300,
-        }
-        new_entries.append({
-            "id": gen_id(len(new_entries)),
-            "kind": "race",
-            "activityType": "Other",
-            "zone": zone,
-            "durationMin": duration_lookup.get(race["id"], 120),
-            "raceDate": race["date"],
-            "taperDays": taper_days,
-            "notes": race["name"],
-            "source": SOURCE_TAG,
-        })
-
-    # --- recurring sessions, window-limited ---
-    n_sessions = 0
-    n_skipped_conflict = 0
-    for week in plan["weeks"]:
-        week_start = dt.date.fromisoformat(week["weekStart"])
-        if week_start > window_end:
-            continue
-        week_end = dt.date.fromisoformat(week["weekEnd"])
-        if week_end < window_start:
-            continue
-        for s in week["sessions"]:
-            disc = s["disc"]
-            if disc in SKIP_DISC or s["mins"] <= 0:
-                continue
-            if s["title"].upper().startswith("RACE"):
-                continue  # represented by the race entry instead
-            activity_type = DISC_TO_ACTIVITY.get(disc)
-            if not activity_type:
-                continue
-            day_offset = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].index(s["day"])
-            session_date = week_start + dt.timedelta(days=day_offset)
-            if not (window_start <= session_date <= window_end):
-                continue
-            if covered_by_existing(session_date, kept):
-                n_skipped_conflict += 1
-                continue
-            new_entries.append({
-                "id": gen_id(len(new_entries) + 1000),
-                "kind": "single",
-                "activityType": activity_type,
-                "zone": classify_zone(disc, s["title"], s.get("detail", "")),
-                "durationMin": s["mins"],
-                "date": session_date.isoformat(),
-                "notes": short_note(s["title"]),
-                "source": SOURCE_TAG,
-            })
-            n_sessions += 1
-
-    final_schedule = kept + new_entries
-    store["training-schedule"] = final_schedule
-
-    print(f"Window: {window_start} .. {window_end} ({args.weeks_ahead} weeks)")
-    print(f"Kept {len(kept)} existing entries (not created by this script).")
-    for eid, label, new_end in capped_log:
-        print(f"  capped open-ended entry {eid!r} ({label!r}) -> endDate {new_end}")
-    n_races_added = sum(1 for e in new_entries if e.get("kind") == "race")
-    print(f"Added {n_races_added} race entries, {n_sessions} single session entries.")
-    if n_skipped_conflict:
-        print(f"Skipped {n_skipped_conflict} plan session(s) that overlapped a date you already had your own entry for.")
-    print(f"Total training-schedule entries after sync: {len(final_schedule)}")
+        new_schedule, lines = schedule_sync.sync_source_into_store(
+            store, plan, source_tag, weeks_ahead=args.weeks_ahead)
+        store["training-schedule"] = new_schedule
+        for line in lines:
+            print(line)
 
     if args.dry_run:
         print("(dry run — nothing written)")

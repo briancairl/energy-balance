@@ -106,6 +106,8 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import schedule_sync
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 TOKENS_PATH = os.path.join(HERE, "tokens.json")
@@ -113,6 +115,7 @@ GOOGLE_TOKENS_PATH = os.path.join(HERE, "google_tokens.json")
 CACHE_PATH = os.path.join(HERE, "strava_cache.json")
 INTERVALS_CACHE_PATH = os.path.join(HERE, "intervals_cache.json")
 STORE_PATH = os.path.join(HERE, "app_store.json")
+SCHEDULE_SOURCES_DIR = os.path.join(HERE, "schedule_sources")
 TLS_CERT_PATH = os.path.join(HERE, "tailscale.crt")
 TLS_KEY_PATH = os.path.join(HERE, "tailscale.key")
 
@@ -547,6 +550,74 @@ def google_auto_sync_loop():
             print(f"[google-sync] {result}")
         except Exception as e:
             print(f"[google-sync] failed: {e}")
+
+
+def schedule_sources_sync_loop(poll_seconds=30):
+    """Watches every schedule_sources/*.json file and re-imports one the
+    moment its content changes — detected by sha256, not mtime, so a touch
+    or a checkout that doesn't actually change the plan can't trigger a
+    pointless re-import. Hashes are kept in the store itself
+    (schedule-source-hashes) so a server restart doesn't re-import every
+    file from scratch. A file that fails to parse is logged and its bad
+    hash is still recorded, so it's only retried once its content changes
+    again (e.g. once you fix it) rather than every poll."""
+    while True:
+        time.sleep(poll_seconds)
+        try:
+            sources = schedule_sync.discover_schedule_sources(SCHEDULE_SOURCES_DIR)
+        except OSError as e:
+            print(f"[schedule-sync] failed to list {SCHEDULE_SOURCES_DIR}: {e}")
+            continue
+
+        for path, source_tag in sources:
+            try:
+                new_hash = schedule_sync.file_sha256(path)
+            except OSError as e:
+                print(f"[schedule-sync] {source_tag}: could not read {path}: {e}")
+                continue
+
+            store = load_store()
+            old_hash = (store.get("schedule-source-hashes") or {}).get(source_tag)
+            if old_hash == new_hash:
+                continue
+
+            try:
+                with open(path) as f:
+                    plan = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"[schedule-sync] {source_tag}: invalid JSON in {path}: {e}")
+
+                def mark_bad(s, tag=source_tag, h=new_hash):
+                    hashes = s.setdefault("schedule-source-hashes", {})
+                    hashes[tag] = h
+                    return s
+                update_store(mark_bad)
+                continue
+
+            try:
+                def mutate(s, plan=plan, tag=source_tag, h=new_hash):
+                    new_schedule, lines = schedule_sync.sync_source_into_store(s, plan, tag)
+                    s["training-schedule"] = new_schedule
+                    hashes = s.setdefault("schedule-source-hashes", {})
+                    hashes[tag] = h
+                    for line in lines:
+                        print(f"[schedule-sync] {line}")
+                    return s
+                update_store(mutate)
+            except Exception as e:
+                # A syntactically-valid-JSON-but-wrong-shape file (missing keys
+                # a plan/entries file is expected to have) must not take the
+                # whole background thread down with it — every other source
+                # file would silently stop auto-importing too. Log it and mark
+                # the hash bad, same as the JSON-parse-failure case above, so
+                # it's only retried once the file's content actually changes.
+                print(f"[schedule-sync] {source_tag}: import failed: {e}")
+
+                def mark_bad(s, tag=source_tag, h=new_hash):
+                    hashes = s.setdefault("schedule-source-hashes", {})
+                    hashes[tag] = h
+                    return s
+                update_store(mark_bad)
 
 
 def ensure_auth_config():
@@ -1105,6 +1176,65 @@ class Handler(BaseHTTPRequestHandler):
             update_store(mutate)
             return self._send_json({"ok": True, "count": len(days)})
 
+        # Lets the browser's own file picker/drop zone (ScheduleTab) trigger
+        # the same import schedule_sources_sync_loop does automatically in
+        # the background — but immediately, with a real success/error result
+        # to show in the UI, instead of waiting up to poll_seconds for the
+        # next poll. The uploaded file is also saved into schedule_sources/
+        # so it's a first-class watched source from then on: editing it later
+        # and dropping it in again (or just leaving the original file there,
+        # if this was uploaded from that same directory) keeps working through
+        # the normal hash-based auto-reimport, no re-upload required.
+        if path == "/api/schedule/import":
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError:
+                return self._send_json({"error": "invalid JSON body"}, 400)
+            if not isinstance(body, dict):
+                return self._send_json({"error": "expected a JSON object with 'filename' and 'data'"}, 400)
+            data = body.get("data")
+            if data is None:
+                return self._send_json({"error": "missing 'data'"}, 400)
+            safe_name = schedule_sync.sanitize_source_filename(body.get("filename"))
+            if not safe_name:
+                return self._send_json(
+                    {"error": "filename must contain at least one letter, digit, '.', '_' or '-'"}, 400)
+            source_tag = safe_name[:-len(".json")]
+
+            os.makedirs(SCHEDULE_SOURCES_DIR, exist_ok=True)
+            dest_path = os.path.join(SCHEDULE_SOURCES_DIR, safe_name)
+            save_json(dest_path, data)
+            new_hash = schedule_sync.file_sha256(dest_path)
+
+            summary = []
+            try:
+                def mutate(s):
+                    new_schedule, lines = schedule_sync.sync_source_into_store(s, data, source_tag)
+                    s["training-schedule"] = new_schedule
+                    hashes = s.setdefault("schedule-source-hashes", {})
+                    hashes[source_tag] = new_hash
+                    summary.extend(lines)
+                    return s
+                result = update_store(mutate)
+            except Exception as e:
+                # The file is left in place either way — a broken upload is
+                # still visible/fixable in schedule_sources/ rather than
+                # vanishing — but the hash is intentionally NOT recorded here,
+                # so a later fix to the same filename (different content, thus
+                # a different hash) is picked up on the very next poll rather
+                # than needing another manual upload.
+                return self._send_json({"error": f"could not import {safe_name}: {e}"}, 400)
+
+            for line in summary:
+                print(f"[schedule-import] {line}")
+            return self._send_json({
+                "ok": True,
+                "source": source_tag,
+                "filename": safe_name,
+                "summary": summary,
+                "schedule": result["training-schedule"],
+            })
+
         if path == "/api/weight/day":
             date = qs.get("date", [None])[0]
             if not date or not DATE_RE.match(date):
@@ -1215,6 +1345,10 @@ def main():
     if get_google_config():
         threading.Thread(target=google_auto_sync_loop, daemon=True).start()
         print("  Google Sheets auto-sync scheduled (set google_sync_time in config.json, default 04:00).")
+
+    threading.Thread(target=schedule_sources_sync_loop, daemon=True).start()
+    n_sources = len(schedule_sync.discover_schedule_sources(SCHEDULE_SOURCES_DIR))
+    print(f"  Watching schedule_sources/ for training-plan changes ({n_sources} file(s) found).")
 
     if generated:
         print("  🔑 Generated login credentials (saved to config.json):")

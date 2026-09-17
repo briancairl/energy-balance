@@ -422,6 +422,21 @@
     if (daysToRace <= 0 || daysToRace > CARB_LOAD_DAYS) return null;
     return { race, daysToRace };
   }
+  function matchDayActivities(plannedItems, actuals) {
+    const remaining = actuals.slice();
+    const pairs = [];
+    for (const planned of plannedItems) {
+      const candidates = remaining.filter((a) => a.activityType === planned.activityType);
+      let match = null;
+      if (candidates.length) {
+        candidates.sort((a, b) => Math.abs(a.durationMin - planned.durationMin) - Math.abs(b.durationMin - planned.durationMin));
+        match = candidates[0];
+        remaining.splice(remaining.indexOf(match), 1);
+      }
+      pairs.push({ planned, actual: match });
+    }
+    return { pairs, extras: remaining };
+  }
   const KCAL_PER_KG_TISSUE = 7700;
   const GOAL_DEFAULTS = {
     build: { ratePct: 0.25, min: 0.1, max: 0.75 },
@@ -1693,6 +1708,11 @@
       () => getActivityLibrary(stravaData, intervalsData),
       [stravaData, intervalsData]
     );
+    const actualsByDate = useMemo(() => {
+      const map = {};
+      for (const a of activityLibrary) (map[a.date] || (map[a.date] = [])).push(a);
+      return map;
+    }, [activityLibrary]);
     function applySourceActivity(key) {
       const src = activityLibrary.find((a) => a.key === key);
       if (!src) {
@@ -1831,13 +1851,96 @@
       const { sessions, taper } = getEffectiveSessionsForDate(schedule, key);
       const raceToday = races.find((r) => r.raceDate === key);
       const carbLoad = getCarbLoadState(schedule, key);
-      calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad });
+      const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
+      const { pairs, extras } = matchDayActivities(plannedItems, actualsByDate[key] || []);
+      calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras });
     }
     const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "Next 3 weeks"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "Next 3 weeks"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, "solid = planned, outline = actual ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 10, color: mint }), " matched")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
       const isToday = day.key === todayKey;
+      const isPast = day.key < todayKey;
       const isFirstOfMonth = day.date.getDate() === 1;
       const clickable = day.sessions.length > 0 || !!day.race;
+      function plannedChip(planned, i) {
+        if (planned.isRace) {
+          return /* @__PURE__ */ React.createElement(
+            "div",
+            {
+              key: `p${i}`,
+              title: `Race: ${planned.notes || planned.activityType} \xB7 ${planned.durationMin}min`,
+              style: {
+                background: gold,
+                color: ink,
+                borderRadius: 3,
+                padding: "2px 5px",
+                fontSize: 10.5,
+                lineHeight: 1.3,
+                fontWeight: 700,
+                display: "flex",
+                alignItems: "center",
+                gap: 3
+              }
+            },
+            /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 9, color: ink }),
+            " ",
+            planned.notes || planned.activityType
+          );
+        }
+        return /* @__PURE__ */ React.createElement(
+          "div",
+          {
+            key: `p${i}`,
+            title: `${planned.activityType} \xB7 ${ZONES[planned.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${planned.durationMin}min${planned.notes ? ` \xB7 ${planned.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}`,
+            style: {
+              background: ACTIVITY_COLORS[planned.activityType] || dim,
+              color: ink,
+              borderRadius: 3,
+              padding: "2px 5px",
+              fontSize: 10.5,
+              lineHeight: 1.3,
+              fontWeight: 600,
+              display: "flex",
+              alignItems: "center",
+              gap: 3,
+              opacity: day.taper ? 0.65 : 1
+            }
+          },
+          planned.activityType,
+          " Z",
+          planned.zone,
+          " \xB7 ",
+          planned.durationMin,
+          "m",
+          isPreloadWorthy(planned) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink })
+        );
+      }
+      function actualChip(actual, matched, i) {
+        const color = ACTIVITY_COLORS[actual.activityType] || dim;
+        return /* @__PURE__ */ React.createElement(
+          "div",
+          {
+            key: `a${i}`,
+            title: `${actual.name} \xB7 ${actual.activityType} \xB7 ${actual.durationMin}min${matched ? " \xB7 matched to the plan" : " \xB7 not on the schedule"}`,
+            style: {
+              border: `1px solid ${color}`,
+              color,
+              borderRadius: 3,
+              padding: "2px 5px",
+              fontSize: 10.5,
+              lineHeight: 1.3,
+              fontWeight: 600,
+              display: "flex",
+              alignItems: "center",
+              gap: 3
+            }
+          },
+          matched && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 9, color }),
+          actual.activityType,
+          " \xB7 ",
+          actual.durationMin,
+          "m"
+        );
+      }
       return /* @__PURE__ */ React.createElement(
         "div",
         {
@@ -1853,58 +1956,13 @@
             display: "flex",
             flexDirection: "column",
             gap: 3,
-            cursor: clickable ? "pointer" : "default"
+            cursor: clickable ? "pointer" : "default",
+            opacity: isPast ? 0.5 : 1
           }
         },
         /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold }))),
-        day.race && /* @__PURE__ */ React.createElement(
-          "div",
-          {
-            title: `Race: ${day.race.notes || day.race.activityType} \xB7 ${day.race.durationMin}min`,
-            style: {
-              background: gold,
-              color: ink,
-              borderRadius: 3,
-              padding: "2px 5px",
-              fontSize: 10.5,
-              lineHeight: 1.3,
-              fontWeight: 700,
-              display: "flex",
-              alignItems: "center",
-              gap: 3
-            }
-          },
-          /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 9, color: ink }),
-          " ",
-          day.race.notes || day.race.activityType
-        ),
-        day.sessions.map((s, i) => /* @__PURE__ */ React.createElement(
-          "div",
-          {
-            key: i,
-            title: `${s.activityType} \xB7 ${ZONES[s.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${s.durationMin}min${s.notes ? ` \xB7 ${s.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}`,
-            style: {
-              background: ACTIVITY_COLORS[s.activityType] || dim,
-              color: ink,
-              borderRadius: 3,
-              padding: "2px 5px",
-              fontSize: 10.5,
-              lineHeight: 1.3,
-              fontWeight: 600,
-              display: "flex",
-              alignItems: "center",
-              gap: 3,
-              opacity: day.taper ? 0.65 : 1
-            }
-          },
-          s.activityType,
-          " Z",
-          s.zone,
-          " \xB7 ",
-          s.durationMin,
-          "m",
-          isPreloadWorthy(s) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink })
-        ))
+        day.pairs.map(({ planned, actual }, i) => /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i), actual ? actualChip(actual, true, i) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null)),
+        day.extras.map((actual, i) => /* @__PURE__ */ React.createElement("div", { key: `extra${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, /* @__PURE__ */ React.createElement("div", null), actualChip(actual, false, i)))
       );
     }))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " Import schedule from file"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file. It's saved under ", /* @__PURE__ */ React.createElement("code", null, "schedule_sources/"), " and re-imported automatically from then on whenever that file's contents change \u2014 no need to come back here and re-upload it."), /* @__PURE__ */ React.createElement(
       "div",

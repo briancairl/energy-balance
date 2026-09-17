@@ -517,6 +517,32 @@ function getCarbLoadState(schedule, dateStr) {
   return { race, daysToRace };
 }
 
+// Pairs each planned item (a scheduled session, or that day's race) for one
+// calendar day against the real activities synced from Strava/intervals.icu
+// for that same date, so the calendar can show planned-vs-actual side by
+// side instead of just what was planned. Matching is necessarily a guess —
+// there's no ID linking a schedule entry to the activity it became — so it's
+// scoped to same activityType only, then (when a day has more than one
+// candidate of that type, e.g. two runs logged the same day) picks whichever
+// actual duration is closest to what was planned. Greedy and order-dependent,
+// but a single day rarely has enough same-type activities for that to matter.
+function matchDayActivities(plannedItems, actuals) {
+  const remaining = actuals.slice();
+  const pairs = [];
+  for (const planned of plannedItems) {
+    const candidates = remaining.filter((a) => a.activityType === planned.activityType);
+    let match = null;
+    if (candidates.length) {
+      candidates.sort((a, b) =>
+        Math.abs(a.durationMin - planned.durationMin) - Math.abs(b.durationMin - planned.durationMin));
+      match = candidates[0];
+      remaining.splice(remaining.indexOf(match), 1);
+    }
+    pairs.push({ planned, actual: match });
+  }
+  return { pairs, extras: remaining };
+}
+
 // ---------- goal-based calorie targets + weight-trend calibration ----------
 // ~7700 kcal ≈ 1 kg of body tissue is the standard practical approximation used
 // by most sports-nutrition calculators to convert a target rate of weight
@@ -2329,6 +2355,11 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
     () => getActivityLibrary(stravaData, intervalsData),
     [stravaData, intervalsData]
   );
+  const actualsByDate = useMemo(() => {
+    const map = {};
+    for (const a of activityLibrary) (map[a.date] || (map[a.date] = [])).push(a);
+    return map;
+  }, [activityLibrary]);
   function applySourceActivity(key) {
     const src = activityLibrary.find((a) => a.key === key);
     if (!src) { setForm((f) => ({ ...f, sourceActivity: null })); return; }
@@ -2451,7 +2482,9 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
     const { sessions, taper } = getEffectiveSessionsForDate(schedule, key);
     const raceToday = races.find((r) => r.raceDate === key);
     const carbLoad = getCarbLoadState(schedule, key);
-    calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad });
+    const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
+    const { pairs, extras } = matchDayActivities(plannedItems, actualsByDate[key] || []);
+    calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras });
   }
   const todayKey = toLocalISODate(new Date());
 
@@ -2467,6 +2500,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.gauge} size={10} color={lavender} /> tapering</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.trophy} size={10} color={gold} /> race day</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}>solid = planned, outline = actual <Icon path={ICONS.check} size={10} color={mint} /> matched</span>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
           {WEEKDAY_LABELS.map((label) => (
@@ -2474,8 +2508,69 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           ))}
           {calendarDays.map((day) => {
             const isToday = day.key === todayKey;
+            const isPast = day.key < todayKey;
             const isFirstOfMonth = day.date.getDate() === 1;
             const clickable = day.sessions.length > 0 || !!day.race;
+
+            function plannedChip(planned, i) {
+              if (planned.isRace) {
+                return (
+                  <div key={`p${i}`} title={`Race: ${planned.notes || planned.activityType} · ${planned.durationMin}min`}
+                    style={{
+                      background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
+                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3,
+                    }}>
+                    <Icon path={ICONS.trophy} size={9} color={ink} /> {planned.notes || planned.activityType}
+                  </div>
+                );
+              }
+              return (
+                <div key={`p${i}`} title={`${planned.activityType} · ${ZONES[planned.zone - 1].label.split(" · ")[1]} · ${planned.durationMin}min${planned.notes ? ` · ${planned.notes}` : ""}${day.taper ? " · tapered" : ""}`}
+                  style={{
+                    background: ACTIVITY_COLORS[planned.activityType] || dim,
+                    color: ink,
+                    borderRadius: 3,
+                    padding: "2px 5px",
+                    fontSize: 10.5,
+                    lineHeight: 1.3,
+                    fontWeight: 600,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 3,
+                    opacity: day.taper ? 0.65 : 1,
+                  }}>
+                  {planned.activityType} Z{planned.zone} · {planned.durationMin}m
+                  {isPreloadWorthy(planned) && <Icon path={ICONS.flame} size={9} color={ink} />}
+                </div>
+              );
+            }
+            // Outlined rather than filled, so a glance tells "planned" (solid)
+            // apart from "actual" (outline) even before reading either chip —
+            // the checkmark then further distinguishes a real match from an
+            // extra, unscheduled activity that just happens to share a slot.
+            function actualChip(actual, matched, i) {
+              const color = ACTIVITY_COLORS[actual.activityType] || dim;
+              return (
+                <div key={`a${i}`}
+                  title={`${actual.name} · ${actual.activityType} · ${actual.durationMin}min${matched ? " · matched to the plan" : " · not on the schedule"}`}
+                  style={{
+                    border: `1px solid ${color}`,
+                    color,
+                    borderRadius: 3,
+                    padding: "2px 5px",
+                    fontSize: 10.5,
+                    lineHeight: 1.3,
+                    fontWeight: 600,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 3,
+                  }}>
+                  {matched && <Icon path={ICONS.check} size={9} color={color} />}
+                  {actual.activityType} · {actual.durationMin}m
+                </div>
+              );
+            }
+
             return (
               <div key={day.key} onClick={clickable ? () => jumpToDay(day) : undefined}
                 title={clickable ? "Jump to this session in the listings below" : undefined}
@@ -2489,38 +2584,25 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                 flexDirection: "column",
                 gap: 3,
                 cursor: clickable ? "pointer" : "default",
+                opacity: isPast ? 0.5 : 1,
               }}>
                 <div style={{ fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 }}>
                   {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
                   {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
                   {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
                 </div>
-                {day.race && (
-                  <div title={`Race: ${day.race.notes || day.race.activityType} · ${day.race.durationMin}min`}
-                    style={{
-                      background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
-                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3,
-                    }}>
-                    <Icon path={ICONS.trophy} size={9} color={ink} /> {day.race.notes || day.race.activityType}
+                {day.pairs.map(({ planned, actual }, i) => (
+                  <div key={`pair${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
+                    {plannedChip(planned, i)}
+                    {actual ? actualChip(actual, true, i) : (day.key <= todayKey
+                      ? <div style={{ fontSize: 10, color: dim, display: "flex", alignItems: "center" }}>not logged</div>
+                      : null)}
                   </div>
-                )}
-                {day.sessions.map((s, i) => (
-                  <div key={i} title={`${s.activityType} · ${ZONES[s.zone - 1].label.split(" · ")[1]} · ${s.durationMin}min${s.notes ? ` · ${s.notes}` : ""}${day.taper ? " · tapered" : ""}`}
-                    style={{
-                      background: ACTIVITY_COLORS[s.activityType] || dim,
-                      color: ink,
-                      borderRadius: 3,
-                      padding: "2px 5px",
-                      fontSize: 10.5,
-                      lineHeight: 1.3,
-                      fontWeight: 600,
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 3,
-                      opacity: day.taper ? 0.65 : 1,
-                    }}>
-                    {s.activityType} Z{s.zone} · {s.durationMin}m
-                    {isPreloadWorthy(s) && <Icon path={ICONS.flame} size={9} color={ink} />}
+                ))}
+                {day.extras.map((actual, i) => (
+                  <div key={`extra${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
+                    <div />
+                    {actualChip(actual, false, i)}
                   </div>
                 ))}
               </div>

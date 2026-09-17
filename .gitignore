@@ -4,3 +4,4 @@ app_store.json
 *cache.json
 *.key
 *.crt
+schedule_sources/

@@ -125,9 +125,26 @@
     }
     return [text, onChange];
   }
+  async function fetchWithRetry(url, options, retries = 2, backoffMs = 300) {
+    for (let attempt = 0; ; attempt++) {
+      let res;
+      try {
+        res = await fetch(url, options);
+      } catch (e) {
+        if (attempt >= retries) throw e;
+        await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
+        continue;
+      }
+      if (res.status >= 500 && attempt < retries) {
+        await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
+        continue;
+      }
+      return res;
+    }
+  }
   async function storageGet(key, fallback) {
     try {
-      const res = await fetch(`/api/store?key=${encodeURIComponent(key)}`);
+      const res = await fetchWithRetry(`/api/store?key=${encodeURIComponent(key)}`);
       if (!res.ok) return fallback;
       const data = await res.json();
       return data.value !== null && data.value !== void 0 ? data.value : fallback;
@@ -138,13 +155,79 @@
   }
   async function storageSet(key, value) {
     try {
-      await fetch(`/api/store?key=${encodeURIComponent(key)}`, {
+      await fetchWithRetry(`/api/store?key=${encodeURIComponent(key)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(value)
       });
     } catch (e) {
       console.error("storage set failed", key, e);
+    }
+  }
+  async function apiSaveNutritionDay(date, manual) {
+    const res = await fetchWithRetry(`/api/nutrition/day?date=${date}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manual })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+    return data.entry;
+  }
+  async function apiDeleteNutritionDay(date) {
+    const res = await fetchWithRetry(`/api/nutrition/day/delete?date=${date}`, { method: "POST" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `Delete failed (${res.status}).`);
+    }
+  }
+  async function apiSaveNutritionBulk(days) {
+    const res = await fetchWithRetry("/api/nutrition/bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ days })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Import failed (${res.status}).`);
+    return data.count;
+  }
+  async function apiImportScheduleFile(filename, data) {
+    const res = await fetchWithRetry("/api/schedule/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename, data })
+    });
+    const result = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(result.error || `Import failed (${res.status}).`);
+    return result;
+  }
+  async function apiSetScheduleMatchOverride(date, plannedKey, actualKey) {
+    const body2 = { plannedKey };
+    if (actualKey !== void 0) body2.actualKey = actualKey;
+    const res = await fetchWithRetry(`/api/schedule/match-override?date=${date}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body2)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+    return data;
+  }
+  async function apiSaveWeightDay(date, kg) {
+    const res = await fetchWithRetry(`/api/weight/day?date=${date}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kg })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+    return data.kg;
+  }
+  async function apiDeleteWeightDay(date) {
+    const res = await fetchWithRetry(`/api/weight/day/delete?date=${date}`, { method: "POST" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `Delete failed (${res.status}).`);
     }
   }
   function normalizeNutritionEntry(raw) {
@@ -223,11 +306,13 @@
   const ACTIVITY_TYPES = ["Run", "Ride", "Swim", "Row", "Strength", "Other"];
   const FORWARD_DAYS = 4;
   const CHART_DAY_WIDTH = 70;
-  function estimatePlannedKcal(session, durationMin, weightKg) {
+  function estimatePlannedKcal(session, durationMin, weightKg, matchedRates) {
     const src = session.sourceActivity;
     if (src && src.durationMin > 0 && src.kcal > 0) {
       return src.kcal / src.durationMin * durationMin;
     }
+    const learnedRate = matchedRates && matchedRates[`${session.activityType}_Z${session.zone}`];
+    if (learnedRate > 0) return learnedRate * durationMin;
     const z = ZONES[session.zone - 1];
     if (!z || !weightKg) return 0;
     return z.met * weightKg * (durationMin / 60);
@@ -351,6 +436,80 @@
     if (daysToRace <= 0 || daysToRace > CARB_LOAD_DAYS) return null;
     return { race, daysToRace };
   }
+  function plannedMatchKey(planned) {
+    return planned.isRace ? `race:${planned.id}` : `session:${planned.id}`;
+  }
+  function matchDayActivities(plannedItems, actuals, overrides) {
+    overrides = overrides || {};
+    const byKey = {};
+    for (const a of actuals) byKey[a.key] = a;
+    const claimed = /* @__PURE__ */ new Set();
+    for (const planned of plannedItems) {
+      const forced = overrides[plannedMatchKey(planned)];
+      if (Array.isArray(forced)) forced.forEach((k) => claimed.add(k));
+      else if (forced) claimed.add(forced);
+    }
+    const remaining = actuals.filter((a) => !claimed.has(a.key));
+    const pairs = [];
+    for (const planned of plannedItems) {
+      const pk = plannedMatchKey(planned);
+      if (Object.prototype.hasOwnProperty.call(overrides, pk)) {
+        const forced = overrides[pk];
+        let actual;
+        if (Array.isArray(forced)) {
+          const matched = forced.map((k) => byKey[k]).filter(Boolean);
+          actual = matched.length === 0 ? null : matched.length === 1 ? matched[0] : matched;
+        } else {
+          actual = forced ? byKey[forced] || null : null;
+        }
+        pairs.push({ planned, actual, manual: true });
+        continue;
+      }
+      const candidates = remaining.filter((a) => a.activityType === planned.activityType);
+      let match = null;
+      if (candidates.length) {
+        candidates.sort((a, b) => Math.abs(a.durationMin - planned.durationMin) - Math.abs(b.durationMin - planned.durationMin));
+        match = candidates[0];
+        remaining.splice(remaining.indexOf(match), 1);
+      }
+      pairs.push({ planned, actual: match, manual: false });
+    }
+    return { pairs, extras: remaining };
+  }
+  const MIN_MATCHED_KCAL_SAMPLES = 2;
+  const MATCHED_KCAL_LOOKBACK_DAYS = 120;
+  function buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides) {
+    const activityLibrary = getActivityLibrary(stravaData, intervalsData);
+    const byDate = {};
+    for (const a of activityLibrary) (byDate[a.date] || (byDate[a.date] = [])).push(a);
+    const races = getRaces(schedule);
+    const cutoff = toISODate(daysAgo(MATCHED_KCAL_LOOKBACK_DAYS));
+    const todayKey = toISODate(/* @__PURE__ */ new Date());
+    const totals = {};
+    for (const dateKey of Object.keys(byDate)) {
+      if (dateKey < cutoff || dateKey >= todayKey) continue;
+      const { sessions } = getEffectiveSessionsForDate(schedule, dateKey);
+      const raceToday = races.find((r) => r.raceDate === dateKey);
+      const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
+      if (!plannedItems.length) continue;
+      const { pairs } = matchDayActivities(plannedItems, byDate[dateKey], (matchOverrides || {})[dateKey]);
+      for (const { planned, actual } of pairs) {
+        if (!actual || planned.isRace) continue;
+        const key = `${planned.activityType}_Z${planned.zone}`;
+        const t = totals[key] || (totals[key] = { kcal: 0, min: 0, n: 0 });
+        for (const a of Array.isArray(actual) ? actual : [actual]) {
+          t.kcal += a.kcal;
+          t.min += a.durationMin;
+        }
+        t.n += 1;
+      }
+    }
+    const rates = {};
+    for (const [key, t] of Object.entries(totals)) {
+      if (t.n >= MIN_MATCHED_KCAL_SAMPLES && t.min > 0) rates[key] = t.kcal / t.min;
+    }
+    return rates;
+  }
   const KCAL_PER_KG_TISSUE = 7700;
   const GOAL_DEFAULTS = {
     build: { ratePct: 0.25, min: 0.1, max: 0.75 },
@@ -459,6 +618,17 @@
   };
   const SEVERITY_COLOR = { low: cyan, medium: amber, high: coral };
   const SEVERITY_BG = { low: "rgba(79,209,217,0.08)", medium: "rgba(232,163,61,0.1)", high: "rgba(225,96,77,0.12)" };
+  const BANNER_STYLE = {
+    info: { color: cyan, bg: "rgba(79,209,217,0.08)" },
+    success: { color: mint, bg: "rgba(127,200,169,0.12)" },
+    warning: { color: amber, bg: "rgba(232,163,61,0.1)" },
+    error: { color: coral, bg: "rgba(225,96,77,0.12)" }
+  };
+  function Banner({ kind = "info", children }) {
+    const s = BANNER_STYLE[kind] || BANNER_STYLE.info;
+    const iconPath = kind === "success" ? ICONS.check : ICONS.warn;
+    return /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: s.bg, border: `1px solid ${s.color}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: iconPath, size: 14, color: s.color }), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }, children));
+  }
   function App() {
     const [tab, setTab] = useState("setup");
     const [theme, setTheme] = useState(() => document.documentElement.dataset.theme === "light" ? "light" : "dark");
@@ -499,6 +669,7 @@
     const [nutrition, setNutrition] = useState({});
     const [weightLog, setWeightLog] = useState({});
     const [schedule, setSchedule] = useState([]);
+    const [matchOverrides, setMatchOverrides] = useState({});
     const [csvPreview, setCsvPreview] = useState(null);
     const [csvPreviewSource, setCsvPreviewSource] = useState(null);
     const [colMap, setColMap] = useState({ date: "", calories: "", protein: "", carbs: "", fat: "" });
@@ -519,11 +690,12 @@
     const [googleError, setGoogleError] = useState(null);
     useEffect(() => {
       (async () => {
-        const [p, n, w, sched, cached, stravaCached, gLastSync] = await Promise.all([
+        const [p, n, w, sched, matchOv, cached, stravaCached, gLastSync] = await Promise.all([
           storageGet("profile", null),
           storageGet("nutrition-log", {}),
           storageGet("weight-log", {}),
           storageGet("training-schedule", []),
+          storageGet("schedule-match-overrides", {}),
           storageGet("intervals-cache", null),
           storageGet("strava-cache", null),
           storageGet("google-last-auto-sync", null)
@@ -531,6 +703,7 @@
         setNutrition(n);
         setWeightLog(w);
         setSchedule(sched);
+        setMatchOverrides(matchOv);
         setGoogleLastAutoSync(gLastSync);
         const latestWeightDate = Object.keys(w).sort().pop();
         const merged = { ...p || {} };
@@ -563,14 +736,8 @@
     useEffect(() => {
       if (loaded) storageSet("profile", profile);
     }, [profile, loaded]);
-    const saveNutrition = useCallback((next) => {
-      setNutrition(next);
-      storageSet("nutrition-log", next);
-    }, []);
-    const saveWeightLog = useCallback((next) => {
-      setWeightLog(next);
-      storageSet("weight-log", next);
-    }, []);
+    const [importError, setImportError] = useState(null);
+    const [importNotice, setImportNotice] = useState(null);
     const saveSchedule = useCallback((next) => {
       setSchedule(next);
       storageSet("training-schedule", next);
@@ -583,6 +750,18 @@
     }
     function deleteScheduleEntry(id) {
       saveSchedule(schedule.filter((s) => s.id !== id));
+    }
+    async function setScheduleMatchOverride(date, plannedKey, actualKey) {
+      setMatchOverrides((prev) => {
+        const day = { ...prev[date] || {} };
+        if (actualKey === void 0) delete day[plannedKey];
+        else day[plannedKey] = actualKey;
+        const next = { ...prev };
+        if (Object.keys(day).length) next[date] = day;
+        else delete next[date];
+        return next;
+      });
+      await apiSetScheduleMatchOverride(date, plannedKey, actualKey);
     }
     const bmr = useMemo(
       () => calcBMR(profile.sex, parseFloat(profile.weightKg), parseFloat(profile.heightCm), parseFloat(profile.age)),
@@ -617,9 +796,31 @@
           setColMap(guessColumnMapping(fields));
           setCsvPreview({ fields, rows: res.data });
           setCsvPreviewSource("csv");
+          setImportError(null);
         },
-        error: (err) => alert("Could not parse CSV: " + err.message)
+        error: (err) => setImportError("Could not parse CSV: " + err.message)
       });
+    }
+    const [scheduleImportError, setScheduleImportError] = useState(null);
+    const [scheduleImportNotice, setScheduleImportNotice] = useState(null);
+    async function handleScheduleFile(file) {
+      setScheduleImportError(null);
+      setScheduleImportNotice(null);
+      try {
+        let parsed;
+        try {
+          parsed = JSON.parse(await file.text());
+        } catch (e) {
+          throw new Error(`"${file.name}" isn't valid JSON.`);
+        }
+        const result = await apiImportScheduleFile(file.name, parsed);
+        setSchedule(result.schedule);
+        setScheduleImportNotice(
+          `Imported "${result.filename}" as source "${result.source}" \u2014 it'll auto-reimport from now on whenever that file's contents change.`
+        );
+      } catch (e) {
+        setScheduleImportError(e.message || "Import failed.");
+      }
     }
     async function syncGoogleSheet() {
       if (!googleStatus.connected) return;
@@ -646,16 +847,15 @@
         setGoogleFetching(false);
       }
     }
-    function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
+    async function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
       var _a, _b, _c, _d, _e, _f;
       if (!preview || !map.date || !map.calories) {
-        alert("Map at least the date and calories columns first.");
+        setImportError("Map at least the date and calories columns first.");
         return;
       }
-      const next = { ...nutrition };
-      const importedDates = [];
+      setImportError(null);
+      const days = {};
       const skippedExamples = [];
-      let count = 0;
       for (const row of preview.rows) {
         const rawDate = row[map.date];
         const d = parseFlexibleDate(rawDate);
@@ -664,59 +864,75 @@
           continue;
         }
         const key = toISODate(d);
-        const existing = normalizeNutritionEntry(next[key]);
-        next[key] = {
-          ...existing,
-          macrosfirst: {
-            calories: parseFloat(row[map.calories]) || 0,
-            protein: map.protein ? parseFloat(row[map.protein]) || 0 : (_b = (_a = existing.macrosfirst) == null ? void 0 : _a.protein) != null ? _b : 0,
-            carbs: map.carbs ? parseFloat(row[map.carbs]) || 0 : (_d = (_c = existing.macrosfirst) == null ? void 0 : _c.carbs) != null ? _d : 0,
-            fat: map.fat ? parseFloat(row[map.fat]) || 0 : (_f = (_e = existing.macrosfirst) == null ? void 0 : _e.fat) != null ? _f : 0
-          }
+        const existing = normalizeNutritionEntry(nutrition[key]);
+        days[key] = {
+          calories: parseFloat(row[map.calories]) || 0,
+          protein: map.protein ? parseFloat(row[map.protein]) || 0 : (_b = (_a = existing.macrosfirst) == null ? void 0 : _a.protein) != null ? _b : 0,
+          carbs: map.carbs ? parseFloat(row[map.carbs]) || 0 : (_d = (_c = existing.macrosfirst) == null ? void 0 : _c.carbs) != null ? _d : 0,
+          fat: map.fat ? parseFloat(row[map.fat]) || 0 : (_f = (_e = existing.macrosfirst) == null ? void 0 : _e.fat) != null ? _f : 0
         };
-        importedDates.push(key);
-        count++;
       }
-      saveNutrition(next);
+      const importedDates = Object.keys(days);
+      if (importedDates.length) {
+        try {
+          await apiSaveNutritionBulk(days);
+        } catch (e) {
+          setImportError(e.message || "Could not import \u2014 the local server's /api/nutrition/bulk request failed.");
+          return;
+        }
+        setNutrition((prev) => {
+          const next = { ...prev };
+          for (const key of importedDates) {
+            next[key] = { ...normalizeNutritionEntry(next[key]), macrosfirst: days[key] };
+          }
+          return next;
+        });
+      }
       setCsvPreview(null);
+      setCsvPreviewSource(null);
       if (source === "sheet") {
         storageSet("google-sheet-colmap", map);
       }
-      setCsvPreviewSource(null);
-      if (count === 0 && skippedExamples.length) {
-        alert(`0 rows imported \u2014 the date column's values couldn't be parsed. Example raw value(s): ${skippedExamples.join(", ")}. Double-check the date column is mapped correctly, or tell me what format that is and I'll add support for it.`);
+      if (importedDates.length === 0) {
+        setImportNotice(null);
+        setImportError(`0 rows imported \u2014 the date column's values couldn't be parsed. Example raw value(s): ${skippedExamples.join(", ")}. Double-check the date column is mapped correctly, or tell me what format that is and I'll add support for it.`);
       } else {
-        alert(`Imported ${count} day(s) of nutrition data from MacrosFirst${skippedExamples.length ? ` (${skippedExamples.length} row(s) skipped \u2014 unparseable date)` : ""}. These take priority over any manual entries for the same days.`);
+        setImportNotice(`Imported ${importedDates.length} day(s) of nutrition data from MacrosFirst${skippedExamples.length ? ` (${skippedExamples.length} row(s) skipped \u2014 unparseable date)` : ""}. These take priority over any manual entries for the same days.`);
       }
-      const newDates = Array.from(new Set(importedDates));
       if (stravaStatus.connected) {
-        const missing = newDates.filter((d) => !stravaData.syncedDates.includes(d));
+        const missing = importedDates.filter((d) => !stravaData.syncedDates.includes(d));
         if (missing.length) fetchStrava(missing);
       }
       if (intervalsStatus.configured) {
-        const missing = newDates.filter((d) => !intervalsData.syncedDates.includes(d));
+        const missing = importedDates.filter((d) => !intervalsData.syncedDates.includes(d));
         if (missing.length) fetchIntervals(missing);
       }
     }
-    function saveManualDay(date, entry) {
-      const existing = normalizeNutritionEntry(nutrition[date]);
-      const next = { ...nutrition, [date]: { ...existing, manual: entry } };
-      saveNutrition(next);
+    async function saveManualDay(date, entry) {
+      const merged = await apiSaveNutritionDay(date, entry);
+      setNutrition((prev) => ({ ...prev, [date]: merged }));
       if (stravaStatus.connected && !stravaData.syncedDates.includes(date)) fetchStrava([date]);
       if (intervalsStatus.configured && !intervalsData.syncedDates.includes(date)) fetchIntervals([date]);
     }
-    function deleteNutritionDay(date) {
-      const next = { ...nutrition };
-      delete next[date];
-      saveNutrition(next);
+    async function deleteNutritionDay(date) {
+      await apiDeleteNutritionDay(date);
+      setNutrition((prev) => {
+        const next = { ...prev };
+        delete next[date];
+        return next;
+      });
     }
-    function saveManualWeight(date, kg) {
-      saveWeightLog({ ...weightLog, [date]: kg });
+    async function saveManualWeight(date, kg) {
+      const savedKg = await apiSaveWeightDay(date, kg);
+      setWeightLog((prev) => ({ ...prev, [date]: savedKg }));
     }
-    function deleteWeightDay(date) {
-      const next = { ...weightLog };
-      delete next[date];
-      saveWeightLog(next);
+    async function deleteWeightDay(date) {
+      await apiDeleteWeightDay(date);
+      setWeightLog((prev) => {
+        const next = { ...prev };
+        delete next[date];
+        return next;
+      });
     }
     async function fetchIntervals(dates) {
       if (!intervalsStatus.configured) return [];
@@ -785,6 +1001,10 @@
       await Promise.all([fetchIntervals(), fetchStrava()]);
       setTab("dashboard");
     }
+    const matchedKcalRates = useMemo(
+      () => buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides),
+      [schedule, stravaData, intervalsData, matchOverrides]
+    );
     const dailyRows = useMemo(() => {
       var _a, _b, _c, _d, _e, _f, _g, _h;
       if (!bmr) return [];
@@ -848,7 +1068,7 @@
           for (const s of scheduledSessions) {
             const baseIF = s.sourceActivity ? s.sourceActivity.intensityFactor : ZONES[s.zone - 1].if;
             const effIF = s.taperIntensityFactor ? baseIF * s.taperIntensityFactor : baseIF;
-            const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay);
+            const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay, matchedKcalRates);
             exerciseKcal += kcal;
             epocKcal += kcal * epocFactorFor(effIF) * profile.epocSensitivity;
             durationSec += s.durationMin * 60;
@@ -857,7 +1077,7 @@
         } else if (raceToday) {
           source = "planned";
           const raceIF = raceToday.sourceActivity ? raceToday.sourceActivity.intensityFactor : ZONES[raceToday.zone - 1].if;
-          const kcal = estimatePlannedKcal(raceToday, raceToday.durationMin, weightForDay);
+          const kcal = estimatePlannedKcal(raceToday, raceToday.durationMin, weightForDay, matchedKcalRates);
           exerciseKcal += kcal;
           epocKcal += kcal * epocFactorFor(raceIF) * profile.epocSensitivity;
           durationSec += raceToday.durationMin * 60;
@@ -955,7 +1175,7 @@
         });
       }
       return days;
-    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection]);
+    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates]);
     const summary = useMemo(() => {
       const withIntake = dailyRows.filter((d) => d.intake !== null);
       const trainingMissingDays = dailyRows.filter((d) => d.trainingMissing).length;
@@ -1020,13 +1240,18 @@
         table.data th:first-child, table.data td:first-child { text-align:left; font-family: ${body}; }
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         .spin { animation: spin 1s linear infinite; }
+        .cal-chip-emoji { display: none; }
+        @media (max-width: 700px) {
+          .cal-chip-text { display: none; }
+          .cal-chip-emoji { display: inline; }
+        }
         * { scrollbar-color: ${line} transparent; scrollbar-width: thin; }
         *::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
         *::-webkit-scrollbar-track { background: transparent; }
         *::-webkit-scrollbar-thumb { background: ${line}; border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
         *::-webkit-scrollbar-thumb:hover { background: ${dim}; background-clip: padding-box; }
         *::-webkit-scrollbar-corner { background: transparent; }
-      `), /* @__PURE__ */ React.createElement("div", { style: { borderBottom: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("div", { style: { padding: "18px 28px", maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10 } }, /* @__PURE__ */ React.createElement("img", { src: "/logo-header.png", alt: "", width: 28, height: 28, style: { borderRadius: 6, display: "block" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 17, letterSpacing: "-0.01em" } }, "Energy Balance"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, fontFamily: mono, marginTop: 1 } }, "training demand vs. fuel intake \u2014 local build"))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 4 } }, [
+      `), /* @__PURE__ */ React.createElement("div", { style: { borderBottom: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("div", { style: { padding: "14px clamp(12px, 4vw, 28px)", maxWidth: 1400, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", rowGap: 10 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10 } }, /* @__PURE__ */ React.createElement("img", { src: "/logo-header.png", alt: "", width: 28, height: 28, style: { borderRadius: 6, display: "block" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 17, letterSpacing: "-0.01em" } }, "Energy Balance"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, fontFamily: mono, marginTop: 1 } }, "training demand vs. fuel intake \u2014 local build"))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" } }, [
       { id: "setup", label: "Setup", icon: ICONS.settings },
       { id: "import", label: "Log", icon: ICONS.upload },
       { id: "schedule", label: "Schedule", icon: ICONS.calendar },
@@ -1051,7 +1276,7 @@
         style: { marginLeft: 6 }
       },
       /* @__PURE__ */ React.createElement(Icon, { path: theme === "dark" ? ICONS.sun : ICONS.moon, size: 14 })
-    )))), /* @__PURE__ */ React.createElement("div", { style: { padding: "24px 28px", maxWidth: 1080, margin: "0 auto" } }, tab === "setup" && /* @__PURE__ */ React.createElement(
+    )))), /* @__PURE__ */ React.createElement("div", { style: { padding: "20px clamp(12px, 4vw, 28px)", maxWidth: 1400, margin: "0 auto" } }, tab === "setup" && /* @__PURE__ */ React.createElement(
       SetupTab,
       {
         profile,
@@ -1093,6 +1318,8 @@
         googleError,
         onSyncGoogleSheet: syncGoogleSheet,
         googleLastAutoSync,
+        importError,
+        importNotice,
         units
       }
     ), tab === "schedule" && /* @__PURE__ */ React.createElement(
@@ -1103,7 +1330,16 @@
         onUpdate: updateScheduleEntry,
         onDelete: deleteScheduleEntry,
         stravaData,
-        intervalsData
+        intervalsData,
+        onImportFile: handleScheduleFile,
+        importFileError: scheduleImportError,
+        importFileNotice: scheduleImportNotice,
+        matchOverrides,
+        onSetMatchOverride: setScheduleMatchOverride,
+        profile,
+        setProfile,
+        weightLog,
+        matchedKcalRates
       }
     ), tab === "dashboard" && /* @__PURE__ */ React.createElement(
       DashboardTab,
@@ -1131,7 +1367,7 @@
     const units = profile.units || "metric";
     const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
     const [heightText, onHeightChange] = useUnitInput(profile.heightCm, units, cmToDisplayLen, displayToCm, 1);
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16 } }, "Athlete profile"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Sex" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: profile.sex, onChange: set("sex") }, /* @__PURE__ */ React.createElement("option", { value: "male" }, "Male"), /* @__PURE__ */ React.createElement("option", { value: "female" }, "Female"))), /* @__PURE__ */ React.createElement(Field, { label: `Weight (${weightUnitLabel(units)})` }, /* @__PURE__ */ React.createElement(
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16 } }, "Athlete profile"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Sex" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: profile.sex, onChange: set("sex") }, /* @__PURE__ */ React.createElement("option", { value: "male" }, "Male"), /* @__PURE__ */ React.createElement("option", { value: "female" }, "Female"))), /* @__PURE__ */ React.createElement(Field, { label: `Weight (${weightUnitLabel(units)})` }, /* @__PURE__ */ React.createElement(
       "input",
       {
         className: "inp",
@@ -1147,7 +1383,7 @@
         onChange: (e) => onHeightChange(e, (v) => setProfile((p) => ({ ...p, heightCm: v }))),
         placeholder: units === "imperial" ? "70" : "178"
       }
-    )), /* @__PURE__ */ React.createElement(Field, { label: "Age" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: profile.age, onChange: set("age"), placeholder: "34" }))), bmr && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 16, fontFamily: mono, fontSize: 13, color: cyan } }, "Mifflin-St Jeor BMR: ", /* @__PURE__ */ React.createElement("b", null, fmt(bmr), " kcal/day"))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 16, color: amber }), " Training calories \u2014 Strava"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Strava only exposes accurate per-activity ", /* @__PURE__ */ React.createElement("code", null, "calories"), " through an authenticated, server-side call \u2014 this runs through ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " next to this page, which keeps your client secret out of the browser. See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup. Every pull is cached to disk by date server-side, so repeat pulls only ever hit Strava for today \u2014 a fresh nutrition entry also triggers a background sync for just that date."), !stravaStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : stravaStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : stravaStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Server is missing ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " \u2014 copy ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), ", fill in your Strava client_id/secret, and restart ", /* @__PURE__ */ React.createElement("code", null, "server.py"), ".") : stravaStatus.connected ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected", ((_a = stravaStatus.athlete) == null ? void 0 : _a.firstname) ? ` as ${stravaStatus.athlete.firstname} ${stravaStatus.athlete.lastname || ""}` : "")) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? /* @__PURE__ */ React.createElement("a", { className: "btn-primary", href: "/login", style: { textDecoration: "none", width: "fit-content" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 13, color: ink }), " Connect to Strava") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, "Connect from ", /* @__PURE__ */ React.createElement("code", null, "http://localhost:", window.location.port, "/"), " on the computer running ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " \u2014 Strava's OAuth callback only works there. Every device on this network shares that connection automatically once it's made."), stravaLastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "last synced ", new Date(stravaLastFetched).toLocaleString(), " \xB7 ", stravaSyncedCount, " day", stravaSyncedCount === 1 ? "" : "s", " covered"), stravaError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: coral }), /* @__PURE__ */ React.createElement("span", null, stravaError))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "intervals.icu connection ", /* @__PURE__ */ React.createElement("span", { style: { color: dim, fontWeight: 400 } }, "(optional \u2014 wellness / TSB only)")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Used only for CTL/ATL/TSB (recovery buffer below) and as a calorie fallback on days Strava has no data. Fetched and cached server-side too, the same way as Strava \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "intervals_api_key"), "(and optionally ", /* @__PURE__ */ React.createElement("code", null, "intervals_athlete_id"), ", default ", /* @__PURE__ */ React.createElement("code", null, "0"), ") to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), "and restart ", /* @__PURE__ */ React.createElement("code", null, "server.py"), ". Get the key from intervals.icu \u2192 Settings \u2192 Developer Settings."), !intervalsStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : intervalsStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : intervalsStatus.configured ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Configured \u2014 athlete ", intervalsStatus.athleteId)) : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "intervals_api_key"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server to enable this."), lastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "last synced ", new Date(lastFetched).toLocaleString(), " \xB7 ", intervalsSyncedCount, " day", intervalsSyncedCount === 1 ? "" : "s", " covered")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(Field, { label: "Days of history" }, /* @__PURE__ */ React.createElement("select", { className: "inp", style: { width: 120 }, value: rangeDays, onChange: (e) => setRangeDays(parseInt(e.target.value)) }, /* @__PURE__ */ React.createElement("option", { value: 14 }, "14 days"), /* @__PURE__ */ React.createElement("option", { value: 21 }, "21 days"), /* @__PURE__ */ React.createElement("option", { value: 30 }, "30 days"), /* @__PURE__ */ React.createElement("option", { value: 60 }, "60 days"))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { marginTop: 18 }, onClick: onFetch, disabled: fetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), fetching ? "Fetching\u2026" : "Pull training data"), lastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 18, fontSize: 11.5, color: dim, fontFamily: mono } }, "intervals last synced ", new Date(lastFetched).toLocaleString())), fetchError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: coral }), /* @__PURE__ */ React.createElement("span", null, fetchError))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 16, color: amber }), " Model tuning"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 20 } }, /* @__PURE__ */ React.createElement(Field, { label: "Non-training activity (NEAT)" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 10 } }, [["multiplier", "Multiplier"], ["offset", "Fixed offset"]].map(([id, label]) => /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement(Field, { label: "Age" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: profile.age, onChange: set("age"), placeholder: "34" }))), bmr && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 16, fontFamily: mono, fontSize: 13, color: cyan } }, "Mifflin-St Jeor BMR: ", /* @__PURE__ */ React.createElement("b", null, fmt(bmr), " kcal/day"))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 16, color: amber }), " Training calories \u2014 Strava"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Strava only exposes accurate per-activity ", /* @__PURE__ */ React.createElement("code", null, "calories"), " through an authenticated, server-side call \u2014 this runs through ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " next to this page, which keeps your client secret out of the browser. See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup. Every pull is cached to disk by date server-side, so repeat pulls only ever hit Strava for today \u2014 a fresh nutrition entry also triggers a background sync for just that date."), !stravaStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : stravaStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : stravaStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Server is missing ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " \u2014 copy ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), ", fill in your Strava client_id/secret, and restart ", /* @__PURE__ */ React.createElement("code", null, "server.py"), ".") : stravaStatus.connected ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected", ((_a = stravaStatus.athlete) == null ? void 0 : _a.firstname) ? ` as ${stravaStatus.athlete.firstname} ${stravaStatus.athlete.lastname || ""}` : "")) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? /* @__PURE__ */ React.createElement("a", { className: "btn-primary", href: "/login", style: { textDecoration: "none", width: "fit-content" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 13, color: ink }), " Connect to Strava") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, "Connect from ", /* @__PURE__ */ React.createElement("code", null, "http://localhost:", window.location.port, "/"), " on the computer running ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " \u2014 Strava's OAuth callback only works there. Every device on this network shares that connection automatically once it's made."), stravaLastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "last synced ", new Date(stravaLastFetched).toLocaleString(), " \xB7 ", stravaSyncedCount, " day", stravaSyncedCount === 1 ? "" : "s", " covered"), stravaError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: coral }), /* @__PURE__ */ React.createElement("span", null, stravaError))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "intervals.icu connection ", /* @__PURE__ */ React.createElement("span", { style: { color: dim, fontWeight: 400 } }, "(optional \u2014 wellness / TSB only)")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Used only for CTL/ATL/TSB (recovery buffer below) and as a calorie fallback on days Strava has no data. Fetched and cached server-side too, the same way as Strava \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "intervals_api_key"), "(and optionally ", /* @__PURE__ */ React.createElement("code", null, "intervals_athlete_id"), ", default ", /* @__PURE__ */ React.createElement("code", null, "0"), ") to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), "and restart ", /* @__PURE__ */ React.createElement("code", null, "server.py"), ". Get the key from intervals.icu \u2192 Settings \u2192 Developer Settings."), !intervalsStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : intervalsStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : intervalsStatus.configured ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Configured \u2014 athlete ", intervalsStatus.athleteId)) : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "intervals_api_key"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server to enable this."), lastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "last synced ", new Date(lastFetched).toLocaleString(), " \xB7 ", intervalsSyncedCount, " day", intervalsSyncedCount === 1 ? "" : "s", " covered")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(Field, { label: "Days of history" }, /* @__PURE__ */ React.createElement("select", { className: "inp", style: { width: 120 }, value: rangeDays, onChange: (e) => setRangeDays(parseInt(e.target.value)) }, /* @__PURE__ */ React.createElement("option", { value: 14 }, "14 days"), /* @__PURE__ */ React.createElement("option", { value: 21 }, "21 days"), /* @__PURE__ */ React.createElement("option", { value: 30 }, "30 days"), /* @__PURE__ */ React.createElement("option", { value: 60 }, "60 days"))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { marginTop: 18 }, onClick: onFetch, disabled: fetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), fetching ? "Fetching\u2026" : "Pull training data"), lastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 18, fontSize: 11.5, color: dim, fontFamily: mono } }, "intervals last synced ", new Date(lastFetched).toLocaleString())), fetchError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: coral }), /* @__PURE__ */ React.createElement("span", null, fetchError))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 16, color: amber }), " Model tuning"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 20 } }, /* @__PURE__ */ React.createElement(Field, { label: "Non-training activity (NEAT)" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 10 } }, [["multiplier", "Multiplier"], ["offset", "Fixed offset"]].map(([id, label]) => /* @__PURE__ */ React.createElement(
       "button",
       {
         key: id,
@@ -1281,11 +1517,11 @@
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Safe range ", range.min, "\u2013", range.max, "%/week. Faster ", profile.goal === "build" ? "gains skew toward fat" : "loss risks muscle and performance", ".")), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.trendCalibration, onChange: (e) => setProfile((p) => ({ ...p, trendCalibration: e.target.checked })) }), "Auto-calibrate the target from your logged weight trend"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 6, marginLeft: 24, lineHeight: 1.5 } }, "Compares your actual weight trend (needs ~10+ days logged) against the ", goalParams.label.toLowerCase(), " rate above, and nudges the daily target toward what your real data says you need \u2014 rather than trusting the formula alone."), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries logged so far, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`));
   }
-  function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, units }) {
+  function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, importError, importNotice, units }) {
     const [dragOver, setDragOver] = useState(false);
     const dayCount = Object.keys(nutrition).length;
     const weightCount = Object.keys(weightLog).length;
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20 } }, /* @__PURE__ */ React.createElement(ManualEntryCard, { nutrition, onSave: onSaveManualDay }), /* @__PURE__ */ React.createElement(WeightEntryCard, { weightLog, onSave: onSaveWeight, units }), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " MacrosFirst via Google Sheets"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst's own API is partner-gated, but its Premium Google Sheets Importer already writes your daily log to a Sheet you own \u2014 this connects to that Sheet directly, through", /* @__PURE__ */ React.createElement("code", null, " server.py"), ", the same pattern as Strava. See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup."), !googleStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : googleStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : googleStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "google_client_id"), ", ", /* @__PURE__ */ React.createElement("code", null, "google_client_secret"), ", and ", /* @__PURE__ */ React.createElement("code", null, "google_sheet_id"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server.") : googleStatus.connected ? /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected")), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: onSyncGoogleSheet, disabled: googleFetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), " ", googleFetching ? "Syncing\u2026" : "Sync from Google Sheet")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, googleLastAutoSync ? `Last automatic sync: ${new Date(googleLastAutoSync).toLocaleString()}` : "No automatic sync yet \u2014 runs daily once you've imported at least once (set google_sync_time in config.json, default 04:00).")) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? /* @__PURE__ */ React.createElement("a", { className: "btn-primary", href: "/google/login", style: { textDecoration: "none", width: "fit-content", display: "inline-flex" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 13, color: ink }), " Connect Google Sheets") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, "Connect from ", /* @__PURE__ */ React.createElement("code", null, "http://localhost:", window.location.port, "/"), " on the computer running ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " \u2014 Google's OAuth callback only works there. Every device on this network shares that connection automatically once it's made."), googleError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: coral }), /* @__PURE__ */ React.createElement("span", null, googleError))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Or import a CSV manually"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst Premium \u2192 Download Food Log (Excel), or export any spreadsheet as CSV. Drop the file here and map its columns below."), /* @__PURE__ */ React.createElement(
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" } }, /* @__PURE__ */ React.createElement(ManualEntryCard, { nutrition, onSave: onSaveManualDay }), /* @__PURE__ */ React.createElement(WeightEntryCard, { weightLog, onSave: onSaveWeight, units }), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " MacrosFirst via Google Sheets"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst's own API is partner-gated, but its Premium Google Sheets Importer already writes your daily log to a Sheet you own \u2014 this connects to that Sheet directly, through", /* @__PURE__ */ React.createElement("code", null, " server.py"), ", the same pattern as Strava. See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup."), !googleStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : googleStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : googleStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "google_client_id"), ", ", /* @__PURE__ */ React.createElement("code", null, "google_client_secret"), ", and ", /* @__PURE__ */ React.createElement("code", null, "google_sheet_id"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server.") : googleStatus.connected ? /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected")), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: onSyncGoogleSheet, disabled: googleFetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), " ", googleFetching ? "Syncing\u2026" : "Sync from Google Sheet")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, googleLastAutoSync ? `Last automatic sync: ${new Date(googleLastAutoSync).toLocaleString()}` : "No automatic sync yet \u2014 runs daily once you've imported at least once (set google_sync_time in config.json, default 04:00).")) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? /* @__PURE__ */ React.createElement("a", { className: "btn-primary", href: "/google/login", style: { textDecoration: "none", width: "fit-content", display: "inline-flex" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 13, color: ink }), " Connect Google Sheets") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, "Connect from ", /* @__PURE__ */ React.createElement("code", null, "http://localhost:", window.location.port, "/"), " on the computer running ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " \u2014 Google's OAuth callback only works there. Every device on this network shares that connection automatically once it's made."), googleError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, googleError)), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Or import a CSV manually"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst Premium \u2192 Download Food Log (Excel), or export any spreadsheet as CSV. Drop the file here and map its columns below."), /* @__PURE__ */ React.createElement(
       "div",
       {
         onDragOver: (e) => {
@@ -1310,7 +1546,7 @@
       /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "center", marginBottom: 10 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 22, color: dim })),
       /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, marginBottom: 12 } }, "Drop your CSV export here, or"),
       /* @__PURE__ */ React.createElement("label", { className: "btn-ghost", style: { display: "inline-block" } }, "Choose file", /* @__PURE__ */ React.createElement("input", { type: "file", accept: ".csv", style: { display: "none" }, onChange: (e) => e.target.files[0] && onFile(e.target.files[0]) }))
-    )), csvPreview && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Map columns"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16 } }, csvPreview.rows.length, " rows found. Match the columns to the fields below."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 } }, ["date", "calories", "protein", "carbs", "fat"].map((k) => /* @__PURE__ */ React.createElement(Field, { key: k, label: k }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: colMap[k], onChange: (e) => setColMap((m) => ({ ...m, [k]: e.target.value })) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "\u2014 none \u2014"), csvPreview.fields.map((f) => /* @__PURE__ */ React.createElement("option", { key: f, value: f }, f)))))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { marginTop: 18 }, onClick: () => onImport() }, "Import ", csvPreview.rows.length, " rows")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored nutrition log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 } }, dayCount, " day", dayCount === 1 ? "" : "s", " of intake saved. Click a row to edit it."), dayCount > 0 && /* @__PURE__ */ React.createElement(NutritionLogTable, { nutrition, onSave: onSaveManualDay, onDelete: onDeleteDay })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored weight log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 } }, weightCount, " day", weightCount === 1 ? "" : "s", " of weight saved. Click a row to edit it."), weightCount > 0 && /* @__PURE__ */ React.createElement(WeightLogTable, { weightLog, onSave: onSaveWeight, onDelete: onDeleteWeight, units })));
+    ), importError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, importError), !importError && importNotice && /* @__PURE__ */ React.createElement(Banner, { kind: "success" }, importNotice)), csvPreview && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Map columns"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16 } }, csvPreview.rows.length, " rows found. Match the columns to the fields below."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 12 } }, ["date", "calories", "protein", "carbs", "fat"].map((k) => /* @__PURE__ */ React.createElement(Field, { key: k, label: k }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: colMap[k], onChange: (e) => setColMap((m) => ({ ...m, [k]: e.target.value })) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "\u2014 none \u2014"), csvPreview.fields.map((f) => /* @__PURE__ */ React.createElement("option", { key: f, value: f }, f)))))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { marginTop: 18 }, onClick: () => onImport() }, "Import ", csvPreview.rows.length, " rows")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored nutrition log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 } }, dayCount, " day", dayCount === 1 ? "" : "s", " of intake saved. Click a row to edit it."), dayCount > 0 && /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto" } }, /* @__PURE__ */ React.createElement(NutritionLogTable, { nutrition, onSave: onSaveManualDay, onDelete: onDeleteDay }))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 } }, "Stored weight log"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 } }, weightCount, " day", weightCount === 1 ? "" : "s", " of weight saved. Click a row to edit it."), weightCount > 0 && /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto" } }, /* @__PURE__ */ React.createElement(WeightLogTable, { weightLog, onSave: onSaveWeight, onDelete: onDeleteWeight, units }))));
   }
   function macroCalories(protein, carbs, fat) {
     return protein * 4 + carbs * 4 + fat * 9;
@@ -1320,29 +1556,46 @@
     const [protein, setProtein] = useState("");
     const [carbs, setCarbs] = useState("");
     const [fat, setFat] = useState("");
-    const [saved, setSaved] = useState(false);
+    const [status, setStatus] = useState("idle");
+    const [errorMsg, setErrorMsg] = useState(null);
+    const dateRef = useRef(date);
     const normalized = normalizeNutritionEntry(nutrition[date]);
     const hasMacrosFirst = !!normalized.macrosfirst;
     useEffect(() => {
-      var _a, _b, _c;
-      const existing = normalizeNutritionEntry(nutrition[date]);
-      const prefill = existing.macrosfirst || existing.manual;
-      setProtein(prefill ? String((_a = prefill.protein) != null ? _a : "") : "");
-      setCarbs(prefill ? String((_b = prefill.carbs) != null ? _b : "") : "");
-      setFat(prefill ? String((_c = prefill.fat) != null ? _c : "") : "");
-      setSaved(false);
+      dateRef.current = date;
+      const applyPrefill = (source) => {
+        var _a, _b, _c;
+        const existing = normalizeNutritionEntry(source[date]);
+        const prefill = existing.macrosfirst || existing.manual;
+        setProtein(prefill ? String((_a = prefill.protein) != null ? _a : "") : "");
+        setCarbs(prefill ? String((_b = prefill.carbs) != null ? _b : "") : "");
+        setFat(prefill ? String((_c = prefill.fat) != null ? _c : "") : "");
+      };
+      applyPrefill(nutrition);
+      setStatus("idle");
+      setErrorMsg(null);
+      storageGet("nutrition-log", null).then((fresh) => {
+        if (dateRef.current === date && fresh) applyPrefill(fresh);
+      });
     }, [date]);
     const p = parseFloat(protein) || 0;
     const c = parseFloat(carbs) || 0;
     const f = parseFloat(fat) || 0;
     const calories = macroCalories(p, c, f);
     const hasAny = protein !== "" || carbs !== "" || fat !== "";
-    function handleSave() {
-      onSave(date, { calories, protein: p, carbs: c, fat: f });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1500);
+    async function handleSave() {
+      setStatus("saving");
+      setErrorMsg(null);
+      try {
+        await onSave(date, { calories, protein: p, carbs: c, fat: f });
+        setStatus("saved");
+        setTimeout(() => setStatus((s) => s === "saved" ? "idle" : s), 1500);
+      } catch (e) {
+        setStatus("error");
+        setErrorMsg(e.message || "Save failed \u2014 check the local server connection and retry.");
+      }
     }
-    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 16, color: cyan }), " Enter a day's macros directly"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Skip the CSV for a single day \u2014 type in totals from MacrosFirst (or anywhere) and calories are computed automatically (4 kcal/g protein & carbs, 9 kcal/g fat). Pick a date that's already logged to edit it. A MacrosFirst import always takes priority over a manual entry for the same day."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: date, max: toISODate(/* @__PURE__ */ new Date()), onChange: (e) => setDate(e.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Protein (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: protein, onChange: (e) => setProtein(e.target.value), placeholder: "0" })), /* @__PURE__ */ React.createElement(Field, { label: "Carbs (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: carbs, onChange: (e) => setCarbs(e.target.value), placeholder: "0" })), /* @__PURE__ */ React.createElement(Field, { label: "Fat (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: fat, onChange: (e) => setFat(e.target.value), placeholder: "0" }))), hasMacrosFirst && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(232,163,61,0.1)", border: `1px solid ${amber}`, borderRadius: 4, padding: "9px 12px", fontSize: 12, color: paper, display: "flex", gap: 8, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 14, color: amber }), /* @__PURE__ */ React.createElement("span", null, "MacrosFirst data already exists for this day and will be used everywhere in the app instead of what you save here \u2014 unless that import is later removed.")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, marginTop: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: mono, fontSize: 13, color: amber } }, "\u2248 ", fmt(calories), " kcal"), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSave, disabled: !hasAny }, normalized.manual ? "Update manual entry" : "Save this day"), saved && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 13, color: mint }), " Saved")));
+    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 16, color: cyan }), " Enter a day's macros directly"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Skip the CSV for a single day \u2014 type in totals from MacrosFirst (or anywhere) and calories are computed automatically (4 kcal/g protein & carbs, 9 kcal/g fat). Pick a date that's already logged to edit it. A MacrosFirst import always takes priority over a manual entry for the same day."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(90px, 1fr))", gap: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: date, max: toISODate(/* @__PURE__ */ new Date()), onChange: (e) => setDate(e.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Protein (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: protein, onChange: (e) => setProtein(e.target.value), placeholder: "0" })), /* @__PURE__ */ React.createElement(Field, { label: "Carbs (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: carbs, onChange: (e) => setCarbs(e.target.value), placeholder: "0" })), /* @__PURE__ */ React.createElement(Field, { label: "Fat (g)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "1", value: fat, onChange: (e) => setFat(e.target.value), placeholder: "0" }))), hasMacrosFirst && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(232,163,61,0.1)", border: `1px solid ${amber}`, borderRadius: 4, padding: "9px 12px", fontSize: 12, color: paper, display: "flex", gap: 8, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 14, color: amber }), /* @__PURE__ */ React.createElement("span", null, "MacrosFirst data already exists for this day and will be used everywhere in the app instead of what you save here \u2014 unless that import is later removed.")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, marginTop: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: mono, fontSize: 13, color: amber } }, "\u2248 ", fmt(calories), " kcal"), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSave, disabled: !hasAny || status === "saving" }, status === "saving" ? "Saving\u2026" : normalized.manual ? "Update manual entry" : "Save this day"), status === "saved" && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 13, color: mint }), " Saved")), status === "error" && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, errorMsg, " ", /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "2px 8px", marginLeft: 8 }, onClick: handleSave }, "Retry")));
   }
   function SourceBadge({ source }) {
     const isMF = source === "macrosfirst";
@@ -1360,83 +1613,150 @@
   }
   function NutritionLogTable({ nutrition, onSave, onDelete }) {
     const [editingDate, setEditingDate] = useState(null);
+    const editingDateRef = useRef(null);
     const [draft, setDraft] = useState({ protein: "", carbs: "", fat: "" });
+    const [status, setStatus] = useState("idle");
+    const [errorMsg, setErrorMsg] = useState(null);
     const dates = Object.keys(nutrition).sort().reverse();
     function startEdit(date) {
       var _a, _b, _c;
-      const eff = effectiveNutritionEntry(nutrition[date]);
+      editingDateRef.current = date;
       setEditingDate(date);
+      setStatus("idle");
+      setErrorMsg(null);
+      const eff = effectiveNutritionEntry(nutrition[date]);
       setDraft({ protein: String((_a = eff == null ? void 0 : eff.protein) != null ? _a : ""), carbs: String((_b = eff == null ? void 0 : eff.carbs) != null ? _b : ""), fat: String((_c = eff == null ? void 0 : eff.fat) != null ? _c : "") });
+      storageGet("nutrition-log", null).then((fresh) => {
+        var _a2, _b2, _c2;
+        if (editingDateRef.current !== date || !fresh) return;
+        const freshEff = effectiveNutritionEntry(fresh[date]);
+        setDraft({ protein: String((_a2 = freshEff == null ? void 0 : freshEff.protein) != null ? _a2 : ""), carbs: String((_b2 = freshEff == null ? void 0 : freshEff.carbs) != null ? _b2 : ""), fat: String((_c2 = freshEff == null ? void 0 : freshEff.fat) != null ? _c2 : "") });
+      });
     }
-    function commitEdit(date) {
+    function cancelEdit() {
+      editingDateRef.current = null;
+      setEditingDate(null);
+    }
+    async function commitEdit(date) {
       const p = parseFloat(draft.protein) || 0;
       const c = parseFloat(draft.carbs) || 0;
       const f = parseFloat(draft.fat) || 0;
-      onSave(date, { calories: macroCalories(p, c, f), protein: p, carbs: c, fat: f });
-      setEditingDate(null);
+      setStatus("saving");
+      setErrorMsg(null);
+      try {
+        await onSave(date, { calories: macroCalories(p, c, f), protein: p, carbs: c, fat: f });
+        editingDateRef.current = null;
+        setEditingDate(null);
+        setStatus("idle");
+      } catch (e) {
+        setStatus("error");
+        setErrorMsg(e.message || "Save failed \u2014 check the local server connection and retry.");
+      }
     }
     return /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Date"), /* @__PURE__ */ React.createElement("th", null, "Protein (g)"), /* @__PURE__ */ React.createElement("th", null, "Carbs (g)"), /* @__PURE__ */ React.createElement("th", null, "Fat (g)"), /* @__PURE__ */ React.createElement("th", null, "Calories"), /* @__PURE__ */ React.createElement("th", null))), /* @__PURE__ */ React.createElement("tbody", null, dates.map((date) => {
       const normalized = normalizeNutritionEntry(nutrition[date]);
       const e = normalized.macrosfirst || normalized.manual;
       const source = normalized.macrosfirst ? "macrosfirst" : "manual";
       const editing = editingDate === date;
-      return /* @__PURE__ */ React.createElement("tr", { key: date }, /* @__PURE__ */ React.createElement("td", null, date, /* @__PURE__ */ React.createElement(SourceBadge, { source })), editing ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.protein, onChange: (ev) => setDraft((d) => ({ ...d, protein: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.carbs, onChange: (ev) => setDraft((d) => ({ ...d, carbs: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.fat, onChange: (ev) => setDraft((d) => ({ ...d, fat: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, "\u2248 ", fmt(macroCalories(parseFloat(draft.protein) || 0, parseFloat(draft.carbs) || 0, parseFloat(draft.fat) || 0))), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement(
+      return /* @__PURE__ */ React.createElement(React.Fragment, { key: date }, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, date, /* @__PURE__ */ React.createElement(SourceBadge, { source })), editing ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.protein, onChange: (ev) => setDraft((d) => ({ ...d, protein: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.carbs, onChange: (ev) => setDraft((d) => ({ ...d, carbs: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", value: draft.fat, onChange: (ev) => setDraft((d) => ({ ...d, fat: ev.target.value })) })), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, "\u2248 ", fmt(macroCalories(parseFloat(draft.protein) || 0, parseFloat(draft.carbs) || 0, parseFloat(draft.fat) || 0))), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement(
         "button",
         {
           className: "btn-ghost",
           style: { padding: "4px 10px", marginRight: 6 },
           onClick: () => commitEdit(date),
+          disabled: status === "saving",
           title: source === "macrosfirst" ? "Saves as a manual fallback \u2014 MacrosFirst data still takes priority for this day" : void 0
         },
-        "Save"
-      ), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px" }, onClick: () => setEditingDate(null) }, "Cancel"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, fmt(e.protein)), /* @__PURE__ */ React.createElement("td", null, fmt(e.carbs)), /* @__PURE__ */ React.createElement("td", null, fmt(e.fat)), /* @__PURE__ */ React.createElement("td", { style: { color: amber } }, fmt(e.calories)), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(date), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+        status === "saving" ? "Saving\u2026" : "Save"
+      ), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px" }, onClick: cancelEdit, disabled: status === "saving" }, "Cancel"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, fmt(e.protein)), /* @__PURE__ */ React.createElement("td", null, fmt(e.carbs)), /* @__PURE__ */ React.createElement("td", null, fmt(e.fat)), /* @__PURE__ */ React.createElement("td", { style: { color: amber } }, fmt(e.calories)), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(date), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
         if (confirm(`Delete ${source === "macrosfirst" ? "the MacrosFirst import and any manual entry" : "the manual entry"} for ${date}?`)) onDelete(date);
-      }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))));
+      }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral }))))), editing && status === "error" && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 6, style: { padding: 0 } }, /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, errorMsg, " ", /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "2px 8px", marginLeft: 8 }, onClick: () => commitEdit(date) }, "Retry")))));
     })));
   }
   function WeightEntryCard({ weightLog, onSave, units }) {
     const [date, setDate] = useState(() => toISODate(/* @__PURE__ */ new Date()));
     const [metricKg, setMetricKg] = useState("");
-    const [saved, setSaved] = useState(false);
+    const [status, setStatus] = useState("idle");
+    const [errorMsg, setErrorMsg] = useState(null);
+    const dateRef = useRef(date);
     useEffect(() => {
+      dateRef.current = date;
       const existingKg = weightLog[date];
       setMetricKg(existingKg === void 0 ? "" : String(existingKg));
-      setSaved(false);
+      setStatus("idle");
+      setErrorMsg(null);
+      storageGet("weight-log", null).then((fresh) => {
+        if (dateRef.current !== date || !fresh) return;
+        const freshKg = fresh[date];
+        setMetricKg(freshKg === void 0 ? "" : String(freshKg));
+      });
     }, [date]);
     const [text, onChange] = useUnitInput(metricKg, units, kgToDisplay, displayToKg, 1);
     const wUnit = weightUnitLabel(units);
-    function handleSave() {
+    async function handleSave() {
       const kg = parseFloat(metricKg);
       if (Number.isNaN(kg) || kg <= 0) return;
-      onSave(date, Math.round(kg * 100) / 100);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1500);
+      setStatus("saving");
+      setErrorMsg(null);
+      try {
+        await onSave(date, Math.round(kg * 100) / 100);
+        setStatus("saved");
+        setTimeout(() => setStatus((s) => s === "saved" ? "idle" : s), 1500);
+      } catch (e) {
+        setStatus("error");
+        setErrorMsg(e.message || "Save failed \u2014 check the local server connection and retry.");
+      }
     }
-    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 16, color: cyan }), " Log today's weight"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Feeds directly into BMR and fueling targets for that day \u2014 body weight shifts across a training block, so this keeps demand and g/kg targets tracking you rather than a fixed Setup value."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: date, max: toISODate(/* @__PURE__ */ new Date()), onChange: (e) => setDate(e.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: `Weight (${wUnit})` }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "0.1", value: text, onChange: (e) => onChange(e, setMetricKg), placeholder: units === "imperial" ? "154.0" : "70.0" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, marginTop: 16 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSave, disabled: !text }, weightLog[date] !== void 0 ? "Update this day" : "Save this day"), saved && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 13, color: mint }), " Saved")));
+    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 16, color: cyan }), " Log today's weight"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Feeds directly into BMR and fueling targets for that day \u2014 body weight shifts across a training block, so this keeps demand and g/kg targets tracking you rather than a fixed Setup value."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: date, max: toISODate(/* @__PURE__ */ new Date()), onChange: (e) => setDate(e.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: `Weight (${wUnit})` }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", step: "0.1", value: text, onChange: (e) => onChange(e, setMetricKg), placeholder: units === "imperial" ? "154.0" : "70.0" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, marginTop: 16 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSave, disabled: !text || status === "saving" }, status === "saving" ? "Saving\u2026" : weightLog[date] !== void 0 ? "Update this day" : "Save this day"), status === "saved" && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 13, color: mint }), " Saved")), status === "error" && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, errorMsg, " ", /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "2px 8px", marginLeft: 8 }, onClick: handleSave }, "Retry")));
   }
   function WeightLogTable({ weightLog, onSave, onDelete, units }) {
     const [editingDate, setEditingDate] = useState(null);
+    const editingDateRef = useRef(null);
     const [draft, setDraft] = useState("");
+    const [status, setStatus] = useState("idle");
+    const [errorMsg, setErrorMsg] = useState(null);
     const dates = Object.keys(weightLog).sort().reverse();
     function startEdit(date) {
+      editingDateRef.current = date;
       setEditingDate(date);
+      setStatus("idle");
+      setErrorMsg(null);
       setDraft(String(roundTo(kgToDisplay(weightLog[date], units), 1)));
+      storageGet("weight-log", null).then((fresh) => {
+        if (editingDateRef.current !== date || !fresh || fresh[date] === void 0) return;
+        setDraft(String(roundTo(kgToDisplay(fresh[date], units), 1)));
+      });
     }
-    function commitEdit(date) {
-      const v = parseFloat(draft);
-      if (!Number.isNaN(v) && v > 0) onSave(date, Math.round(displayToKg(v, units) * 100) / 100);
+    function cancelEdit() {
+      editingDateRef.current = null;
       setEditingDate(null);
+    }
+    async function commitEdit(date) {
+      const v = parseFloat(draft);
+      if (Number.isNaN(v) || v <= 0) return;
+      setStatus("saving");
+      setErrorMsg(null);
+      try {
+        await onSave(date, Math.round(displayToKg(v, units) * 100) / 100);
+        editingDateRef.current = null;
+        setEditingDate(null);
+        setStatus("idle");
+      } catch (e) {
+        setStatus("error");
+        setErrorMsg(e.message || "Save failed \u2014 check the local server connection and retry.");
+      }
     }
     return /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Date"), /* @__PURE__ */ React.createElement("th", null, "Weight (", weightUnitLabel(units), ")"), /* @__PURE__ */ React.createElement("th", null))), /* @__PURE__ */ React.createElement("tbody", null, dates.map((date) => {
       const kg = weightLog[date];
       const editing = editingDate === date;
-      return /* @__PURE__ */ React.createElement("tr", { key: date }, /* @__PURE__ */ React.createElement("td", null, date), editing ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", step: "0.1", value: draft, onChange: (ev) => setDraft(ev.target.value) })), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px", marginRight: 6 }, onClick: () => commitEdit(date) }, "Save"), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px" }, onClick: () => setEditingDate(null) }, "Cancel"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, fmt(kgToDisplay(kg, units), 1)), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(date), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+      return /* @__PURE__ */ React.createElement(React.Fragment, { key: date }, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, date), editing ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("input", { className: "inp", style: { padding: "4px 6px", textAlign: "right" }, type: "number", step: "0.1", value: draft, onChange: (ev) => setDraft(ev.target.value) })), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px", marginRight: 6 }, onClick: () => commitEdit(date), disabled: status === "saving" }, status === "saving" ? "Saving\u2026" : "Save"), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px" }, onClick: cancelEdit, disabled: status === "saving" }, "Cancel"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("td", null, fmt(kgToDisplay(kg, units), 1)), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(date), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
         if (confirm(`Delete weight entry for ${date}?`)) onDelete(date);
-      }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))));
+      }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral }))))), editing && status === "error" && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 3, style: { padding: 0 } }, /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, errorMsg, " ", /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "2px 8px", marginLeft: 8 }, onClick: () => commitEdit(date) }, "Retry")))));
     })));
   }
   const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const ACTIVITY_COLORS = { Run: coral, Ride: cyan, Swim: mint, Row: lavender, Strength: gold, Other: amber };
+  const ACTIVITY_EMOJI = { Run: "\u{1F3C3}", Ride: "\u{1F6B4}", Swim: "\u{1F3CA}", Row: "\u{1F6A3}", Strength: "\u{1F3CB}\uFE0F", Other: "\u26A1" };
   const DEFAULT_TAPER_DAYS = 10;
   function emptyScheduleForm() {
     return {
@@ -1471,16 +1791,41 @@
       transition: "background 0.3s, border-color 0.3s"
     };
   }
-  function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData }) {
-    var _a;
+  function ScheduleTab({
+    schedule,
+    onAdd,
+    onUpdate,
+    onDelete,
+    stravaData,
+    intervalsData,
+    onImportFile,
+    importFileError,
+    importFileNotice,
+    matchOverrides,
+    onSetMatchOverride,
+    profile,
+    setProfile,
+    weightLog,
+    matchedKcalRates
+  }) {
+    var _a, _b;
     const [form, setForm] = useState(emptyScheduleForm());
     const [editingId, setEditingId] = useState(null);
     const [highlightIds, setHighlightIds] = useState([]);
+    const [scheduleDragOver, setScheduleDragOver] = useState(false);
+    const [editingMatchDay, setEditingMatchDay] = useState(null);
     const itemRefs = useRef({});
+    const showActual = profile.scheduleShowActual !== false;
+    const showCalories = profile.scheduleShowCalories !== false;
     const activityLibrary = useMemo(
       () => getActivityLibrary(stravaData, intervalsData),
       [stravaData, intervalsData]
     );
+    const actualsByDate = useMemo(() => {
+      const map = {};
+      for (const a of activityLibrary) (map[a.date] || (map[a.date] = [])).push(a);
+      return map;
+    }, [activityLibrary]);
     function applySourceActivity(key) {
       const src = activityLibrary.find((a) => a.key === key);
       if (!src) {
@@ -1619,13 +1964,136 @@
       const { sessions, taper } = getEffectiveSessionsForDate(schedule, key);
       const raceToday = races.find((r) => r.raceDate === key);
       const carbLoad = getCarbLoadState(schedule, key);
-      calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad });
+      const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
+      const dayActuals = actualsByDate[key] || [];
+      const { pairs, extras } = matchDayActivities(plannedItems, dayActuals, matchOverrides[key]);
+      const weightForDay = (_a = weightLog[key]) != null ? _a : parseFloat(profile.weightKg) || null;
+      const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay, matchedKcalRates), 0);
+      const actualKcal = dayActuals.reduce((sum, a) => sum + a.kcal, 0);
+      calendarDays.push({
+        key,
+        date: d,
+        sessions,
+        taper,
+        race: raceToday,
+        carbLoad,
+        pairs,
+        extras,
+        dayActuals,
+        expectedKcal,
+        actualKcal
+      });
     }
     const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "Next 3 weeks"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 16, marginBottom: 10, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "checkbox",
+        checked: showActual,
+        onChange: (e) => setProfile((p) => ({ ...p, scheduleShowActual: e.target.checked }))
+      }
+    ), "Show actual/matched workouts"), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "checkbox",
+        checked: showCalories,
+        onChange: (e) => setProfile((p) => ({ ...p, scheduleShowCalories: e.target.checked }))
+      }
+    ), "Show expected/actual calories burned")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "Next 3 weeks"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day"), showActual && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, "solid = planned, outline = actual ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 10, color: mint }), " matched"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim }), " click to correct a match")), showCalories && /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { color: cyan } }, "expected"), " / ", /* @__PURE__ */ React.createElement("span", { style: { color: amber } }, "actual"), " kcal burned")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
       const isToday = day.key === todayKey;
+      const isPast = day.key < todayKey;
       const isFirstOfMonth = day.date.getDate() === 1;
       const clickable = day.sessions.length > 0 || !!day.race;
+      function plannedChip(planned, i, isGroup) {
+        if (planned.isRace) {
+          return /* @__PURE__ */ React.createElement(
+            "div",
+            {
+              key: `p${i}`,
+              title: `Race: ${planned.notes || planned.activityType} \xB7 ${planned.durationMin}min${isGroup ? " \xB7 matched to multiple activities" : ""}`,
+              style: {
+                background: gold,
+                color: ink,
+                borderRadius: 3,
+                padding: "2px 5px",
+                fontSize: 10.5,
+                lineHeight: 1.3,
+                fontWeight: 700,
+                display: "flex",
+                alignItems: "center",
+                gap: 3,
+                overflow: "hidden"
+              }
+            },
+            /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 9, color: ink }),
+            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, planned.notes || planned.activityType),
+            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, "\u{1F3C6}"),
+            isGroup && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 8, color: ink })
+          );
+        }
+        return /* @__PURE__ */ React.createElement(
+          "div",
+          {
+            key: `p${i}`,
+            title: `${planned.activityType} \xB7 ${ZONES[planned.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${planned.durationMin}min${planned.notes ? ` \xB7 ${planned.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}${isGroup ? " \xB7 matched to multiple activities" : ""}`,
+            style: {
+              background: ACTIVITY_COLORS[planned.activityType] || dim,
+              color: ink,
+              borderRadius: 3,
+              padding: "2px 5px",
+              fontSize: 10.5,
+              lineHeight: 1.3,
+              fontWeight: 600,
+              display: "flex",
+              alignItems: "center",
+              gap: 3,
+              opacity: day.taper ? 0.65 : 1,
+              overflow: "hidden"
+            }
+          },
+          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, planned.activityType, " Z", planned.zone, " \xB7 ", planned.durationMin, "m"),
+          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[planned.activityType] || "\u{1F3AF}"),
+          isPreloadWorthy(planned) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink }),
+          isGroup && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 8, color: ink })
+        );
+      }
+      function actualChip(actual, matched, i, manual) {
+        const color = ACTIVITY_COLORS[actual.activityType] || dim;
+        return /* @__PURE__ */ React.createElement(
+          "div",
+          {
+            key: `a${i}`,
+            title: `${actual.name} \xB7 ${actual.activityType} \xB7 ${actual.durationMin}min${matched ? " \xB7 matched to the plan" : " \xB7 not on the schedule"}${manual ? " \xB7 manually corrected" : ""}`,
+            style: {
+              border: `1px solid ${color}`,
+              color,
+              borderRadius: 3,
+              padding: "2px 5px",
+              fontSize: 10.5,
+              lineHeight: 1.3,
+              fontWeight: 600,
+              display: "flex",
+              alignItems: "center",
+              gap: 3,
+              overflow: "hidden"
+            }
+          },
+          matched && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 9, color }),
+          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, actual.activityType, " \xB7 ", actual.durationMin, "m"),
+          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[actual.activityType] || "\u{1F3AF}"),
+          manual && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 8, color })
+        );
+      }
+      function actualChipGroup(actuals, i, manual) {
+        return /* @__PURE__ */ React.createElement("div", { key: `ag${i}`, style: {
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+          border: `1px dashed ${dim}`,
+          borderRadius: 4,
+          padding: 2
+        } }, actuals.map((a, j) => actualChip(a, true, `${i}-${j}`, manual)));
+      }
       return /* @__PURE__ */ React.createElement(
         "div",
         {
@@ -1641,60 +2109,162 @@
             display: "flex",
             flexDirection: "column",
             gap: 3,
-            cursor: clickable ? "pointer" : "default"
+            cursor: clickable ? "pointer" : "default",
+            opacity: isPast ? 0.5 : 1
           }
         },
-        /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold }))),
-        day.race && /* @__PURE__ */ React.createElement(
+        /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold })), showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            title: "Correct planned/actual matches for this day",
+            onClick: (e) => {
+              e.stopPropagation();
+              setEditingMatchDay(day.key);
+            },
+            style: { marginLeft: "auto", background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }
+          },
+          /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim })
+        )),
+        showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && /* @__PURE__ */ React.createElement(
           "div",
           {
-            title: `Race: ${day.race.notes || day.race.activityType} \xB7 ${day.race.durationMin}min`,
+            title: `Expected ${Math.round(day.expectedKcal)} kcal \xB7 Actual ${Math.round(day.actualKcal)} kcal burned`,
             style: {
-              background: gold,
-              color: ink,
-              borderRadius: 3,
-              padding: "2px 5px",
-              fontSize: 10.5,
-              lineHeight: 1.3,
-              fontWeight: 700,
+              borderBottom: `1px solid ${line}`,
+              paddingBottom: 4,
+              marginBottom: 1,
+              fontSize: 10,
               display: "flex",
-              alignItems: "center",
-              gap: 3
+              justifyContent: "space-between",
+              gap: 4
             }
           },
-          /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 9, color: ink }),
-          " ",
-          day.race.notes || day.race.activityType
+          /* @__PURE__ */ React.createElement("span", { style: { color: cyan, fontWeight: 600 } }, Math.round(day.expectedKcal)),
+          /* @__PURE__ */ React.createElement("span", { style: { color: dim } }, "/"),
+          /* @__PURE__ */ React.createElement("span", { style: { color: amber, fontWeight: 600 } }, Math.round(day.actualKcal))
         ),
-        day.sessions.map((s, i) => /* @__PURE__ */ React.createElement(
-          "div",
-          {
-            key: i,
-            title: `${s.activityType} \xB7 ${ZONES[s.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${s.durationMin}min${s.notes ? ` \xB7 ${s.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}`,
-            style: {
-              background: ACTIVITY_COLORS[s.activityType] || dim,
-              color: ink,
-              borderRadius: 3,
-              padding: "2px 5px",
-              fontSize: 10.5,
-              lineHeight: 1.3,
-              fontWeight: 600,
-              display: "flex",
-              alignItems: "center",
-              gap: 3,
-              opacity: day.taper ? 0.65 : 1
-            }
-          },
-          s.activityType,
-          " Z",
-          s.zone,
-          " \xB7 ",
-          s.durationMin,
-          "m",
-          isPreloadWorthy(s) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink })
-        ))
+        showActual ? /* @__PURE__ */ React.createElement(React.Fragment, null, day.pairs.map(({ planned, actual, manual }, i) => {
+          const isGroup = Array.isArray(actual);
+          return /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i, isGroup), isGroup ? actualChipGroup(actual, i, manual) : actual ? actualChip(actual, true, i, manual) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null);
+        }), day.extras.map((actual, i) => /* @__PURE__ */ React.createElement("div", { key: `extra${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, /* @__PURE__ */ React.createElement("div", null), actualChip(actual, false, i)))) : day.pairs.map(({ planned }, i) => plannedChip(planned, i))
       );
-    }))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: form.kind === "race" ? ICONS.trophy : ICONS.calendar, size: 16, color: cyan }), " ", editingId ? "Edit scheduled session" : "Add to schedule"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, form.kind === "race" ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days." : form.kind === "single" ? "A single session on one specific date \u2014 doesn't repeat, and won't affect any other day." : /* @__PURE__ */ React.createElement(React.Fragment, null, "Repeats on the days you pick, within the date range. Projects up to ", FORWARD_DAYS, " days ahead on the dashboard as an estimate \u2014 once a real activity syncs in for that day, it takes over automatically.")), !editingId && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4, marginBottom: 16 } }, /* @__PURE__ */ React.createElement(
+    }))), editingMatchDay && (() => {
+      const day = calendarDays.find((d) => d.key === editingMatchDay);
+      if (!day) return null;
+      const dayOverrides = matchOverrides[day.key] || {};
+      return /* @__PURE__ */ React.createElement("div", { style: {
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        zIndex: 50,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20
+      }, onClick: () => setEditingMatchDay(null) }, /* @__PURE__ */ React.createElement("div", { onClick: (e) => e.stopPropagation(), style: {
+        background: panel2,
+        border: `1px solid ${line}`,
+        borderRadius: 8,
+        padding: 20,
+        width: 420,
+        maxWidth: "100%",
+        maxHeight: "80vh",
+        overflowY: "auto"
+      } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 14 } }, day.date.toLocaleDateString(void 0, { weekday: "long", month: "short", day: "numeric" })), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => setEditingMatchDay(null),
+          style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }
+        },
+        "\xD7"
+      )), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: dim, marginBottom: 16, lineHeight: 1.5 } }, 'Correct which logged activity matches each planned session, if the automatic guess got it wrong \u2014 or pick more than one to group several activities into one match (e.g. a "Triathlon" race entry that actually shows up on Strava as a separate swim, bike, and run).'), day.pairs.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16 } }, "Nothing scheduled this day."), day.pairs.map(({ planned, actual }, i) => {
+        const pk = plannedMatchKey(planned);
+        const label = planned.isRace ? `Race: ${planned.notes || planned.activityType}` : `${planned.activityType} Z${planned.zone} \xB7 ${planned.durationMin}m${planned.notes ? ` \xB7 ${planned.notes}` : ""}`;
+        const hasOverride = Object.prototype.hasOwnProperty.call(dayOverrides, pk);
+        const overrideValue = dayOverrides[pk];
+        const mode = !hasOverride ? "auto" : overrideValue === null ? "none" : "custom";
+        const selectedKeys = mode === "custom" ? Array.isArray(overrideValue) ? overrideValue : [overrideValue] : [];
+        const actualNames = actual ? Array.isArray(actual) ? actual.map((a) => a.name) : [actual.name] : [];
+        return /* @__PURE__ */ React.createElement("div", { key: i, style: { marginBottom: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, fontWeight: 600, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 } }, /* @__PURE__ */ React.createElement("span", { style: {
+          width: 8,
+          height: 8,
+          borderRadius: 2,
+          background: planned.isRace ? gold : ACTIVITY_COLORS[planned.activityType] || dim,
+          display: "inline-block"
+        } }), label), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 4 } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "radio",
+            name: `match-mode-${day.key}-${pk}`,
+            checked: mode === "auto",
+            onChange: () => onSetMatchOverride(day.key, pk, void 0)
+          }
+        ), "Auto (let the app guess)"), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "radio",
+            name: `match-mode-${day.key}-${pk}`,
+            checked: mode === "none",
+            onChange: () => onSetMatchOverride(day.key, pk, null)
+          }
+        ), "No match"), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "radio",
+            name: `match-mode-${day.key}-${pk}`,
+            checked: mode === "custom",
+            onChange: () => onSetMatchOverride(day.key, pk, actual ? Array.isArray(actual) ? actual.map((a) => a.key) : [actual.key] : [])
+          }
+        ), "Choose specific activities"), mode === "custom" && /* @__PURE__ */ React.createElement("div", { style: { marginLeft: 22, display: "flex", flexDirection: "column", gap: 3, marginTop: 2 } }, day.dayActuals.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim } }, "No activities synced this day."), day.dayActuals.map((a) => /* @__PURE__ */ React.createElement("label", { key: a.key, style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "checkbox",
+            checked: selectedKeys.includes(a.key),
+            onChange: () => {
+              const next = selectedKeys.includes(a.key) ? selectedKeys.filter((k) => k !== a.key) : [...selectedKeys, a.key];
+              onSetMatchOverride(day.key, pk, next);
+            }
+          }
+        ), a.activityType, " \xB7 ", a.durationMin, "m \xB7 ", a.name)))), mode === "auto" && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: dim, marginTop: 4 } }, "Auto-detected", actualNames.length ? ` \u2014 matched to "${actualNames.join('", "')}"` : " \u2014 no match found"));
+      }), day.dayActuals.length === 0 && day.pairs.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim } }, "No Strava/intervals.icu activities synced for this day.")));
+    })(), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " Import schedule from file"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file. It's saved under ", /* @__PURE__ */ React.createElement("code", null, "schedule_sources/"), " and re-imported automatically from then on whenever that file's contents change \u2014 no need to come back here and re-upload it."), /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        onDragOver: (e) => {
+          e.preventDefault();
+          setScheduleDragOver(true);
+        },
+        onDragLeave: () => setScheduleDragOver(false),
+        onDrop: (e) => {
+          e.preventDefault();
+          setScheduleDragOver(false);
+          if (e.dataTransfer.files[0]) onImportFile(e.dataTransfer.files[0]);
+        },
+        style: {
+          border: `1.5px dashed ${scheduleDragOver ? cyan : line}`,
+          borderRadius: 6,
+          padding: "28px 20px",
+          textAlign: "center",
+          background: scheduleDragOver ? "rgba(79,209,217,0.05)" : "transparent",
+          transition: "all 0.15s"
+        }
+      },
+      /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "center", marginBottom: 10 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 22, color: dim })),
+      /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, marginBottom: 12 } }, "Drop a .json schedule file here, or"),
+      /* @__PURE__ */ React.createElement("label", { className: "btn-ghost", style: { display: "inline-block" } }, "Choose file", /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "file",
+          accept: ".json,application/json",
+          style: { display: "none" },
+          onChange: (e) => {
+            if (e.target.files[0]) onImportFile(e.target.files[0]);
+            e.target.value = "";
+          }
+        }
+      ))
+    ), importFileError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, importFileError), !importFileError && importFileNotice && /* @__PURE__ */ React.createElement(Banner, { kind: "success" }, importFileNotice)), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: form.kind === "race" ? ICONS.trophy : ICONS.calendar, size: 16, color: cyan }), " ", editingId ? "Edit scheduled session" : "Add to schedule"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, form.kind === "race" ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days." : form.kind === "single" ? "A single session on one specific date \u2014 doesn't repeat, and won't affect any other day." : /* @__PURE__ */ React.createElement(React.Fragment, null, "Repeats on the days you pick, within the date range. Projects up to ", FORWARD_DAYS, " days ahead on the dashboard as an estimate \u2014 once a real activity syncs in for that day, it takes over automatically.")), !editingId && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4, marginBottom: 16 } }, /* @__PURE__ */ React.createElement(
       "button",
       {
         type: "button",
@@ -1721,7 +2291,7 @@
       },
       /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 13, color: form.kind === "race" ? ink : dim }),
       " Race"
-    )), /* @__PURE__ */ React.createElement("div", { style: { marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Model demand on" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: ((_a = form.sourceActivity) == null ? void 0 : _a.key) || "", onChange: (e) => applySourceActivity(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Manual (MET estimate from activity type / zone / duration below)"), activityLibrary.map((a) => /* @__PURE__ */ React.createElement("option", { key: a.key, value: a.key }, sourceActivityLabel(a)))), form.sourceActivity ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Demand estimate will scale from this session's actual ", fmt(form.sourceActivity.kcal / form.sourceActivity.durationMin, 1), " kcal/min \u2014 activity type/zone below were pre-filled from it, and duration can still be adjusted.") : activityLibrary.length === 0 ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "No synced Strava/intervals.icu activities in the last ", ACTIVITY_LIBRARY_DAYS, " days yet.") : null)), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Activity type" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: form.activityType, onChange: (e) => setForm((f) => ({ ...f, activityType: e.target.value })) }, ACTIVITY_TYPES.map((t) => /* @__PURE__ */ React.createElement("option", { key: t, value: t }, t)))), /* @__PURE__ */ React.createElement(Field, { label: form.kind === "race" ? "Expected finish time (min)" : "Duration (min)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "1", value: form.durationMin, onChange: (e) => setForm((f) => ({ ...f, durationMin: e.target.value })) }))), /* @__PURE__ */ React.createElement(Field, { label: "Intensity zone" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, ZONES.map((z) => /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", { style: { marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Model demand on" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: ((_b = form.sourceActivity) == null ? void 0 : _b.key) || "", onChange: (e) => applySourceActivity(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Manual (MET estimate from activity type / zone / duration below)"), activityLibrary.map((a) => /* @__PURE__ */ React.createElement("option", { key: a.key, value: a.key }, sourceActivityLabel(a)))), form.sourceActivity ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Demand estimate will scale from this session's actual ", fmt(form.sourceActivity.kcal / form.sourceActivity.durationMin, 1), " kcal/min \u2014 activity type/zone below were pre-filled from it, and duration can still be adjusted.") : activityLibrary.length === 0 ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "No synced Strava/intervals.icu activities in the last ", ACTIVITY_LIBRARY_DAYS, " days yet.") : null)), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Activity type" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: form.activityType, onChange: (e) => setForm((f) => ({ ...f, activityType: e.target.value })) }, ACTIVITY_TYPES.map((t) => /* @__PURE__ */ React.createElement("option", { key: t, value: t }, t)))), /* @__PURE__ */ React.createElement(Field, { label: form.kind === "race" ? "Expected finish time (min)" : "Duration (min)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "1", value: form.durationMin, onChange: (e) => setForm((f) => ({ ...f, durationMin: e.target.value })) }))), /* @__PURE__ */ React.createElement(Field, { label: "Intensity zone" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, ZONES.map((z) => /* @__PURE__ */ React.createElement(
       "button",
       {
         key: z.n,
@@ -1732,7 +2302,7 @@
       },
       "Z",
       z.n
-    ))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, ZONES[form.zone - 1].label, " \xB7 ", ZONES[form.zone - 1].hrPct)), form.kind === "race" ? /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Race date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.raceDate, onChange: (e) => setForm((f) => ({ ...f, raceDate: e.target.value })) })), /* @__PURE__ */ React.createElement(Field, { label: "Taper starts (days before race)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", value: form.taperDays, onChange: (e) => setForm((f) => ({ ...f, taperDays: e.target.value })) }))) : form.kind === "single" ? /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.date, onChange: (e) => setForm((f) => ({ ...f, date: e.target.value })) }))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement("span", { className: "fieldlabel" }, "Days of week"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, WEEKDAY_LABELS.map((label, n) => /* @__PURE__ */ React.createElement(
+    ))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, ZONES[form.zone - 1].label, " \xB7 ", ZONES[form.zone - 1].hrPct)), form.kind === "race" ? /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Race date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.raceDate, onChange: (e) => setForm((f) => ({ ...f, raceDate: e.target.value })) })), /* @__PURE__ */ React.createElement(Field, { label: "Taper starts (days before race)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "0", value: form.taperDays, onChange: (e) => setForm((f) => ({ ...f, taperDays: e.target.value })) }))) : form.kind === "single" ? /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.date, onChange: (e) => setForm((f) => ({ ...f, date: e.target.value })) }))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement("span", { className: "fieldlabel" }, "Days of week"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, WEEKDAY_LABELS.map((label, n) => /* @__PURE__ */ React.createElement(
       "button",
       {
         key: n,
@@ -1741,7 +2311,7 @@
         style: form.daysOfWeek.includes(n) ? { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 700, fontSize: 11.5, cursor: "pointer", border: "none", background: amber, color: ink } : { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 600, fontSize: 11.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }
       },
       label
-    )))), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 14, marginTop: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement(Field, { label: "Start date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.startDate, onChange: (e) => setForm((f) => ({ ...f, startDate: e.target.value })) })), /* @__PURE__ */ React.createElement(Field, { label: "End date" }, /* @__PURE__ */ React.createElement(
+    )))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 140px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Start date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.startDate, onChange: (e) => setForm((f) => ({ ...f, startDate: e.target.value })) }))), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 140px" } }, /* @__PURE__ */ React.createElement(Field, { label: "End date" }, /* @__PURE__ */ React.createElement(
       "input",
       {
         className: "inp",
@@ -1751,7 +2321,7 @@
         onChange: (e) => setForm((f) => ({ ...f, endDate: e.target.value })),
         style: { opacity: form.ongoing ? 0.5 : 1 }
       }
-    )), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.ongoing, onChange: (e) => setForm((f) => ({ ...f, ongoing: e.target.checked })) }), "Ongoing"))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Notes (optional)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: form.notes, onChange: (e) => setForm((f) => ({ ...f, notes: e.target.value })), placeholder: form.kind === "race" ? "e.g. Boston Marathon" : "e.g. track intervals" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 18 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSubmit }, editingId ? "Save changes" : form.kind === "race" ? "Add race" : "Add to schedule"), editingId && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: cancelEdit }, "Cancel"))), races.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 16, color: gold }), " Races"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 } }, races.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, ref: (el) => {
+    ))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.ongoing, onChange: (e) => setForm((f) => ({ ...f, ongoing: e.target.checked })) }), "Ongoing"))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Notes (optional)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: form.notes, onChange: (e) => setForm((f) => ({ ...f, notes: e.target.value })), placeholder: form.kind === "race" ? "e.g. Boston Marathon" : "e.g. track intervals" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 18 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSubmit }, editingId ? "Save changes" : form.kind === "race" ? "Add race" : "Add to schedule"), editingId && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: cancelEdit }, "Cancel"))), races.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 16, color: gold }), " Races"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 } }, races.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, ref: (el) => {
       itemRefs.current[s.id] = el;
     }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.notes || s.activityType), " \xB7 ", s.activityType, " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.raceDate, " \xB7 taper starts ", s.taperDays, "d out", s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
       if (confirm("Delete this race?")) onDelete(s.id);
@@ -1813,7 +2383,7 @@
       // viewport, since "auto" tracks size to their content's min-content
       // width. That silently broke the page's centering only while Dashboard
       // was open, since it's the only tab with fixed-width content this wide.
-      /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" } }, (summary.trainingMissingDays > 0 || summary.nutritionMissingDays > 0) && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: "rgba(232,163,61,0.1)", border: `1px solid ${amber}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 16, color: amber }), /* @__PURE__ */ React.createElement("div", null, summary.trainingMissingDays > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, summary.trainingMissingDays), " day", summary.trainingMissingDays === 1 ? "" : "s", " with no training data synced yet (demand is a floor, not the full picture)."), summary.nutritionMissingDays > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, summary.nutritionMissingDays), " day", summary.nutritionMissingDays === 1 ? "" : "s", " with no nutrition logged."))), goalParams.sign !== 0 && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: "rgba(79,209,217,0.08)", border: `1px solid ${cyan}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 16, color: cyan }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, goalParams.label), " at ", goalParams.ratePct, "%/week.", trendCalibration && trendCorrection && !trendCorrection.insufficient && /* @__PURE__ */ React.createElement(React.Fragment, null, " Trend calibration is live: ", trendCorrection.correctionKcal >= 0 ? "+" : "", fmt(trendCorrection.correctionKcal), " kcal/day applied based on your actual ", fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2), " ", wUnit, "/wk trend."), trendCalibration && trendCorrection && trendCorrection.insufficient && /* @__PURE__ */ React.createElement(React.Fragment, null, " Log weight for ~10+ days to enable trend-based calibration (", trendCorrection.n, " logged so far)."))), weightGoalStatus && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: SEVERITY_BG[weightGoalStatus.severity], border: `1px solid ${SEVERITY_COLOR[weightGoalStatus.severity]}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 16, color: SEVERITY_COLOR[weightGoalStatus.severity] }), /* @__PURE__ */ React.createElement("div", null, formatWeightGoalMessage(weightGoalStatus, units))), !summary.noIntake && /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 } }, /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. daily target", value: `${fmt(summary.avgTarget)} kcal`, color: cyan }), /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. daily intake", value: `${fmt(summary.avgIntake)} kcal`, color: paper }), /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. gap", value: `${summary.avgGap >= 0 ? "+" : ""}${fmt(summary.avgGap)} kcal`, color: summary.avgGap < -200 ? coral : summary.avgGap > 200 ? amber : mint }), /* @__PURE__ */ React.createElement(StatCard, { label: "Off-target days", value: `${summary.deficitDays} / ${summary.trackedDays}`, color: summary.deficitDays > summary.trackedDays / 3 ? coral : dim })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 16px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12, padding: "0 4px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, position: "relative" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14 } }, "Target vs. intake"), /* @__PURE__ */ React.createElement(
+      /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" } }, (summary.trainingMissingDays > 0 || summary.nutritionMissingDays > 0) && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: "rgba(232,163,61,0.1)", border: `1px solid ${amber}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 16, color: amber }), /* @__PURE__ */ React.createElement("div", null, summary.trainingMissingDays > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, summary.trainingMissingDays), " day", summary.trainingMissingDays === 1 ? "" : "s", " with no training data synced yet (demand is a floor, not the full picture)."), summary.nutritionMissingDays > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, summary.nutritionMissingDays), " day", summary.nutritionMissingDays === 1 ? "" : "s", " with no nutrition logged."))), goalParams.sign !== 0 && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: "rgba(79,209,217,0.08)", border: `1px solid ${cyan}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 16, color: cyan }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, goalParams.label), " at ", goalParams.ratePct, "%/week.", trendCalibration && trendCorrection && !trendCorrection.insufficient && /* @__PURE__ */ React.createElement(React.Fragment, null, " Trend calibration is live: ", trendCorrection.correctionKcal >= 0 ? "+" : "", fmt(trendCorrection.correctionKcal), " kcal/day applied based on your actual ", fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2), " ", wUnit, "/wk trend."), trendCalibration && trendCorrection && trendCorrection.insufficient && /* @__PURE__ */ React.createElement(React.Fragment, null, " Log weight for ~10+ days to enable trend-based calibration (", trendCorrection.n, " logged so far)."))), weightGoalStatus && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: SEVERITY_BG[weightGoalStatus.severity], border: `1px solid ${SEVERITY_COLOR[weightGoalStatus.severity]}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 16, color: SEVERITY_COLOR[weightGoalStatus.severity] }), /* @__PURE__ */ React.createElement("div", null, formatWeightGoalMessage(weightGoalStatus, units))), !summary.noIntake && /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14 } }, /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. daily target", value: `${fmt(summary.avgTarget)} kcal`, color: cyan }), /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. daily intake", value: `${fmt(summary.avgIntake)} kcal`, color: paper }), /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. gap", value: `${summary.avgGap >= 0 ? "+" : ""}${fmt(summary.avgGap)} kcal`, color: summary.avgGap < -200 ? coral : summary.avgGap > 200 ? amber : mint }), /* @__PURE__ */ React.createElement(StatCard, { label: "Off-target days", value: `${summary.deficitDays} / ${summary.trackedDays}`, color: summary.deficitDays > summary.trackedDays / 3 ? coral : dim })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 16px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12, padding: "0 4px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, position: "relative" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14 } }, "Target vs. intake"), /* @__PURE__ */ React.createElement(
         "button",
         {
           onClick: () => setShowInfoPopout((v) => !v),
@@ -1878,7 +2448,7 @@
     return /* @__PURE__ */ React.createElement("div", { style: { position: "absolute", top: 26, left: 0, zIndex: 20, width: 340, maxWidth: "80vw", background: panel2, border: `1px solid ${line}`, borderRadius: 6, padding: 16, boxShadow: "0 10px 28px rgba(0,0,0,0.45)" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 12.5 } }, "About these targets"), /* @__PURE__ */ React.createElement("button", { onClick: onClose, style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0 } }, "\xD7")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: dim, lineHeight: 1.6 } }, "Carbs follow the IOC/Burke carbohydrate-periodization framework (3\u20135 g/kg on light days up to 8\u201312 g/kg on 3h+ high-volume days), blending toward the top of the range the harder the day's training was \u2014 and if tomorrow has a demanding session scheduled (90min+ or Zone 4+), today's target pre-loads toward that higher tier too, per GSSI guidance to scale carbs to the demands of the ", /* @__PURE__ */ React.createElement("i", null, "upcoming"), " session. Protein is a flat ", /* @__PURE__ */ React.createElement("b", { style: { color: paper } }, proteinGPerKg, " g/kg/day"), " (adjustable in Setup \u2014 Model tuning). Fat fills whatever's left of the day's calorie Target after carbs and protein, with a floor of 20% of Target \u2014 sports-nutrition consensus treats fat below ~20% of total energy as a performance/health risk. These are general guidelines, not individualized advice."), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, paddingTop: 12, borderTop: `1px solid ${line}`, fontSize: 11.5, color: dim, lineHeight: 1.6 } }, /* @__PURE__ */ React.createElement("b", { style: { color: paper } }, "In-session (\u226560 min):"), " 30\u201360 g carb/hour, up to ~90 g/hour beyond ~2.5h using multiple carb sources \u2014 practice this in training, don't debut it on race day.", /* @__PURE__ */ React.createElement("br", null), /* @__PURE__ */ React.createElement("b", { style: { color: paper } }, "Recovery window:"), " if under ~8h until your next session, aim for ~1.0\u20131.2 g/kg carb plus 20\u201340 g protein within the first couple hours post-workout."));
   }
   function FuelingReferencePanel({ fuelingByTier }) {
-    return /* @__PURE__ */ React.createElement("div", { style: { marginTop: 16, paddingTop: 16, borderTop: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: fuelingByTier.length ? 18 : 0 } }, FUEL_TIERS.map((t) => /* @__PURE__ */ React.createElement("div", { key: t.tier, style: { background: panel2, border: `1px solid ${line}`, borderRadius: 5, padding: "10px 12px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginBottom: 4 } }, t.label), /* @__PURE__ */ React.createElement("div", { style: { fontFamily: mono, fontSize: 12.5 } }, t.carbLo, "\u2013", t.carbHi, " g/kg carb")))), fuelingByTier.length > 0 && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, fontWeight: 600, marginBottom: 10 } }, "Your averages by tier, this window"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8 } }, fuelingByTier.map((g) => /* @__PURE__ */ React.createElement("div", { key: g.tier, style: { display: "flex", alignItems: "center", gap: 12, fontSize: 12.5 } }, /* @__PURE__ */ React.createElement("div", { style: { width: 130, color: dim, flexShrink: 0 } }, g.label, " ", /* @__PURE__ */ React.createElement("span", { style: { fontFamily: mono } }, "(", g.n, "d)")), /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, "Carb: ", /* @__PURE__ */ React.createElement(MacroCell, { actual: g.avgCarb, target: g.avgCarbTarget }), " g"), /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, "Protein: ", /* @__PURE__ */ React.createElement(MacroCell, { actual: g.avgProtein, target: g.avgProteinTarget }), " g"), /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, "Fat: ", /* @__PURE__ */ React.createElement(MacroCell, { actual: g.avgFat, target: g.avgFatTarget }), " g"))))));
+    return /* @__PURE__ */ React.createElement("div", { style: { marginTop: 16, paddingTop: 16, borderTop: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10, marginBottom: fuelingByTier.length ? 18 : 0 } }, FUEL_TIERS.map((t) => /* @__PURE__ */ React.createElement("div", { key: t.tier, style: { background: panel2, border: `1px solid ${line}`, borderRadius: 5, padding: "10px 12px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginBottom: 4 } }, t.label), /* @__PURE__ */ React.createElement("div", { style: { fontFamily: mono, fontSize: 12.5 } }, t.carbLo, "\u2013", t.carbHi, " g/kg carb")))), fuelingByTier.length > 0 && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, fontWeight: 600, marginBottom: 10 } }, "Your averages by tier, this window"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8 } }, fuelingByTier.map((g) => /* @__PURE__ */ React.createElement("div", { key: g.tier, style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 12, fontSize: 12.5 } }, /* @__PURE__ */ React.createElement("div", { style: { width: 130, color: dim, flexShrink: 0 } }, g.label, " ", /* @__PURE__ */ React.createElement("span", { style: { fontFamily: mono } }, "(", g.n, "d)")), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 100px" } }, "Carb: ", /* @__PURE__ */ React.createElement(MacroCell, { actual: g.avgCarb, target: g.avgCarbTarget }), " g"), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 100px" } }, "Protein: ", /* @__PURE__ */ React.createElement(MacroCell, { actual: g.avgProtein, target: g.avgProteinTarget }), " g"), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 100px" } }, "Fat: ", /* @__PURE__ */ React.createElement(MacroCell, { actual: g.avgFat, target: g.avgFatTarget }), " g"))))));
   }
   function CustomTooltip({ active, payload, label }) {
     if (!active || !payload || !payload.length) return null;

@@ -119,9 +119,33 @@ function useUnitInput(metricStr, units, toDisplay, toMetric, decimals = 1) {
 
 // ---------- persistence: server-side (/api/store), shared across every device
 // pointed at this server instance, instead of per-browser localStorage ----------
+
+// Retries a transient failure (network drop, 5xx) a couple times with a short
+// backoff before giving up — the main failure mode in practice is a phone
+// briefly leaving wifi/Tailscale range mid-request, not a real server error.
+// Never retries a 4xx: that's a request the server actively rejected, not one
+// that'll succeed on a second try.
+async function fetchWithRetry(url, options, retries = 2, backoffMs = 300) {
+  for (let attempt = 0; ; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, options);
+    } catch (e) {
+      if (attempt >= retries) throw e;
+      await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
+      continue;
+    }
+    if (res.status >= 500 && attempt < retries) {
+      await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
+      continue;
+    }
+    return res;
+  }
+}
+
 async function storageGet(key, fallback) {
   try {
-    const res = await fetch(`/api/store?key=${encodeURIComponent(key)}`);
+    const res = await fetchWithRetry(`/api/store?key=${encodeURIComponent(key)}`);
     if (!res.ok) return fallback;
     const data = await res.json();
     return data.value !== null && data.value !== undefined ? data.value : fallback;
@@ -132,13 +156,91 @@ async function storageGet(key, fallback) {
 }
 async function storageSet(key, value) {
   try {
-    await fetch(`/api/store?key=${encodeURIComponent(key)}`, {
+    await fetchWithRetry(`/api/store?key=${encodeURIComponent(key)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(value),
     });
   } catch (e) {
     console.error("storage set failed", key, e);
+  }
+}
+
+// ---------- per-date nutrition/weight persistence ----------
+// Unlike storageSet above (which PUTs a whole collection and trusts the
+// client's copy of it completely — fine for keys only ever edited from one
+// place, like training-schedule or profile), these merge just the one date
+// server-side, so a stale client (a second device, or a tab left open across
+// the nightly Google auto-sync in server.py) can never wholesale-overwrite
+// every other date's data with its own out-of-date snapshot. These throw on
+// failure (after the same retry treatment) so callers can show a real
+// save-failed state instead of a silent no-op.
+async function apiSaveNutritionDay(date, manual) {
+  const res = await fetchWithRetry(`/api/nutrition/day?date=${date}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ manual }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+  return data.entry;
+}
+async function apiDeleteNutritionDay(date) {
+  const res = await fetchWithRetry(`/api/nutrition/day/delete?date=${date}`, { method: "POST" });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Delete failed (${res.status}).`);
+  }
+}
+async function apiSaveNutritionBulk(days) {
+  const res = await fetchWithRetry("/api/nutrition/bulk", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ days }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Import failed (${res.status}).`);
+  return data.count;
+}
+async function apiImportScheduleFile(filename, data) {
+  const res = await fetchWithRetry("/api/schedule/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename, data }),
+  });
+  const result = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(result.error || `Import failed (${res.status}).`);
+  return result;
+}
+// actualKey: a specific activity key forces that match; null forces "no
+// match"; omitted entirely clears the override, reverting to the auto-guess.
+async function apiSetScheduleMatchOverride(date, plannedKey, actualKey) {
+  const body = { plannedKey };
+  if (actualKey !== undefined) body.actualKey = actualKey;
+  const res = await fetchWithRetry(`/api/schedule/match-override?date=${date}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+  return data;
+}
+async function apiSaveWeightDay(date, kg) {
+  const res = await fetchWithRetry(`/api/weight/day?date=${date}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kg }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+  return data.kg;
+}
+async function apiDeleteWeightDay(date) {
+  const res = await fetchWithRetry(`/api/weight/day/delete?date=${date}`, { method: "POST" });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Delete failed (${res.status}).`);
   }
 }
 
@@ -255,11 +357,17 @@ const CHART_DAY_WIDTH = 70; // px per day — charts render at their full data w
 // trusted directly and scaled to this session's (possibly taper-adjusted)
 // duration — more accurate than MET×weight since it reflects how this
 // specific athlete actually burns energy doing this specific workout.
-function estimatePlannedKcal(session, durationMin, weightKg) {
+function estimatePlannedKcal(session, durationMin, weightKg, matchedRates) {
   const src = session.sourceActivity;
   if (src && src.durationMin > 0 && src.kcal > 0) {
     return (src.kcal / src.durationMin) * durationMin;
   }
+  // Personalized rate learned from this athlete's own matched workouts of
+  // this exact activityType+zone (see buildMatchedKcalRates) — checked
+  // before the generic MET table since it reflects how THIS athlete actually
+  // burns energy at this intensity, not a population-average estimate.
+  const learnedRate = matchedRates && matchedRates[`${session.activityType}_Z${session.zone}`];
+  if (learnedRate > 0) return learnedRate * durationMin;
   const z = ZONES[session.zone - 1];
   if (!z || !weightKg) return 0;
   return z.met * weightKg * (durationMin / 60);
@@ -429,6 +537,148 @@ function getCarbLoadState(schedule, dateStr) {
   return { race, daysToRace };
 }
 
+// Stable per-day key for a planned item (a scheduled session or that day's
+// race), used to store a manual match correction. A recurring session's `id`
+// repeats on every date it recurs — that's fine here because overrides are
+// always looked up scoped to one date first (schedule-match-overrides[date]),
+// so the same session id on two different dates never collides.
+function plannedMatchKey(planned) {
+  return planned.isRace ? `race:${planned.id}` : `session:${planned.id}`;
+}
+
+// Pairs each planned item (a scheduled session, or that day's race) for one
+// calendar day against the real activities synced from Strava/intervals.icu
+// for that same date, so the calendar can show planned-vs-actual side by
+// side instead of just what was planned. Matching is necessarily a guess —
+// there's no ID linking a schedule entry to the activity it became — so it's
+// scoped to same activityType only, then (when a day has more than one
+// candidate of that type, e.g. two runs logged the same day) picks whichever
+// actual duration is closest to what was planned. Greedy and order-dependent,
+// but a single day rarely has enough same-type activities for that to matter.
+//
+// `overrides` (schedule-match-overrides[date], from the "correct a match" UI)
+// take priority over the guess: a plannedMatchKey present with a specific
+// actual key forces that pairing (and reserves the activity so the auto
+// heuristic can't also hand it to something else); present with `null` means
+// "confirmed no match" even if the heuristic would have guessed one; absent
+// entirely means "let the heuristic decide", the original behavior. A value
+// can also be an ARRAY of activity keys — this is the only way to express a
+// multi-part match (e.g. a "Triathlon" race entry actually showing up as a
+// separate swim/bike/run) since the auto heuristic only ever guesses a
+// single activity per planned item; a resolved pair's `actual` is then an
+// array too, which the calendar renders as a grouped cluster instead of one
+// chip. A single-element array collapses back to a plain object, same shape
+// as an ordinary one-to-one match, so callers only need to branch on
+// Array.isArray(actual) for the genuinely-grouped case.
+function matchDayActivities(plannedItems, actuals, overrides) {
+  overrides = overrides || {};
+  const byKey = {};
+  for (const a of actuals) byKey[a.key] = a;
+
+  const claimed = new Set();
+  for (const planned of plannedItems) {
+    const forced = overrides[plannedMatchKey(planned)];
+    if (Array.isArray(forced)) forced.forEach((k) => claimed.add(k));
+    else if (forced) claimed.add(forced);
+  }
+  const remaining = actuals.filter((a) => !claimed.has(a.key));
+
+  const pairs = [];
+  for (const planned of plannedItems) {
+    const pk = plannedMatchKey(planned);
+    if (Object.prototype.hasOwnProperty.call(overrides, pk)) {
+      const forced = overrides[pk];
+      let actual;
+      if (Array.isArray(forced)) {
+        const matched = forced.map((k) => byKey[k]).filter(Boolean);
+        actual = matched.length === 0 ? null : matched.length === 1 ? matched[0] : matched;
+      } else {
+        actual = forced ? (byKey[forced] || null) : null;
+      }
+      pairs.push({ planned, actual, manual: true });
+      continue;
+    }
+    const candidates = remaining.filter((a) => a.activityType === planned.activityType);
+    let match = null;
+    if (candidates.length) {
+      candidates.sort((a, b) =>
+        Math.abs(a.durationMin - planned.durationMin) - Math.abs(b.durationMin - planned.durationMin));
+      match = candidates[0];
+      remaining.splice(remaining.indexOf(match), 1);
+    }
+    pairs.push({ planned, actual: match, manual: false });
+  }
+  return { pairs, extras: remaining };
+}
+
+// Minimum real matched samples of a given (activityType, zone) before its
+// learned rate is trusted over the generic MET-table guess — one lucky/odd
+// session (e.g. a "Zone 2 run" that was actually a hard fartlek) shouldn't
+// override the table on its own.
+const MIN_MATCHED_KCAL_SAMPLES = 2;
+// How far back to gather matched real workouts for the learned rate. Long
+// enough to accumulate enough same-type/zone samples to average out
+// day-to-day noise, short enough that a real fitness change (getting
+// fitter/slower, a new training phase) isn't stuck averaging in months-old
+// sessions that no longer reflect how this athlete burns energy now.
+const MATCHED_KCAL_LOOKBACK_DAYS = 120;
+
+// Learns a personalized kcal/minute rate per (activityType, zone) from real
+// workouts that were actually matched to a scheduled session of that same
+// type/zone — using the exact same matching (and manual corrections) the
+// Schedule tab's calendar already shows, just run over a much longer history
+// than that 3-week view needs, purely to build up a statistically reliable
+// base. This sits between the two existing planned-kcal estimates in
+// estimatePlannedKcal: more specific than the generic MET table (which knows
+// nothing about this athlete), less specific than sourceActivity (which is
+// one hand-picked real session, not an average) — so it's checked after
+// sourceActivity but before falling back to the MET table.
+function buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides) {
+  const activityLibrary = getActivityLibrary(stravaData, intervalsData);
+  const byDate = {};
+  for (const a of activityLibrary) (byDate[a.date] || (byDate[a.date] = [])).push(a);
+
+  const races = getRaces(schedule);
+  const cutoff = toISODate(daysAgo(MATCHED_KCAL_LOOKBACK_DAYS));
+  const todayKey = toISODate(new Date());
+  const totals = {}; // "activityType_Zzone" -> { kcal, min, n }
+
+  for (const dateKey of Object.keys(byDate)) {
+    if (dateKey < cutoff || dateKey >= todayKey) continue; // only fully-happened past days
+    const { sessions } = getEffectiveSessionsForDate(schedule, dateKey);
+    const raceToday = races.find((r) => r.raceDate === dateKey);
+    const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
+    if (!plannedItems.length) continue;
+    const { pairs } = matchDayActivities(plannedItems, byDate[dateKey], (matchOverrides || {})[dateKey]);
+    for (const { planned, actual } of pairs) {
+      // Races are one-off efforts (all-out for the distance), not a
+      // repeatable training-zone signal worth averaging into future
+      // estimates the way a recurring Zone 2 run's rate is. This also
+      // covers the common case of a multi-part match (e.g. a "Triathlon"
+      // race grouped into its swim/bike/run) since those are race entries
+      // too — a mixed-discipline group has no single activityType/zone rate
+      // worth learning from anyway.
+      if (!actual || planned.isRace) continue;
+      const key = `${planned.activityType}_Z${planned.zone}`;
+      const t = totals[key] || (totals[key] = { kcal: 0, min: 0, n: 0 });
+      // A non-race planned item could still carry a manually-grouped
+      // multi-activity match (e.g. a hand-entered brick session) — sum
+      // across the group rather than assuming a single object.
+      for (const a of Array.isArray(actual) ? actual : [actual]) {
+        t.kcal += a.kcal;
+        t.min += a.durationMin;
+      }
+      t.n += 1;
+    }
+  }
+
+  const rates = {};
+  for (const [key, t] of Object.entries(totals)) {
+    if (t.n >= MIN_MATCHED_KCAL_SAMPLES && t.min > 0) rates[key] = t.kcal / t.min;
+  }
+  return rates;
+}
+
 // ---------- goal-based calorie targets + weight-trend calibration ----------
 // ~7700 kcal ≈ 1 kg of body tissue is the standard practical approximation used
 // by most sports-nutrition calculators to convert a target rate of weight
@@ -577,6 +827,28 @@ const ICONS = {
 const SEVERITY_COLOR = { low: cyan, medium: amber, high: coral };
 const SEVERITY_BG = { low: "rgba(79,209,217,0.08)", medium: "rgba(232,163,61,0.1)", high: "rgba(225,96,77,0.12)" };
 
+// Shared inline banner — replaces several duplicated ad-hoc style blocks and
+// the alert()-based feedback in the Log tab's import flow, using the same
+// cyan/amber/coral/mint grammar already used for status everywhere else.
+// rgba values are the dark-theme hex for each color (same convention already
+// used by the blocks this replaces, which don't re-tint for light mode either).
+const BANNER_STYLE = {
+  info: { color: cyan, bg: "rgba(79,209,217,0.08)" },
+  success: { color: mint, bg: "rgba(127,200,169,0.12)" },
+  warning: { color: amber, bg: "rgba(232,163,61,0.1)" },
+  error: { color: coral, bg: "rgba(225,96,77,0.12)" },
+};
+function Banner({ kind = "info", children }) {
+  const s = BANNER_STYLE[kind] || BANNER_STYLE.info;
+  const iconPath = kind === "success" ? ICONS.check : ICONS.warn;
+  return (
+    <div style={{ marginTop: 14, background: s.bg, border: `1px solid ${s.color}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8, alignItems: "flex-start" }}>
+      <Icon path={iconPath} size={14} color={s.color} />
+      <span style={{ flex: 1 }}>{children}</span>
+    </div>
+  );
+}
+
 function App() {
   const [tab, setTab] = useState("setup");
   const [theme, setTheme] = useState(() => (document.documentElement.dataset.theme === "light" ? "light" : "dark"));
@@ -608,6 +880,9 @@ function App() {
   const [nutrition, setNutrition] = useState({});
   const [weightLog, setWeightLog] = useState({}); // { 'YYYY-MM-DD': kg }
   const [schedule, setSchedule] = useState([]);
+  // { 'YYYY-MM-DD': { [plannedMatchKey]: actualKey | null } } — manual
+  // corrections to the Schedule tab's auto planned-vs-actual matching.
+  const [matchOverrides, setMatchOverrides] = useState({});
   // Recurring: { id, kind: "recurring", activityType, zone, durationMin, daysOfWeek, startDate, endDate, notes }
   // Single:    { id, kind: "single", activityType, zone, durationMin, date, notes } — one-off, non-repeating
   // Race:      { id, kind: "race", activityType, zone, durationMin, raceDate, taperDays, notes }
@@ -634,11 +909,12 @@ function App() {
 
   useEffect(() => {
     (async () => {
-      const [p, n, w, sched, cached, stravaCached, gLastSync] = await Promise.all([
+      const [p, n, w, sched, matchOv, cached, stravaCached, gLastSync] = await Promise.all([
         storageGet("profile", null),
         storageGet("nutrition-log", {}),
         storageGet("weight-log", {}),
         storageGet("training-schedule", []),
+        storageGet("schedule-match-overrides", {}),
         storageGet("intervals-cache", null),
         storageGet("strava-cache", null),
         storageGet("google-last-auto-sync", null),
@@ -646,6 +922,7 @@ function App() {
       setNutrition(n);
       setWeightLog(w);
       setSchedule(sched);
+      setMatchOverrides(matchOv);
       setGoogleLastAutoSync(gLastSync);
 
       // Weight always reflects the most recent logged entry, so a fresh
@@ -688,15 +965,8 @@ function App() {
 
   useEffect(() => { if (loaded) storageSet("profile", profile); }, [profile, loaded]);
 
-  const saveNutrition = useCallback((next) => {
-    setNutrition(next);
-    storageSet("nutrition-log", next);
-  }, []);
-
-  const saveWeightLog = useCallback((next) => {
-    setWeightLog(next);
-    storageSet("weight-log", next);
-  }, []);
+  const [importError, setImportError] = useState(null);
+  const [importNotice, setImportNotice] = useState(null);
 
   const saveSchedule = useCallback((next) => {
     setSchedule(next);
@@ -710,6 +980,32 @@ function App() {
   }
   function deleteScheduleEntry(id) {
     saveSchedule(schedule.filter((s) => s.id !== id));
+  }
+
+  // actualKey: a specific activity key forces that match; null forces "no
+  // match"; undefined clears the override, reverting to the auto-guess.
+  // Per-date merge (like nutrition/weight day saves) rather than a wholesale
+  // overwrite of the whole overrides object, so correcting one day can't
+  // race with — and clobber — a correction on another day from another tab.
+  //
+  // Updates local state OPTIMISTICALLY, before the network call resolves —
+  // the multi-activity checkbox picker fires one of these per checkbox, and
+  // a user checking several boxes in quick succession would otherwise have
+  // each click's "next selection" computed from the same stale pre-click
+  // snapshot (since state wouldn't have updated yet), silently losing all
+  // but the last click. Applying the change locally first means the very
+  // next click already sees it.
+  async function setScheduleMatchOverride(date, plannedKey, actualKey) {
+    setMatchOverrides((prev) => {
+      const day = { ...(prev[date] || {}) };
+      if (actualKey === undefined) delete day[plannedKey];
+      else day[plannedKey] = actualKey;
+      const next = { ...prev };
+      if (Object.keys(day).length) next[date] = day;
+      else delete next[date];
+      return next;
+    });
+    await apiSetScheduleMatchOverride(date, plannedKey, actualKey);
   }
 
   const bmr = useMemo(
@@ -748,9 +1044,38 @@ function App() {
         setColMap(guessColumnMapping(fields));
         setCsvPreview({ fields, rows: res.data });
         setCsvPreviewSource("csv");
+        setImportError(null);
       },
-      error: (err) => alert("Could not parse CSV: " + err.message),
+      error: (err) => setImportError("Could not parse CSV: " + err.message),
     });
+  }
+
+  const [scheduleImportError, setScheduleImportError] = useState(null);
+  const [scheduleImportNotice, setScheduleImportNotice] = useState(null);
+  async function handleScheduleFile(file) {
+    setScheduleImportError(null);
+    setScheduleImportNotice(null);
+    try {
+      let parsed;
+      try {
+        parsed = JSON.parse(await file.text());
+      } catch (e) {
+        throw new Error(`"${file.name}" isn't valid JSON.`);
+      }
+      const result = await apiImportScheduleFile(file.name, parsed);
+      // The server already wrote this into the store — updating local state
+      // straight from its response (rather than re-running storageSet, which
+      // would just PUT the same array right back) keeps this tab in sync so
+      // the next hand-edit's wholesale save can't clobber what was just
+      // imported with a stale in-memory copy.
+      setSchedule(result.schedule);
+      setScheduleImportNotice(
+        `Imported "${result.filename}" as source "${result.source}" — ` +
+        `it'll auto-reimport from now on whenever that file's contents change.`
+      );
+    } catch (e) {
+      setScheduleImportError(e.message || "Import failed.");
+    }
   }
 
   async function syncGoogleSheet() {
@@ -791,15 +1116,19 @@ function App() {
   // Takes explicit preview/map/source rather than always reading state, so
   // syncGoogleSheet's cached-mapping fast path can import immediately with
   // freshly-fetched data instead of waiting a render cycle for state to catch up.
-  function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
+  //
+  // Sends the parsed rows to the server's /api/nutrition/bulk, which merges
+  // each date's macrosfirst slot in under the store's lock — the client's own
+  // possibly-stale copy of *other* dates is never sent back, unlike a plain
+  // storageSet('nutrition-log', wholeObject) would.
+  async function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
     if (!preview || !map.date || !map.calories) {
-      alert("Map at least the date and calories columns first.");
+      setImportError("Map at least the date and calories columns first.");
       return;
     }
-    const next = { ...nutrition };
-    const importedDates = [];
+    setImportError(null);
+    const days = {};
     const skippedExamples = [];
-    let count = 0;
     for (const row of preview.rows) {
       const rawDate = row[map.date];
       const d = parseFlexibleDate(rawDate);
@@ -808,67 +1137,91 @@ function App() {
         continue;
       }
       const key = toISODate(d);
-      const existing = normalizeNutritionEntry(next[key]);
-      next[key] = {
-        ...existing,
-        macrosfirst: {
-          calories: parseFloat(row[map.calories]) || 0,
-          protein: map.protein ? parseFloat(row[map.protein]) || 0 : (existing.macrosfirst?.protein ?? 0),
-          carbs: map.carbs ? parseFloat(row[map.carbs]) || 0 : (existing.macrosfirst?.carbs ?? 0),
-          fat: map.fat ? parseFloat(row[map.fat]) || 0 : (existing.macrosfirst?.fat ?? 0),
-        },
+      const existing = normalizeNutritionEntry(nutrition[key]);
+      days[key] = {
+        calories: parseFloat(row[map.calories]) || 0,
+        protein: map.protein ? parseFloat(row[map.protein]) || 0 : (existing.macrosfirst?.protein ?? 0),
+        carbs: map.carbs ? parseFloat(row[map.carbs]) || 0 : (existing.macrosfirst?.carbs ?? 0),
+        fat: map.fat ? parseFloat(row[map.fat]) || 0 : (existing.macrosfirst?.fat ?? 0),
       };
-      importedDates.push(key);
-      count++;
     }
-    saveNutrition(next);
+    const importedDates = Object.keys(days);
+
+    if (importedDates.length) {
+      try {
+        await apiSaveNutritionBulk(days);
+      } catch (e) {
+        // Leave the preview open so the mapped rows aren't lost — the user can
+        // just hit Import again once the local server's reachable.
+        setImportError(e.message || "Could not import — the local server's /api/nutrition/bulk request failed.");
+        return;
+      }
+      setNutrition((prev) => {
+        const next = { ...prev };
+        for (const key of importedDates) {
+          next[key] = { ...normalizeNutritionEntry(next[key]), macrosfirst: days[key] };
+        }
+        return next;
+      });
+    }
+
     setCsvPreview(null);
+    setCsvPreviewSource(null);
     if (source === "sheet") {
       storageSet("google-sheet-colmap", map); // lets the server's auto-sync reuse this mapping
     }
-    setCsvPreviewSource(null);
-    if (count === 0 && skippedExamples.length) {
-      alert(`0 rows imported — the date column's values couldn't be parsed. Example raw value(s): ${skippedExamples.join(", ")}. Double-check the date column is mapped correctly, or tell me what format that is and I'll add support for it.`);
+    if (importedDates.length === 0) {
+      setImportNotice(null);
+      setImportError(`0 rows imported — the date column's values couldn't be parsed. Example raw value(s): ${skippedExamples.join(", ")}. Double-check the date column is mapped correctly, or tell me what format that is and I'll add support for it.`);
     } else {
-      alert(`Imported ${count} day(s) of nutrition data from MacrosFirst${skippedExamples.length ? ` (${skippedExamples.length} row(s) skipped — unparseable date)` : ""}. These take priority over any manual entries for the same days.`);
+      setImportNotice(`Imported ${importedDates.length} day(s) of nutrition data from MacrosFirst${skippedExamples.length ? ` (${skippedExamples.length} row(s) skipped — unparseable date)` : ""}. These take priority over any manual entries for the same days.`);
     }
 
     // A newly-logged nutrition day is a signal this day matters — make sure we
     // also have training data for it (Strava + intervals.icu), without
     // re-syncing days we already have.
-    const newDates = Array.from(new Set(importedDates));
     if (stravaStatus.connected) {
-      const missing = newDates.filter((d) => !stravaData.syncedDates.includes(d));
+      const missing = importedDates.filter((d) => !stravaData.syncedDates.includes(d));
       if (missing.length) fetchStrava(missing);
     }
     if (intervalsStatus.configured) {
-      const missing = newDates.filter((d) => !intervalsData.syncedDates.includes(d));
+      const missing = importedDates.filter((d) => !intervalsData.syncedDates.includes(d));
       if (missing.length) fetchIntervals(missing);
     }
   }
 
-  function saveManualDay(date, entry) {
-    const existing = normalizeNutritionEntry(nutrition[date]);
-    const next = { ...nutrition, [date]: { ...existing, manual: entry } };
-    saveNutrition(next);
+  // Each returns a promise that resolves once the server has actually
+  // confirmed the write (see apiSaveNutritionDay/apiSaveWeightDay et al. —
+  // per-date merges, not a whole-collection overwrite) so callers can show a
+  // real saved/failed state instead of an optimistic one.
+  async function saveManualDay(date, entry) {
+    const merged = await apiSaveNutritionDay(date, entry);
+    setNutrition((prev) => ({ ...prev, [date]: merged }));
     if (stravaStatus.connected && !stravaData.syncedDates.includes(date)) fetchStrava([date]);
     if (intervalsStatus.configured && !intervalsData.syncedDates.includes(date)) fetchIntervals([date]);
   }
 
-  function deleteNutritionDay(date) {
-    const next = { ...nutrition };
-    delete next[date];
-    saveNutrition(next);
+  async function deleteNutritionDay(date) {
+    await apiDeleteNutritionDay(date);
+    setNutrition((prev) => {
+      const next = { ...prev };
+      delete next[date];
+      return next;
+    });
   }
 
-  function saveManualWeight(date, kg) {
-    saveWeightLog({ ...weightLog, [date]: kg });
+  async function saveManualWeight(date, kg) {
+    const savedKg = await apiSaveWeightDay(date, kg);
+    setWeightLog((prev) => ({ ...prev, [date]: savedKg }));
   }
 
-  function deleteWeightDay(date) {
-    const next = { ...weightLog };
-    delete next[date];
-    saveWeightLog(next);
+  async function deleteWeightDay(date) {
+    await apiDeleteWeightDay(date);
+    setWeightLog((prev) => {
+      const next = { ...prev };
+      delete next[date];
+      return next;
+    });
   }
 
   async function fetchIntervals(dates) {
@@ -950,6 +1303,17 @@ function App() {
     setTab("dashboard");
   }
 
+  // Personalized kcal/min rates learned from this athlete's own matched
+  // workout history (see buildMatchedKcalRates) — feeds estimatePlannedKcal
+  // below so a not-yet-happened session's estimate reflects how this
+  // athlete actually burns energy at that type/zone, not just a generic
+  // MET-table guess. Recomputed whenever the schedule, real activity data,
+  // or a manual match correction changes.
+  const matchedKcalRates = useMemo(
+    () => buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides),
+    [schedule, stravaData, intervalsData, matchOverrides]
+  );
+
   const dailyRows = useMemo(() => {
     if (!bmr) return [];
     const wellByDate = {};
@@ -1021,7 +1385,7 @@ function App() {
         for (const s of scheduledSessions) {
           const baseIF = s.sourceActivity ? s.sourceActivity.intensityFactor : ZONES[s.zone - 1].if;
           const effIF = s.taperIntensityFactor ? baseIF * s.taperIntensityFactor : baseIF; // tapered sessions carry a reduced effective intensity
-          const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay); // s.durationMin is already taper-adjusted
+          const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay, matchedKcalRates); // s.durationMin is already taper-adjusted
           exerciseKcal += kcal;
           epocKcal += kcal * epocFactorFor(effIF) * profile.epocSensitivity;
           durationSec += s.durationMin * 60;
@@ -1033,7 +1397,7 @@ function App() {
         // race day, same as any other planned session.
         source = "planned";
         const raceIF = raceToday.sourceActivity ? raceToday.sourceActivity.intensityFactor : ZONES[raceToday.zone - 1].if;
-        const kcal = estimatePlannedKcal(raceToday, raceToday.durationMin, weightForDay);
+        const kcal = estimatePlannedKcal(raceToday, raceToday.durationMin, weightForDay, matchedKcalRates);
         exerciseKcal += kcal;
         epocKcal += kcal * epocFactorFor(raceIF) * profile.epocSensitivity;
         durationSec += raceToday.durationMin * 60;
@@ -1179,7 +1543,7 @@ function App() {
       });
     }
     return days;
-  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection]);
+  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates]);
 
 
   const summary = useMemo(() => {
@@ -1245,6 +1609,11 @@ function App() {
         table.data th:first-child, table.data td:first-child { text-align:left; font-family: ${body}; }
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         .spin { animation: spin 1s linear infinite; }
+        .cal-chip-emoji { display: none; }
+        @media (max-width: 700px) {
+          .cal-chip-text { display: none; }
+          .cal-chip-emoji { display: inline; }
+        }
         * { scrollbar-color: ${line} transparent; scrollbar-width: thin; }
         *::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
         *::-webkit-scrollbar-track { background: transparent; }
@@ -1254,7 +1623,7 @@ function App() {
       `}</style>
 
       <div style={{ borderBottom: `1px solid ${line}` }}>
-        <div style={{ padding: "18px 28px", maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ padding: "14px clamp(12px, 4vw, 28px)", maxWidth: 1400, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", rowGap: 10 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <img src="/logo-header.png" alt="" width={28} height={28} style={{ borderRadius: 6, display: "block" }} />
             <div>
@@ -1262,7 +1631,7 @@ function App() {
               <div style={{ fontSize: 11, color: dim, fontFamily: mono, marginTop: 1 }}>training demand vs. fuel intake — local build</div>
             </div>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
             {[
               { id: "setup", label: "Setup", icon: ICONS.settings },
               { id: "import", label: "Log", icon: ICONS.upload },
@@ -1295,7 +1664,7 @@ function App() {
         </div>
       </div>
 
-      <div style={{ padding: "24px 28px", maxWidth: 1080, margin: "0 auto" }}>
+      <div style={{ padding: "20px clamp(12px, 4vw, 28px)", maxWidth: 1400, margin: "0 auto" }}>
         {tab === "setup" && (
           <SetupTab profile={profile} setProfile={setProfile} bmr={bmr} onFetch={pullAll}
             fetching={fetching || stravaFetching} fetchError={fetchError} rangeDays={rangeDays} setRangeDays={setRangeDays}
@@ -1311,11 +1680,15 @@ function App() {
             onDeleteDay={deleteNutritionDay} weightLog={weightLog} onSaveWeight={saveManualWeight}
             onDeleteWeight={deleteWeightDay} googleStatus={googleStatus} googleFetching={googleFetching}
             googleError={googleError} onSyncGoogleSheet={syncGoogleSheet} googleLastAutoSync={googleLastAutoSync}
-            units={units} />
+            importError={importError} importNotice={importNotice} units={units} />
         )}
         {tab === "schedule" && (
           <ScheduleTab schedule={schedule} onAdd={addScheduleEntry} onUpdate={updateScheduleEntry}
-            onDelete={deleteScheduleEntry} stravaData={stravaData} intervalsData={intervalsData} />
+            onDelete={deleteScheduleEntry} stravaData={stravaData} intervalsData={intervalsData}
+            onImportFile={handleScheduleFile} importFileError={scheduleImportError}
+            importFileNotice={scheduleImportNotice} matchOverrides={matchOverrides}
+            onSetMatchOverride={setScheduleMatchOverride} profile={profile} setProfile={setProfile}
+            weightLog={weightLog} matchedKcalRates={matchedKcalRates} />
         )}
         {tab === "dashboard" && (
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
@@ -1338,10 +1711,10 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
   const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
   const [heightText, onHeightChange] = useUnitInput(profile.heightCm, units, cmToDisplayLen, displayToCm, 1);
   return (
-    <div style={{ display: "grid", gap: 20 }}>
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16 }}>Athlete profile</div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 14 }}>
           <Field label="Sex">
             <select className="inp" value={profile.sex} onChange={set("sex")}>
               <option value="male">Male</option>
@@ -1431,7 +1804,7 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
         {lastFetched && <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>last synced {new Date(lastFetched).toLocaleString()} · {intervalsSyncedCount} day{intervalsSyncedCount === 1 ? "" : "s"} covered</div>}
       </div>
 
-      <div className="card" style={{ padding: 22 }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
           <Field label="Days of history">
             <select className="inp" style={{ width: 120 }} value={rangeDays} onChange={(e) => setRangeDays(parseInt(e.target.value))}>
@@ -1459,7 +1832,7 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16, display: "flex", alignItems: "center", gap: 7 }}>
           <Icon path={ICONS.gauge} size={16} color={amber} /> Model tuning
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 20 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 20 }}>
           <Field label="Non-training activity (NEAT)">
             <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
               {[["multiplier", "Multiplier"], ["offset", "Fixed offset"]].map(([id, label]) => (
@@ -1611,12 +1984,12 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
   );
 }
 
-function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, units }) {
+function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, importError, importNotice, units }) {
   const [dragOver, setDragOver] = useState(false);
   const dayCount = Object.keys(nutrition).length;
   const weightCount = Object.keys(weightLog).length;
   return (
-    <div style={{ display: "grid", gap: 20 }}>
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
       <ManualEntryCard nutrition={nutrition} onSave={onSaveManualDay} />
       <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} units={units} />
 
@@ -1661,12 +2034,7 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
             Every device on this network shares that connection automatically once it's made.
           </div>
         )}
-        {googleError && (
-          <div style={{ marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 }}>
-            <Icon path={ICONS.warn} size={15} color={coral} />
-            <span>{googleError}</span>
-          </div>
-        )}
+        {googleError && <Banner kind="error">{googleError}</Banner>}
       </div>
 
       <div className="card" style={{ padding: 22 }}>
@@ -1690,13 +2058,15 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
             <input type="file" accept=".csv" style={{ display: "none" }} onChange={(e) => e.target.files[0] && onFile(e.target.files[0])} />
           </label>
         </div>
+        {importError && <Banner kind="error">{importError}</Banner>}
+        {!importError && importNotice && <Banner kind="success">{importNotice}</Banner>}
       </div>
 
       {csvPreview && (
-        <div className="card" style={{ padding: 22 }}>
+        <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Map columns</div>
           <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>{csvPreview.rows.length} rows found. Match the columns to the fields below.</div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 12 }}>
             {["date", "calories", "protein", "carbs", "fat"].map((k) => (
               <Field key={k} label={k}>
                 <select className="inp" value={colMap[k]} onChange={(e) => setColMap((m) => ({ ...m, [k]: e.target.value }))}>
@@ -1710,16 +2080,24 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
         </div>
       )}
 
-      <div className="card" style={{ padding: 22 }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored nutrition log</div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 }}>{dayCount} day{dayCount === 1 ? "" : "s"} of intake saved. Click a row to edit it.</div>
-        {dayCount > 0 && <NutritionLogTable nutrition={nutrition} onSave={onSaveManualDay} onDelete={onDeleteDay} />}
+        {dayCount > 0 && (
+          <div style={{ overflowX: "auto" }}>
+            <NutritionLogTable nutrition={nutrition} onSave={onSaveManualDay} onDelete={onDeleteDay} />
+          </div>
+        )}
       </div>
 
-      <div className="card" style={{ padding: 22 }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored weight log</div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 }}>{weightCount} day{weightCount === 1 ? "" : "s"} of weight saved. Click a row to edit it.</div>
-        {weightCount > 0 && <WeightLogTable weightLog={weightLog} onSave={onSaveWeight} onDelete={onDeleteWeight} units={units} />}
+        {weightCount > 0 && (
+          <div style={{ overflowX: "auto" }}>
+            <WeightLogTable weightLog={weightLog} onSave={onSaveWeight} onDelete={onDeleteWeight} units={units} />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1734,7 +2112,9 @@ function ManualEntryCard({ nutrition, onSave }) {
   const [protein, setProtein] = useState("");
   const [carbs, setCarbs] = useState("");
   const [fat, setFat] = useState("");
-  const [saved, setSaved] = useState(false);
+  const [status, setStatus] = useState("idle"); // idle | saving | saved | error
+  const [errorMsg, setErrorMsg] = useState(null);
+  const dateRef = useRef(date);
 
   const normalized = normalizeNutritionEntry(nutrition[date]);
   const hasMacrosFirst = !!normalized.macrosfirst;
@@ -1742,13 +2122,26 @@ function ManualEntryCard({ nutrition, onSave }) {
   // Prefill from whichever entry is currently effective, so editing shows
   // what you'd actually see elsewhere in the app — but Save always writes
   // to the manual slot, never overwrites a MacrosFirst import in place.
+  // Prefills immediately from (possibly slightly stale) props for
+  // responsiveness, then reconciles against a fresh fetch — this app is
+  // used from multiple devices against the same server-side log, so the
+  // in-memory copy here can be behind whatever another device (or the
+  // nightly Google auto-sync) has already written for this date.
   useEffect(() => {
-    const existing = normalizeNutritionEntry(nutrition[date]);
-    const prefill = existing.macrosfirst || existing.manual;
-    setProtein(prefill ? String(prefill.protein ?? "") : "");
-    setCarbs(prefill ? String(prefill.carbs ?? "") : "");
-    setFat(prefill ? String(prefill.fat ?? "") : "");
-    setSaved(false);
+    dateRef.current = date;
+    const applyPrefill = (source) => {
+      const existing = normalizeNutritionEntry(source[date]);
+      const prefill = existing.macrosfirst || existing.manual;
+      setProtein(prefill ? String(prefill.protein ?? "") : "");
+      setCarbs(prefill ? String(prefill.carbs ?? "") : "");
+      setFat(prefill ? String(prefill.fat ?? "") : "");
+    };
+    applyPrefill(nutrition);
+    setStatus("idle");
+    setErrorMsg(null);
+    storageGet("nutrition-log", null).then((fresh) => {
+      if (dateRef.current === date && fresh) applyPrefill(fresh);
+    });
     // eslint-disable-next-line
   }, [date]);
 
@@ -1758,10 +2151,17 @@ function ManualEntryCard({ nutrition, onSave }) {
   const calories = macroCalories(p, c, f);
   const hasAny = protein !== "" || carbs !== "" || fat !== "";
 
-  function handleSave() {
-    onSave(date, { calories, protein: p, carbs: c, fat: f });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1500);
+  async function handleSave() {
+    setStatus("saving");
+    setErrorMsg(null);
+    try {
+      await onSave(date, { calories, protein: p, carbs: c, fat: f });
+      setStatus("saved");
+      setTimeout(() => setStatus((s) => (s === "saved" ? "idle" : s)), 1500);
+    } catch (e) {
+      setStatus("error");
+      setErrorMsg(e.message || "Save failed — check the local server connection and retry.");
+    }
   }
 
   return (
@@ -1774,7 +2174,7 @@ function ManualEntryCard({ nutrition, onSave }) {
         computed automatically (4 kcal/g protein & carbs, 9 kcal/g fat). Pick a date that's already logged
         to edit it. A MacrosFirst import always takes priority over a manual entry for the same day.
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(90px, 1fr))", gap: 14 }}>
         <Field label="Date">
           <input className="inp" type="date" value={date} max={toISODate(new Date())} onChange={(e) => setDate(e.target.value)} />
         </Field>
@@ -1796,11 +2196,16 @@ function ManualEntryCard({ nutrition, onSave }) {
       )}
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 16 }}>
         <div style={{ fontFamily: mono, fontSize: 13, color: amber }}>≈ {fmt(calories)} kcal</div>
-        <button className="btn-primary" onClick={handleSave} disabled={!hasAny}>
-          {normalized.manual ? "Update manual entry" : "Save this day"}
+        <button className="btn-primary" onClick={handleSave} disabled={!hasAny || status === "saving"}>
+          {status === "saving" ? "Saving…" : normalized.manual ? "Update manual entry" : "Save this day"}
         </button>
-        {saved && <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint }}><Icon path={ICONS.check} size={13} color={mint} /> Saved</div>}
+        {status === "saved" && <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint }}><Icon path={ICONS.check} size={13} color={mint} /> Saved</div>}
       </div>
+      {status === "error" && (
+        <Banner kind="error">
+          {errorMsg} <button className="btn-ghost" style={{ padding: "2px 8px", marginLeft: 8 }} onClick={handleSave}>Retry</button>
+        </Banner>
+      )}
     </div>
   );
 }
@@ -1821,20 +2226,47 @@ function SourceBadge({ source }) {
 
 function NutritionLogTable({ nutrition, onSave, onDelete }) {
   const [editingDate, setEditingDate] = useState(null);
+  const editingDateRef = useRef(null);
   const [draft, setDraft] = useState({ protein: "", carbs: "", fat: "" });
+  const [status, setStatus] = useState("idle"); // idle | saving | error
+  const [errorMsg, setErrorMsg] = useState(null);
   const dates = Object.keys(nutrition).sort().reverse();
 
   function startEdit(date) {
-    const eff = effectiveNutritionEntry(nutrition[date]);
+    editingDateRef.current = date;
     setEditingDate(date);
+    setStatus("idle");
+    setErrorMsg(null);
+    const eff = effectiveNutritionEntry(nutrition[date]);
     setDraft({ protein: String(eff?.protein ?? ""), carbs: String(eff?.carbs ?? ""), fat: String(eff?.fat ?? "") });
+    // Another device (or the nightly Google auto-sync) may have changed this
+    // day since this table's props were loaded — refresh before editing so a
+    // stale prefill can't get submitted back as an "intentional" edit.
+    storageGet("nutrition-log", null).then((fresh) => {
+      if (editingDateRef.current !== date || !fresh) return;
+      const freshEff = effectiveNutritionEntry(fresh[date]);
+      setDraft({ protein: String(freshEff?.protein ?? ""), carbs: String(freshEff?.carbs ?? ""), fat: String(freshEff?.fat ?? "") });
+    });
   }
-  function commitEdit(date) {
+  function cancelEdit() {
+    editingDateRef.current = null;
+    setEditingDate(null);
+  }
+  async function commitEdit(date) {
     const p = parseFloat(draft.protein) || 0;
     const c = parseFloat(draft.carbs) || 0;
     const f = parseFloat(draft.fat) || 0;
-    onSave(date, { calories: macroCalories(p, c, f), protein: p, carbs: c, fat: f });
-    setEditingDate(null);
+    setStatus("saving");
+    setErrorMsg(null);
+    try {
+      await onSave(date, { calories: macroCalories(p, c, f), protein: p, carbs: c, fat: f });
+      editingDateRef.current = null;
+      setEditingDate(null);
+      setStatus("idle");
+    } catch (e) {
+      setStatus("error");
+      setErrorMsg(e.message || "Save failed — check the local server connection and retry.");
+    }
   }
 
   return (
@@ -1851,7 +2283,8 @@ function NutritionLogTable({ nutrition, onSave, onDelete }) {
           const source = normalized.macrosfirst ? "macrosfirst" : "manual";
           const editing = editingDate === date;
           return (
-            <tr key={date}>
+            <React.Fragment key={date}>
+            <tr>
               <td>{date}<SourceBadge source={source} /></td>
               {editing ? (
                 <>
@@ -1860,9 +2293,9 @@ function NutritionLogTable({ nutrition, onSave, onDelete }) {
                   <td><input className="inp" style={{ padding: "4px 6px", textAlign: "right" }} type="number" value={draft.fat} onChange={(ev) => setDraft((d) => ({ ...d, fat: ev.target.value }))} /></td>
                   <td style={{ color: dim }}>≈ {fmt(macroCalories(parseFloat(draft.protein) || 0, parseFloat(draft.carbs) || 0, parseFloat(draft.fat) || 0))}</td>
                   <td style={{ textAlign: "left", whiteSpace: "nowrap" }}>
-                    <button className="btn-ghost" style={{ padding: "4px 10px", marginRight: 6 }} onClick={() => commitEdit(date)}
-                      title={source === "macrosfirst" ? "Saves as a manual fallback — MacrosFirst data still takes priority for this day" : undefined}>Save</button>
-                    <button className="btn-ghost" style={{ padding: "4px 10px" }} onClick={() => setEditingDate(null)}>Cancel</button>
+                    <button className="btn-ghost" style={{ padding: "4px 10px", marginRight: 6 }} onClick={() => commitEdit(date)} disabled={status === "saving"}
+                      title={source === "macrosfirst" ? "Saves as a manual fallback — MacrosFirst data still takes priority for this day" : undefined}>{status === "saving" ? "Saving…" : "Save"}</button>
+                    <button className="btn-ghost" style={{ padding: "4px 10px" }} onClick={cancelEdit} disabled={status === "saving"}>Cancel</button>
                   </td>
                 </>
               ) : (
@@ -1878,6 +2311,16 @@ function NutritionLogTable({ nutrition, onSave, onDelete }) {
                 </>
               )}
             </tr>
+            {editing && status === "error" && (
+              <tr>
+                <td colSpan={6} style={{ padding: 0 }}>
+                  <Banner kind="error">
+                    {errorMsg} <button className="btn-ghost" style={{ padding: "2px 8px", marginLeft: 8 }} onClick={() => commitEdit(date)}>Retry</button>
+                  </Banner>
+                </td>
+              </tr>
+            )}
+            </React.Fragment>
           );
         })}
       </tbody>
@@ -1888,24 +2331,42 @@ function NutritionLogTable({ nutrition, onSave, onDelete }) {
 function WeightEntryCard({ weightLog, onSave, units }) {
   const [date, setDate] = useState(() => toISODate(new Date()));
   const [metricKg, setMetricKg] = useState(""); // canonical (kg) buffer for the currently edited date
-  const [saved, setSaved] = useState(false);
+  const [status, setStatus] = useState("idle"); // idle | saving | saved | error
+  const [errorMsg, setErrorMsg] = useState(null);
+  const dateRef = useRef(date);
 
   useEffect(() => {
+    dateRef.current = date;
     const existingKg = weightLog[date];
     setMetricKg(existingKg === undefined ? "" : String(existingKg));
-    setSaved(false);
+    setStatus("idle");
+    setErrorMsg(null);
+    // Same reasoning as ManualEntryCard: refresh against the server in case
+    // another device (or an in-progress sync) has a newer value for this day.
+    storageGet("weight-log", null).then((fresh) => {
+      if (dateRef.current !== date || !fresh) return;
+      const freshKg = fresh[date];
+      setMetricKg(freshKg === undefined ? "" : String(freshKg));
+    });
     // eslint-disable-next-line
   }, [date]);
 
   const [text, onChange] = useUnitInput(metricKg, units, kgToDisplay, displayToKg, 1);
   const wUnit = weightUnitLabel(units);
 
-  function handleSave() {
+  async function handleSave() {
     const kg = parseFloat(metricKg);
     if (Number.isNaN(kg) || kg <= 0) return;
-    onSave(date, Math.round(kg * 100) / 100);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1500);
+    setStatus("saving");
+    setErrorMsg(null);
+    try {
+      await onSave(date, Math.round(kg * 100) / 100);
+      setStatus("saved");
+      setTimeout(() => setStatus((s) => (s === "saved" ? "idle" : s)), 1500);
+    } catch (e) {
+      setStatus("error");
+      setErrorMsg(e.message || "Save failed — check the local server connection and retry.");
+    }
   }
 
   return (
@@ -1917,7 +2378,7 @@ function WeightEntryCard({ weightLog, onSave, units }) {
         Feeds directly into BMR and fueling targets for that day — body weight shifts across a training
         block, so this keeps demand and g/kg targets tracking you rather than a fixed Setup value.
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, alignItems: "end" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 14, alignItems: "end" }}>
         <Field label="Date">
           <input className="inp" type="date" value={date} max={toISODate(new Date())} onChange={(e) => setDate(e.target.value)} />
         </Field>
@@ -1926,28 +2387,57 @@ function WeightEntryCard({ weightLog, onSave, units }) {
         </Field>
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 16 }}>
-        <button className="btn-primary" onClick={handleSave} disabled={!text}>
-          {weightLog[date] !== undefined ? "Update this day" : "Save this day"}
+        <button className="btn-primary" onClick={handleSave} disabled={!text || status === "saving"}>
+          {status === "saving" ? "Saving…" : weightLog[date] !== undefined ? "Update this day" : "Save this day"}
         </button>
-        {saved && <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint }}><Icon path={ICONS.check} size={13} color={mint} /> Saved</div>}
+        {status === "saved" && <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: mint }}><Icon path={ICONS.check} size={13} color={mint} /> Saved</div>}
       </div>
+      {status === "error" && (
+        <Banner kind="error">
+          {errorMsg} <button className="btn-ghost" style={{ padding: "2px 8px", marginLeft: 8 }} onClick={handleSave}>Retry</button>
+        </Banner>
+      )}
     </div>
   );
 }
 
 function WeightLogTable({ weightLog, onSave, onDelete, units }) {
   const [editingDate, setEditingDate] = useState(null);
+  const editingDateRef = useRef(null);
   const [draft, setDraft] = useState("");
+  const [status, setStatus] = useState("idle"); // idle | saving | error
+  const [errorMsg, setErrorMsg] = useState(null);
   const dates = Object.keys(weightLog).sort().reverse();
 
   function startEdit(date) {
+    editingDateRef.current = date;
     setEditingDate(date);
+    setStatus("idle");
+    setErrorMsg(null);
     setDraft(String(roundTo(kgToDisplay(weightLog[date], units), 1)));
+    storageGet("weight-log", null).then((fresh) => {
+      if (editingDateRef.current !== date || !fresh || fresh[date] === undefined) return;
+      setDraft(String(roundTo(kgToDisplay(fresh[date], units), 1)));
+    });
   }
-  function commitEdit(date) {
-    const v = parseFloat(draft);
-    if (!Number.isNaN(v) && v > 0) onSave(date, Math.round(displayToKg(v, units) * 100) / 100);
+  function cancelEdit() {
+    editingDateRef.current = null;
     setEditingDate(null);
+  }
+  async function commitEdit(date) {
+    const v = parseFloat(draft);
+    if (Number.isNaN(v) || v <= 0) return;
+    setStatus("saving");
+    setErrorMsg(null);
+    try {
+      await onSave(date, Math.round(displayToKg(v, units) * 100) / 100);
+      editingDateRef.current = null;
+      setEditingDate(null);
+      setStatus("idle");
+    } catch (e) {
+      setStatus("error");
+      setErrorMsg(e.message || "Save failed — check the local server connection and retry.");
+    }
   }
 
   return (
@@ -1960,14 +2450,15 @@ function WeightLogTable({ weightLog, onSave, onDelete, units }) {
           const kg = weightLog[date];
           const editing = editingDate === date;
           return (
-            <tr key={date}>
+            <React.Fragment key={date}>
+            <tr>
               <td>{date}</td>
               {editing ? (
                 <>
                   <td><input className="inp" style={{ padding: "4px 6px", textAlign: "right" }} type="number" step="0.1" value={draft} onChange={(ev) => setDraft(ev.target.value)} /></td>
                   <td style={{ textAlign: "left", whiteSpace: "nowrap" }}>
-                    <button className="btn-ghost" style={{ padding: "4px 10px", marginRight: 6 }} onClick={() => commitEdit(date)}>Save</button>
-                    <button className="btn-ghost" style={{ padding: "4px 10px" }} onClick={() => setEditingDate(null)}>Cancel</button>
+                    <button className="btn-ghost" style={{ padding: "4px 10px", marginRight: 6 }} onClick={() => commitEdit(date)} disabled={status === "saving"}>{status === "saving" ? "Saving…" : "Save"}</button>
+                    <button className="btn-ghost" style={{ padding: "4px 10px" }} onClick={cancelEdit} disabled={status === "saving"}>Cancel</button>
                   </td>
                 </>
               ) : (
@@ -1980,6 +2471,16 @@ function WeightLogTable({ weightLog, onSave, onDelete, units }) {
                 </>
               )}
             </tr>
+            {editing && status === "error" && (
+              <tr>
+                <td colSpan={3} style={{ padding: 0 }}>
+                  <Banner kind="error">
+                    {errorMsg} <button className="btn-ghost" style={{ padding: "2px 8px", marginLeft: 8 }} onClick={() => commitEdit(date)}>Retry</button>
+                  </Banner>
+                </td>
+              </tr>
+            )}
+            </React.Fragment>
           );
         })}
       </tbody>
@@ -1990,6 +2491,12 @@ function WeightLogTable({ weightLog, onSave, onDelete, units }) {
 
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const ACTIVITY_COLORS = { Run: coral, Ride: cyan, Swim: mint, Row: lavender, Strength: gold, Other: amber };
+// Calendar chips are only ever a fraction of a 7-column grid cell (half that
+// again once the planned/actual columns split it further), so there's no
+// width to spare for "Run Z2 · 30m" once the viewport gets narrow — a
+// .cal-chip-emoji/.cal-chip-text pair (see the <style> block) swaps to these
+// under a media query rather than letting the text force the cell wider.
+const ACTIVITY_EMOJI = { Run: "🏃", Ride: "🚴", Swim: "🏊", Row: "🚣", Strength: "🏋️", Other: "⚡" };
 
 const DEFAULT_TAPER_DAYS = 10; // middle of the commonly-cited 1-2 week taper window
 
@@ -2027,16 +2534,29 @@ function scheduleRowStyle(highlighted) {
   };
 }
 
-function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData }) {
+function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData,
+  onImportFile, importFileError, importFileNotice, matchOverrides, onSetMatchOverride,
+  profile, setProfile, weightLog, matchedKcalRates }) {
   const [form, setForm] = useState(emptyScheduleForm());
   const [editingId, setEditingId] = useState(null);
   const [highlightIds, setHighlightIds] = useState([]);
+  const [scheduleDragOver, setScheduleDragOver] = useState(false);
+  const [editingMatchDay, setEditingMatchDay] = useState(null); // date key, or null
   const itemRefs = useRef({});
+  // Both default on (undefined !== false) so existing profiles pick up the
+  // new toggles already enabled — nothing changes until someone opts out.
+  const showActual = profile.scheduleShowActual !== false;
+  const showCalories = profile.scheduleShowCalories !== false;
 
   const activityLibrary = useMemo(
     () => getActivityLibrary(stravaData, intervalsData),
     [stravaData, intervalsData]
   );
+  const actualsByDate = useMemo(() => {
+    const map = {};
+    for (const a of activityLibrary) (map[a.date] || (map[a.date] = [])).push(a);
+    return map;
+  }, [activityLibrary]);
   function applySourceActivity(key) {
     const src = activityLibrary.find((a) => a.key === key);
     if (!src) { setForm((f) => ({ ...f, sourceActivity: null })); return; }
@@ -2159,15 +2679,45 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
     const { sessions, taper } = getEffectiveSessionsForDate(schedule, key);
     const raceToday = races.find((r) => r.raceDate === key);
     const carbLoad = getCarbLoadState(schedule, key);
-    calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad });
+    const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
+    const dayActuals = actualsByDate[key] || [];
+    const { pairs, extras } = matchDayActivities(plannedItems, dayActuals, matchOverrides[key]);
+
+    // Expected vs actual calories burned that day — expected mirrors the
+    // same MET-based estimate dailyRows uses for a not-yet-happened session
+    // (or a sourceActivity-modeled one); actual sums whatever Strava/
+    // intervals.icu kcal getActivityLibrary already computed. Independent of
+    // the planned/actual matching above — this totals ALL of both sides, not
+    // just the ones the heuristic paired up, so a manually-corrected or
+    // unmatched activity still counts.
+    const weightForDay = weightLog[key] ?? (parseFloat(profile.weightKg) || null);
+    const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay, matchedKcalRates), 0);
+    const actualKcal = dayActuals.reduce((sum, a) => sum + a.kcal, 0);
+
+    calendarDays.push({
+      key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras, dayActuals,
+      expectedKcal, actualKcal,
+    });
   }
   const todayKey = toLocalISODate(new Date());
 
   return (
-    <div style={{ display: "grid", gap: 20 }}>
-      <div className="card" style={{ padding: 22 }}>
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
           <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 10, flexWrap: "wrap" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+            <input type="checkbox" checked={showActual}
+              onChange={(e) => setProfile((p) => ({ ...p, scheduleShowActual: e.target.checked }))} />
+            Show actual/matched workouts
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+            <input type="checkbox" checked={showCalories}
+              onChange={(e) => setProfile((p) => ({ ...p, scheduleShowCalories: e.target.checked }))} />
+            Show expected/actual calories burned
+          </label>
         </div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <span>Next 3 weeks</span>
@@ -2175,15 +2725,111 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.gauge} size={10} color={lavender} /> tapering</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.trophy} size={10} color={gold} /> race day</span>
+          {showActual && (
+            <>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>solid = planned, outline = actual <Icon path={ICONS.check} size={10} color={mint} /> matched</span>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.pencil} size={10} color={dim} /> click to correct a match</span>
+            </>
+          )}
+          {showCalories && (
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ color: cyan }}>expected</span> / <span style={{ color: amber }}>actual</span> kcal burned
+            </span>
+          )}
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }}>
           {WEEKDAY_LABELS.map((label) => (
             <div key={label} style={{ fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 }}>{label}</div>
           ))}
           {calendarDays.map((day) => {
             const isToday = day.key === todayKey;
+            const isPast = day.key < todayKey;
             const isFirstOfMonth = day.date.getDate() === 1;
             const clickable = day.sessions.length > 0 || !!day.race;
+
+            function plannedChip(planned, i, isGroup) {
+              if (planned.isRace) {
+                return (
+                  <div key={`p${i}`} title={`Race: ${planned.notes || planned.activityType} · ${planned.durationMin}min${isGroup ? " · matched to multiple activities" : ""}`}
+                    style={{
+                      background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
+                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3, overflow: "hidden",
+                    }}>
+                    <Icon path={ICONS.trophy} size={9} color={ink} />
+                    <span className="cal-chip-text">{planned.notes || planned.activityType}</span>
+                    <span className="cal-chip-emoji">🏆</span>
+                    {isGroup && <Icon path={ICONS.link} size={8} color={ink} />}
+                  </div>
+                );
+              }
+              return (
+                <div key={`p${i}`} title={`${planned.activityType} · ${ZONES[planned.zone - 1].label.split(" · ")[1]} · ${planned.durationMin}min${planned.notes ? ` · ${planned.notes}` : ""}${day.taper ? " · tapered" : ""}${isGroup ? " · matched to multiple activities" : ""}`}
+                  style={{
+                    background: ACTIVITY_COLORS[planned.activityType] || dim,
+                    color: ink,
+                    borderRadius: 3,
+                    padding: "2px 5px",
+                    fontSize: 10.5,
+                    lineHeight: 1.3,
+                    fontWeight: 600,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 3,
+                    opacity: day.taper ? 0.65 : 1,
+                    overflow: "hidden",
+                  }}>
+                  <span className="cal-chip-text">{planned.activityType} Z{planned.zone} · {planned.durationMin}m</span>
+                  <span className="cal-chip-emoji">{ACTIVITY_EMOJI[planned.activityType] || "🎯"}</span>
+                  {isPreloadWorthy(planned) && <Icon path={ICONS.flame} size={9} color={ink} />}
+                  {isGroup && <Icon path={ICONS.link} size={8} color={ink} />}
+                </div>
+              );
+            }
+            // Outlined rather than filled, so a glance tells "planned" (solid)
+            // apart from "actual" (outline) even before reading either chip —
+            // the checkmark then further distinguishes a real match from an
+            // extra, unscheduled activity that just happens to share a slot.
+            function actualChip(actual, matched, i, manual) {
+              const color = ACTIVITY_COLORS[actual.activityType] || dim;
+              return (
+                <div key={`a${i}`}
+                  title={`${actual.name} · ${actual.activityType} · ${actual.durationMin}min${matched ? " · matched to the plan" : " · not on the schedule"}${manual ? " · manually corrected" : ""}`}
+                  style={{
+                    border: `1px solid ${color}`,
+                    color,
+                    borderRadius: 3,
+                    padding: "2px 5px",
+                    fontSize: 10.5,
+                    lineHeight: 1.3,
+                    fontWeight: 600,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 3,
+                    overflow: "hidden",
+                  }}>
+                  {matched && <Icon path={ICONS.check} size={9} color={color} />}
+                  <span className="cal-chip-text">{actual.activityType} · {actual.durationMin}m</span>
+                  <span className="cal-chip-emoji">{ACTIVITY_EMOJI[actual.activityType] || "🎯"}</span>
+                  {manual && <Icon path={ICONS.pencil} size={8} color={color} />}
+                </div>
+              );
+            }
+            // A multi-part match (e.g. a "Triathlon" race grouped into its
+            // separate swim/bike/run activities) renders each real activity
+            // as its own normal actualChip, wrapped in a dashed container so
+            // the coupling reads as "these N activities together are the one
+            // planned item," not N unrelated extra activities.
+            function actualChipGroup(actuals, i, manual) {
+              return (
+                <div key={`ag${i}`} style={{
+                  display: "flex", flexDirection: "column", gap: 2,
+                  border: `1px dashed ${dim}`, borderRadius: 4, padding: 2,
+                }}>
+                  {actuals.map((a, j) => actualChip(a, true, `${i}-${j}`, manual))}
+                </div>
+              );
+            }
+
             return (
               <div key={day.key} onClick={clickable ? () => jumpToDay(day) : undefined}
                 title={clickable ? "Jump to this session in the listings below" : undefined}
@@ -2197,47 +2843,194 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                 flexDirection: "column",
                 gap: 3,
                 cursor: clickable ? "pointer" : "default",
+                opacity: isPast ? 0.5 : 1,
               }}>
                 <div style={{ fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 }}>
                   {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
                   {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
                   {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
+                  {showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && (
+                    <button type="button" title="Correct planned/actual matches for this day"
+                      onClick={(e) => { e.stopPropagation(); setEditingMatchDay(day.key); }}
+                      style={{ marginLeft: "auto", background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }}>
+                      <Icon path={ICONS.pencil} size={10} color={dim} />
+                    </button>
+                  )}
                 </div>
-                {day.race && (
-                  <div title={`Race: ${day.race.notes || day.race.activityType} · ${day.race.durationMin}min`}
+                {showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && (
+                  <div title={`Expected ${Math.round(day.expectedKcal)} kcal · Actual ${Math.round(day.actualKcal)} kcal burned`}
                     style={{
-                      background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
-                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3,
+                      borderBottom: `1px solid ${line}`, paddingBottom: 4, marginBottom: 1, fontSize: 10,
+                      display: "flex", justifyContent: "space-between", gap: 4,
                     }}>
-                    <Icon path={ICONS.trophy} size={9} color={ink} /> {day.race.notes || day.race.activityType}
+                    <span style={{ color: cyan, fontWeight: 600 }}>{Math.round(day.expectedKcal)}</span>
+                    <span style={{ color: dim }}>/</span>
+                    <span style={{ color: amber, fontWeight: 600 }}>{Math.round(day.actualKcal)}</span>
                   </div>
                 )}
-                {day.sessions.map((s, i) => (
-                  <div key={i} title={`${s.activityType} · ${ZONES[s.zone - 1].label.split(" · ")[1]} · ${s.durationMin}min${s.notes ? ` · ${s.notes}` : ""}${day.taper ? " · tapered" : ""}`}
-                    style={{
-                      background: ACTIVITY_COLORS[s.activityType] || dim,
-                      color: ink,
-                      borderRadius: 3,
-                      padding: "2px 5px",
-                      fontSize: 10.5,
-                      lineHeight: 1.3,
-                      fontWeight: 600,
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 3,
-                      opacity: day.taper ? 0.65 : 1,
-                    }}>
-                    {s.activityType} Z{s.zone} · {s.durationMin}m
-                    {isPreloadWorthy(s) && <Icon path={ICONS.flame} size={9} color={ink} />}
-                  </div>
-                ))}
+                {showActual ? (
+                  <>
+                    {day.pairs.map(({ planned, actual, manual }, i) => {
+                      const isGroup = Array.isArray(actual);
+                      return (
+                        <div key={`pair${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
+                          {plannedChip(planned, i, isGroup)}
+                          {isGroup ? actualChipGroup(actual, i, manual)
+                            : actual ? actualChip(actual, true, i, manual) : (day.key <= todayKey
+                              ? <div style={{ fontSize: 10, color: dim, display: "flex", alignItems: "center" }}>not logged</div>
+                              : null)}
+                        </div>
+                      );
+                    })}
+                    {day.extras.map((actual, i) => (
+                      <div key={`extra${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
+                        <div />
+                        {actualChip(actual, false, i)}
+                      </div>
+                    ))}
+                  </>
+                ) : (
+                  day.pairs.map(({ planned }, i) => plannedChip(planned, i))
+                )}
               </div>
             );
           })}
         </div>
       </div>
 
+      {editingMatchDay && (() => {
+        const day = calendarDays.find((d) => d.key === editingMatchDay);
+        if (!day) return null;
+        const dayOverrides = matchOverrides[day.key] || {};
+        return (
+          <div style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 50,
+            display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
+          }} onClick={() => setEditingMatchDay(null)}>
+            <div onClick={(e) => e.stopPropagation()} style={{
+              background: panel2, border: `1px solid ${line}`, borderRadius: 8, padding: 20,
+              width: 420, maxWidth: "100%", maxHeight: "80vh", overflowY: "auto",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 14 }}>
+                  {day.date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}
+                </div>
+                <button onClick={() => setEditingMatchDay(null)}
+                  style={{ background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }}>×</button>
+              </div>
+              <div style={{ fontSize: 12, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+                Correct which logged activity matches each planned session, if the automatic guess got it wrong —
+                or pick more than one to group several activities into one match (e.g. a "Triathlon" race entry
+                that actually shows up on Strava as a separate swim, bike, and run).
+              </div>
+              {day.pairs.length === 0 && (
+                <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>Nothing scheduled this day.</div>
+              )}
+              {day.pairs.map(({ planned, actual }, i) => {
+                const pk = plannedMatchKey(planned);
+                const label = planned.isRace
+                  ? `Race: ${planned.notes || planned.activityType}`
+                  : `${planned.activityType} Z${planned.zone} · ${planned.durationMin}m${planned.notes ? ` · ${planned.notes}` : ""}`;
+                const hasOverride = Object.prototype.hasOwnProperty.call(dayOverrides, pk);
+                const overrideValue = dayOverrides[pk];
+                const mode = !hasOverride ? "auto" : overrideValue === null ? "none" : "custom";
+                const selectedKeys = mode === "custom" ? (Array.isArray(overrideValue) ? overrideValue : [overrideValue]) : [];
+                const actualNames = actual ? (Array.isArray(actual) ? actual.map((a) => a.name) : [actual.name]) : [];
+                return (
+                  <div key={i} style={{ marginBottom: 16 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{
+                        width: 8, height: 8, borderRadius: 2,
+                        background: planned.isRace ? gold : (ACTIVITY_COLORS[planned.activityType] || dim),
+                        display: "inline-block",
+                      }} />
+                      {label}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                        <input type="radio" name={`match-mode-${day.key}-${pk}`} checked={mode === "auto"}
+                          onChange={() => onSetMatchOverride(day.key, pk, undefined)} />
+                        Auto (let the app guess)
+                      </label>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                        <input type="radio" name={`match-mode-${day.key}-${pk}`} checked={mode === "none"}
+                          onChange={() => onSetMatchOverride(day.key, pk, null)} />
+                        No match
+                      </label>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                        <input type="radio" name={`match-mode-${day.key}-${pk}`} checked={mode === "custom"}
+                          onChange={() => onSetMatchOverride(day.key, pk, actual
+                            ? (Array.isArray(actual) ? actual.map((a) => a.key) : [actual.key])
+                            : [])} />
+                        Choose specific activities
+                      </label>
+                      {mode === "custom" && (
+                        <div style={{ marginLeft: 22, display: "flex", flexDirection: "column", gap: 3, marginTop: 2 }}>
+                          {day.dayActuals.length === 0 && (
+                            <div style={{ fontSize: 11, color: dim }}>No activities synced this day.</div>
+                          )}
+                          {day.dayActuals.map((a) => (
+                            <label key={a.key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                              <input type="checkbox" checked={selectedKeys.includes(a.key)}
+                                onChange={() => {
+                                  const next = selectedKeys.includes(a.key)
+                                    ? selectedKeys.filter((k) => k !== a.key)
+                                    : [...selectedKeys, a.key];
+                                  onSetMatchOverride(day.key, pk, next);
+                                }} />
+                              {a.activityType} · {a.durationMin}m · {a.name}
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    {mode === "auto" && (
+                      <div style={{ fontSize: 10.5, color: dim, marginTop: 4 }}>
+                        Auto-detected{actualNames.length ? ` — matched to "${actualNames.join('", "')}"` : " — no match found"}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {day.dayActuals.length === 0 && day.pairs.length > 0 && (
+                <div style={{ fontSize: 11, color: dim }}>No Strava/intervals.icu activities synced for this day.</div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
       <div className="card" style={{ padding: 22 }}>
+        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
+          <Icon path={ICONS.upload} size={16} color={cyan} /> Import schedule from file
+        </div>
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+          Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file.
+          It's saved under <code>schedule_sources/</code> and re-imported automatically from then on
+          whenever that file's contents change — no need to come back here and re-upload it.
+        </div>
+        <div
+          onDragOver={(e) => { e.preventDefault(); setScheduleDragOver(true); }}
+          onDragLeave={() => setScheduleDragOver(false)}
+          onDrop={(e) => { e.preventDefault(); setScheduleDragOver(false); if (e.dataTransfer.files[0]) onImportFile(e.dataTransfer.files[0]); }}
+          style={{
+            border: `1.5px dashed ${scheduleDragOver ? cyan : line}`, borderRadius: 6, padding: "28px 20px",
+            textAlign: "center", background: scheduleDragOver ? "rgba(79,209,217,0.05)" : "transparent", transition: "all 0.15s",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}><Icon path={ICONS.upload} size={22} color={dim} /></div>
+          <div style={{ fontSize: 13, marginBottom: 12 }}>Drop a .json schedule file here, or</div>
+          <label className="btn-ghost" style={{ display: "inline-block" }}>
+            Choose file
+            <input type="file" accept=".json,application/json" style={{ display: "none" }}
+              onChange={(e) => { if (e.target.files[0]) onImportFile(e.target.files[0]); e.target.value = ""; }} />
+          </label>
+        </div>
+        {importFileError && <Banner kind="error">{importFileError}</Banner>}
+        {!importFileError && importFileNotice && <Banner kind="success">{importFileNotice}</Banner>}
+      </div>
+
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
           <Icon path={form.kind === "race" ? ICONS.trophy : ICONS.calendar} size={16} color={cyan} /> {editingId ? "Edit scheduled session" : "Add to schedule"}
         </div>
@@ -2292,7 +3085,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           </Field>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginBottom: 14 }}>
           <Field label="Activity type">
             <select className="inp" value={form.activityType} onChange={(e) => setForm((f) => ({ ...f, activityType: e.target.value }))}>
               {ACTIVITY_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
@@ -2319,7 +3112,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
         </Field>
 
         {form.kind === "race" ? (
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginTop: 14 }}>
             <Field label="Race date">
               <input className="inp" type="date" value={form.raceDate} onChange={(e) => setForm((f) => ({ ...f, raceDate: e.target.value }))} />
             </Field>
@@ -2349,14 +3142,18 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
               </div>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 14, marginTop: 14, alignItems: "end" }}>
-              <Field label="Start date">
-                <input className="inp" type="date" value={form.startDate} onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value }))} />
-              </Field>
-              <Field label="End date">
-                <input className="inp" type="date" value={form.endDate} disabled={form.ongoing}
-                  onChange={(e) => setForm((f) => ({ ...f, endDate: e.target.value }))} style={{ opacity: form.ongoing ? 0.5 : 1 }} />
-              </Field>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" }}>
+              <div style={{ flex: "1 1 140px" }}>
+                <Field label="Start date">
+                  <input className="inp" type="date" value={form.startDate} onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value }))} />
+                </Field>
+              </div>
+              <div style={{ flex: "1 1 140px" }}>
+                <Field label="End date">
+                  <input className="inp" type="date" value={form.endDate} disabled={form.ongoing}
+                    onChange={(e) => setForm((f) => ({ ...f, endDate: e.target.value }))} style={{ opacity: form.ongoing ? 0.5 : 1 }} />
+                </Field>
+              </div>
               <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
                 <input type="checkbox" checked={form.ongoing} onChange={(e) => setForm((f) => ({ ...f, ongoing: e.target.checked }))} />
                 Ongoing
@@ -2537,7 +3334,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
       )}
 
       {!summary.noIntake && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14 }}>
           <StatCard label="Avg. daily target" value={`${fmt(summary.avgTarget)} kcal`} color={cyan} />
           <StatCard label="Avg. daily intake" value={`${fmt(summary.avgIntake)} kcal`} color={paper} />
           <StatCard label="Avg. gap" value={`${summary.avgGap >= 0 ? "+" : ""}${fmt(summary.avgGap)} kcal`} color={summary.avgGap < -200 ? coral : summary.avgGap > 200 ? amber : mint} />
@@ -2749,7 +3546,7 @@ function FuelingInfoPopout({ proteinGPerKg, onClose }) {
 function FuelingReferencePanel({ fuelingByTier }) {
   return (
     <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${line}` }}>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: fuelingByTier.length ? 18 : 0 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10, marginBottom: fuelingByTier.length ? 18 : 0 }}>
         {FUEL_TIERS.map((t) => (
           <div key={t.tier} style={{ background: panel2, border: `1px solid ${line}`, borderRadius: 5, padding: "10px 12px" }}>
             <div style={{ fontSize: 11, color: dim, marginBottom: 4 }}>{t.label}</div>
@@ -2763,15 +3560,15 @@ function FuelingReferencePanel({ fuelingByTier }) {
           <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 10 }}>Your averages by tier, this window</div>
           <div style={{ display: "grid", gap: 8 }}>
             {fuelingByTier.map((g) => (
-              <div key={g.tier} style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 12.5 }}>
+              <div key={g.tier} style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 12, fontSize: 12.5 }}>
                 <div style={{ width: 130, color: dim, flexShrink: 0 }}>{g.label} <span style={{ fontFamily: mono }}>({g.n}d)</span></div>
-                <div style={{ flex: 1 }}>
+                <div style={{ flex: "1 1 100px" }}>
                   Carb: <MacroCell actual={g.avgCarb} target={g.avgCarbTarget} /> g
                 </div>
-                <div style={{ flex: 1 }}>
+                <div style={{ flex: "1 1 100px" }}>
                   Protein: <MacroCell actual={g.avgProtein} target={g.avgProteinTarget} /> g
                 </div>
-                <div style={{ flex: 1 }}>
+                <div style={{ flex: "1 1 100px" }}>
                   Fat: <MacroCell actual={g.avgFat} target={g.avgFatTarget} /> g
                 </div>
               </div>

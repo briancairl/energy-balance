@@ -240,38 +240,55 @@ looking for the longest valid-JSON prefix) — keep it around.
   outbound network access to load Recharts/React from CDN for a full render test) — all run
   in-conversation, not saved as a runnable suite. Worth setting one up if this keeps growing.
 
-## Road to Placid (IRONMAN training plan) integration
+## Training-plan import (schedule_sources/)
 
-`road_to_placid_plan.json` is a static export of the periodized training plan built in the
-"Road to Placid" artifact (Sept 2026 → IRONMAN Lake Placid, July 2027 — see the published
-Claude artifact for the human-facing checklist/notes version of the same plan).
-`sync_schedule_from_plan.py` (run it from this directory: `python3 sync_schedule_from_plan.py
-[--weeks-ahead 8] [--dry-run]`) reads that export and writes into `training-schedule`:
+Any periodized training plan export — e.g. `schedule_sources/road_to_placid.json`, a static
+export of the plan built in the "Road to Placid" artifact (Sept 2026 → IRONMAN Lake Placid,
+July 2027 — see the published Claude artifact for the human-facing checklist/notes version) —
+can be dropped as a `*.json` file into `schedule_sources/`. **The running server watches that
+directory and imports automatically**: `schedule_sources_sync_loop()` in `server.py` polls
+every ~30s, hashes (sha256, not mtime — a touch with no content change must not trigger a
+re-import) each file, and re-imports any file whose hash has changed since last time. Hashes
+are kept in the store itself (`schedule-source-hashes`), so nothing gets re-imported from
+scratch on a server restart, and editing a plan file (e.g. regenerating it after a re-published
+version of the source artifact) takes effect on its own within about 30 seconds — no restart,
+no manual step. Each file's source tag is its filename minus `.json`, so several plans can be
+dropped in side by side (a base plan plus a separate race-specific block, say) without their
+entries colliding.
+
+The actual plan → schedule-entry conversion (shared by the background importer and the manual
+CLI below) lives in `schedule_sync.py`, `sync_plan_into_store()`. For each file it writes into
+`training-schedule`:
 
 - **Race entries** (`kind: "race"`) for every race in the plan — added once, covering the
-  whole calendar out to Lake Placid and the Long Island 70.3, since taper/carb-load math
+  whole calendar (e.g. out to Lake Placid and the Long Island 70.3), since taper/carb-load math
   looks at the nearest upcoming race regardless of distance. Skipped if a race entry with the
   same `raceDate` already exists (so it never clobbers a race added by hand — e.g. the Olympic
-  tri entry was hand-entered before this script existed and is left alone).
+  tri entry was hand-entered before this ever existed and is left alone). Once added, a source's
+  own race entries are never removed or rebuilt on a later sync — only regenerated if genuinely
+  missing — since races are meant to persist even as the file's near-term sessions keep churning.
 - **Single-session entries** (`kind: "single"`), one per planned session, but only for the next
   `--weeks-ahead` weeks (default 8) — the app only ever consults the schedule for
   `FORWARD_DAYS` (4) days of lookahead plus taper-window scaling, so encoding a full year of
-  sessions up front would be pure clutter. Re-run the script periodically (weekly is plenty) to
-  keep the near-term window current as the plan progresses. These are genuinely non-recurring
-  (a `date`, not a weekly pattern), so they show up under "Single sessions" in the app, not
-  "Recurring sessions".
+  sessions up front would be pure clutter. These are genuinely non-recurring (a `date`, not a
+  weekly pattern), so they show up under "Single sessions" in the app, not "Recurring sessions".
+  Every sync fully regenerates a source's own single-session entries against the current window
+  (that's the piece that has to re-run as the plan progresses/today's date moves forward).
 
-Every entry the script creates is tagged `"source": "road_to_placid"`, so re-running it
-replaces only its own previously-synced entries — anything added by hand in the app's UI is
-left untouched, with one exception: your own open-ended (`endDate: null`) recurring entries
-that overlap the sync window get their `endDate` capped to the day before the window starts
-(printed every time it happens), since otherwise they'd keep firing forever and double-count
-against what the script adds. It also skips generating a session for any date already covered
-by one of your own (non-`road_to_placid`) entries, so a hand-entered override is never
-double-booked.
+Every entry a source creates is tagged `"source": "<filename-without-.json>"`, so re-syncing one
+file only replaces that file's own previously-synced single-session entries — anything added by
+hand in the app's UI, or by another source file, is left untouched, with one exception: your own
+open-ended (`endDate: null`) recurring entries that overlap the sync window get their `endDate`
+capped to the day before the window starts (printed every time it happens), since otherwise
+they'd keep firing forever and double-count against what the sync adds. It also skips generating
+a session for any date already covered by an entry from outside that source, so a hand-entered
+override (or another plan file's entry) is never double-booked.
 
-If the underlying plan changes (a re-published version of the artifact), regenerate
-`road_to_placid_plan.json` from it before the next sync.
+**Manual/offline use** (previewing a change before saving it, or forcing an immediate re-import
+without waiting ~30s for the background poll): `python3 sync_schedule_from_plan.py
+[--weeks-ahead 8] [--dry-run] [--file some_plan.json]`. With no `--file`, it syncs every
+`schedule_sources/*.json` file in one pass. This script is *not* required for the automatic
+import to work — it's a convenience for testing/forcing, not the primary mechanism anymore.
 
 ## If you're picking this up cold
 

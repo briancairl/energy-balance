@@ -113,7 +113,7 @@ def classify_zone(disc, title, detail):
     text = f"{title} {detail}".lower()
     if "recovery" in text and "spin" in text:
         return 1
-    if any(k in text for k in ["dress rehearsal", "marathon pace", "tempo", "race power",
+    if any(k in text for k in ["dress rehearsal", "marathon pace", "tempo", "threshold", "race power",
                                 "race-pace", "race pace", "hills", "surges", "70.3 pace"]):
         return 3
     return 2

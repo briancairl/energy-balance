@@ -357,11 +357,17 @@ const CHART_DAY_WIDTH = 70; // px per day — charts render at their full data w
 // trusted directly and scaled to this session's (possibly taper-adjusted)
 // duration — more accurate than MET×weight since it reflects how this
 // specific athlete actually burns energy doing this specific workout.
-function estimatePlannedKcal(session, durationMin, weightKg) {
+function estimatePlannedKcal(session, durationMin, weightKg, matchedRates) {
   const src = session.sourceActivity;
   if (src && src.durationMin > 0 && src.kcal > 0) {
     return (src.kcal / src.durationMin) * durationMin;
   }
+  // Personalized rate learned from this athlete's own matched workouts of
+  // this exact activityType+zone (see buildMatchedKcalRates) — checked
+  // before the generic MET table since it reflects how THIS athlete actually
+  // burns energy at this intensity, not a population-average estimate.
+  const learnedRate = matchedRates && matchedRates[`${session.activityType}_Z${session.zone}`];
+  if (learnedRate > 0) return learnedRate * durationMin;
   const z = ZONES[session.zone - 1];
   if (!z || !weightKg) return 0;
   return z.met * weightKg * (durationMin / 60);
@@ -587,6 +593,65 @@ function matchDayActivities(plannedItems, actuals, overrides) {
     pairs.push({ planned, actual: match, manual: false });
   }
   return { pairs, extras: remaining };
+}
+
+// Minimum real matched samples of a given (activityType, zone) before its
+// learned rate is trusted over the generic MET-table guess — one lucky/odd
+// session (e.g. a "Zone 2 run" that was actually a hard fartlek) shouldn't
+// override the table on its own.
+const MIN_MATCHED_KCAL_SAMPLES = 2;
+// How far back to gather matched real workouts for the learned rate. Long
+// enough to accumulate enough same-type/zone samples to average out
+// day-to-day noise, short enough that a real fitness change (getting
+// fitter/slower, a new training phase) isn't stuck averaging in months-old
+// sessions that no longer reflect how this athlete burns energy now.
+const MATCHED_KCAL_LOOKBACK_DAYS = 120;
+
+// Learns a personalized kcal/minute rate per (activityType, zone) from real
+// workouts that were actually matched to a scheduled session of that same
+// type/zone — using the exact same matching (and manual corrections) the
+// Schedule tab's calendar already shows, just run over a much longer history
+// than that 3-week view needs, purely to build up a statistically reliable
+// base. This sits between the two existing planned-kcal estimates in
+// estimatePlannedKcal: more specific than the generic MET table (which knows
+// nothing about this athlete), less specific than sourceActivity (which is
+// one hand-picked real session, not an average) — so it's checked after
+// sourceActivity but before falling back to the MET table.
+function buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides) {
+  const activityLibrary = getActivityLibrary(stravaData, intervalsData);
+  const byDate = {};
+  for (const a of activityLibrary) (byDate[a.date] || (byDate[a.date] = [])).push(a);
+
+  const races = getRaces(schedule);
+  const cutoff = toISODate(daysAgo(MATCHED_KCAL_LOOKBACK_DAYS));
+  const todayKey = toISODate(new Date());
+  const totals = {}; // "activityType_Zzone" -> { kcal, min, n }
+
+  for (const dateKey of Object.keys(byDate)) {
+    if (dateKey < cutoff || dateKey >= todayKey) continue; // only fully-happened past days
+    const { sessions } = getEffectiveSessionsForDate(schedule, dateKey);
+    const raceToday = races.find((r) => r.raceDate === dateKey);
+    const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
+    if (!plannedItems.length) continue;
+    const { pairs } = matchDayActivities(plannedItems, byDate[dateKey], (matchOverrides || {})[dateKey]);
+    for (const { planned, actual } of pairs) {
+      // Races are one-off efforts (all-out for the distance), not a
+      // repeatable training-zone signal worth averaging into future
+      // estimates the way a recurring Zone 2 run's rate is.
+      if (!actual || planned.isRace) continue;
+      const key = `${planned.activityType}_Z${planned.zone}`;
+      const t = totals[key] || (totals[key] = { kcal: 0, min: 0, n: 0 });
+      t.kcal += actual.kcal;
+      t.min += actual.durationMin;
+      t.n += 1;
+    }
+  }
+
+  const rates = {};
+  for (const [key, t] of Object.entries(totals)) {
+    if (t.n >= MIN_MATCHED_KCAL_SAMPLES && t.min > 0) rates[key] = t.kcal / t.min;
+  }
+  return rates;
 }
 
 // ---------- goal-based calorie targets + weight-trend calibration ----------
@@ -1202,6 +1267,17 @@ function App() {
     setTab("dashboard");
   }
 
+  // Personalized kcal/min rates learned from this athlete's own matched
+  // workout history (see buildMatchedKcalRates) — feeds estimatePlannedKcal
+  // below so a not-yet-happened session's estimate reflects how this
+  // athlete actually burns energy at that type/zone, not just a generic
+  // MET-table guess. Recomputed whenever the schedule, real activity data,
+  // or a manual match correction changes.
+  const matchedKcalRates = useMemo(
+    () => buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides),
+    [schedule, stravaData, intervalsData, matchOverrides]
+  );
+
   const dailyRows = useMemo(() => {
     if (!bmr) return [];
     const wellByDate = {};
@@ -1273,7 +1349,7 @@ function App() {
         for (const s of scheduledSessions) {
           const baseIF = s.sourceActivity ? s.sourceActivity.intensityFactor : ZONES[s.zone - 1].if;
           const effIF = s.taperIntensityFactor ? baseIF * s.taperIntensityFactor : baseIF; // tapered sessions carry a reduced effective intensity
-          const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay); // s.durationMin is already taper-adjusted
+          const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay, matchedKcalRates); // s.durationMin is already taper-adjusted
           exerciseKcal += kcal;
           epocKcal += kcal * epocFactorFor(effIF) * profile.epocSensitivity;
           durationSec += s.durationMin * 60;
@@ -1285,7 +1361,7 @@ function App() {
         // race day, same as any other planned session.
         source = "planned";
         const raceIF = raceToday.sourceActivity ? raceToday.sourceActivity.intensityFactor : ZONES[raceToday.zone - 1].if;
-        const kcal = estimatePlannedKcal(raceToday, raceToday.durationMin, weightForDay);
+        const kcal = estimatePlannedKcal(raceToday, raceToday.durationMin, weightForDay, matchedKcalRates);
         exerciseKcal += kcal;
         epocKcal += kcal * epocFactorFor(raceIF) * profile.epocSensitivity;
         durationSec += raceToday.durationMin * 60;
@@ -1431,7 +1507,7 @@ function App() {
       });
     }
     return days;
-  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection]);
+  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates]);
 
 
   const summary = useMemo(() => {
@@ -1576,7 +1652,7 @@ function App() {
             onImportFile={handleScheduleFile} importFileError={scheduleImportError}
             importFileNotice={scheduleImportNotice} matchOverrides={matchOverrides}
             onSetMatchOverride={setScheduleMatchOverride} profile={profile} setProfile={setProfile}
-            weightLog={weightLog} />
+            weightLog={weightLog} matchedKcalRates={matchedKcalRates} />
         )}
         {tab === "dashboard" && (
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
@@ -2424,7 +2500,7 @@ function scheduleRowStyle(highlighted) {
 
 function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData,
   onImportFile, importFileError, importFileNotice, matchOverrides, onSetMatchOverride,
-  profile, setProfile, weightLog }) {
+  profile, setProfile, weightLog, matchedKcalRates }) {
   const [form, setForm] = useState(emptyScheduleForm());
   const [editingId, setEditingId] = useState(null);
   const [highlightIds, setHighlightIds] = useState([]);
@@ -2579,7 +2655,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
     // just the ones the heuristic paired up, so a manually-corrected or
     // unmatched activity still counts.
     const weightForDay = weightLog[key] ?? (parseFloat(profile.weightKg) || null);
-    const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay), 0);
+    const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay, matchedKcalRates), 0);
     const actualKcal = dayActuals.reduce((sum, a) => sum + a.kcal, 0);
 
     calendarDays.push({

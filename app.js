@@ -306,11 +306,13 @@
   const ACTIVITY_TYPES = ["Run", "Ride", "Swim", "Row", "Strength", "Other"];
   const FORWARD_DAYS = 4;
   const CHART_DAY_WIDTH = 70;
-  function estimatePlannedKcal(session, durationMin, weightKg) {
+  function estimatePlannedKcal(session, durationMin, weightKg, matchedRates) {
     const src = session.sourceActivity;
     if (src && src.durationMin > 0 && src.kcal > 0) {
       return src.kcal / src.durationMin * durationMin;
     }
+    const learnedRate = matchedRates && matchedRates[`${session.activityType}_Z${session.zone}`];
+    if (learnedRate > 0) return learnedRate * durationMin;
     const z = ZONES[session.zone - 1];
     if (!z || !weightKg) return 0;
     return z.met * weightKg * (durationMin / 60);
@@ -465,6 +467,38 @@
       pairs.push({ planned, actual: match, manual: false });
     }
     return { pairs, extras: remaining };
+  }
+  const MIN_MATCHED_KCAL_SAMPLES = 2;
+  const MATCHED_KCAL_LOOKBACK_DAYS = 120;
+  function buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides) {
+    const activityLibrary = getActivityLibrary(stravaData, intervalsData);
+    const byDate = {};
+    for (const a of activityLibrary) (byDate[a.date] || (byDate[a.date] = [])).push(a);
+    const races = getRaces(schedule);
+    const cutoff = toISODate(daysAgo(MATCHED_KCAL_LOOKBACK_DAYS));
+    const todayKey = toISODate(/* @__PURE__ */ new Date());
+    const totals = {};
+    for (const dateKey of Object.keys(byDate)) {
+      if (dateKey < cutoff || dateKey >= todayKey) continue;
+      const { sessions } = getEffectiveSessionsForDate(schedule, dateKey);
+      const raceToday = races.find((r) => r.raceDate === dateKey);
+      const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
+      if (!plannedItems.length) continue;
+      const { pairs } = matchDayActivities(plannedItems, byDate[dateKey], (matchOverrides || {})[dateKey]);
+      for (const { planned, actual } of pairs) {
+        if (!actual || planned.isRace) continue;
+        const key = `${planned.activityType}_Z${planned.zone}`;
+        const t = totals[key] || (totals[key] = { kcal: 0, min: 0, n: 0 });
+        t.kcal += actual.kcal;
+        t.min += actual.durationMin;
+        t.n += 1;
+      }
+    }
+    const rates = {};
+    for (const [key, t] of Object.entries(totals)) {
+      if (t.n >= MIN_MATCHED_KCAL_SAMPLES && t.min > 0) rates[key] = t.kcal / t.min;
+    }
+    return rates;
   }
   const KCAL_PER_KG_TISSUE = 7700;
   const GOAL_DEFAULTS = {
@@ -954,6 +988,10 @@
       await Promise.all([fetchIntervals(), fetchStrava()]);
       setTab("dashboard");
     }
+    const matchedKcalRates = useMemo(
+      () => buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides),
+      [schedule, stravaData, intervalsData, matchOverrides]
+    );
     const dailyRows = useMemo(() => {
       var _a, _b, _c, _d, _e, _f, _g, _h;
       if (!bmr) return [];
@@ -1017,7 +1055,7 @@
           for (const s of scheduledSessions) {
             const baseIF = s.sourceActivity ? s.sourceActivity.intensityFactor : ZONES[s.zone - 1].if;
             const effIF = s.taperIntensityFactor ? baseIF * s.taperIntensityFactor : baseIF;
-            const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay);
+            const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay, matchedKcalRates);
             exerciseKcal += kcal;
             epocKcal += kcal * epocFactorFor(effIF) * profile.epocSensitivity;
             durationSec += s.durationMin * 60;
@@ -1026,7 +1064,7 @@
         } else if (raceToday) {
           source = "planned";
           const raceIF = raceToday.sourceActivity ? raceToday.sourceActivity.intensityFactor : ZONES[raceToday.zone - 1].if;
-          const kcal = estimatePlannedKcal(raceToday, raceToday.durationMin, weightForDay);
+          const kcal = estimatePlannedKcal(raceToday, raceToday.durationMin, weightForDay, matchedKcalRates);
           exerciseKcal += kcal;
           epocKcal += kcal * epocFactorFor(raceIF) * profile.epocSensitivity;
           durationSec += raceToday.durationMin * 60;
@@ -1124,7 +1162,7 @@
         });
       }
       return days;
-    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection]);
+    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates]);
     const summary = useMemo(() => {
       const withIntake = dailyRows.filter((d) => d.intake !== null);
       const trainingMissingDays = dailyRows.filter((d) => d.trainingMissing).length;
@@ -1287,7 +1325,8 @@
         onSetMatchOverride: setScheduleMatchOverride,
         profile,
         setProfile,
-        weightLog
+        weightLog,
+        matchedKcalRates
       }
     ), tab === "dashboard" && /* @__PURE__ */ React.createElement(
       DashboardTab,
@@ -1753,7 +1792,8 @@
     onSetMatchOverride,
     profile,
     setProfile,
-    weightLog
+    weightLog,
+    matchedKcalRates
   }) {
     var _a, _b;
     const [form, setForm] = useState(emptyScheduleForm());
@@ -1915,7 +1955,7 @@
       const dayActuals = actualsByDate[key] || [];
       const { pairs, extras } = matchDayActivities(plannedItems, dayActuals, matchOverrides[key]);
       const weightForDay = (_a = weightLog[key]) != null ? _a : parseFloat(profile.weightKg) || null;
-      const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay), 0);
+      const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay, matchedKcalRates), 0);
       const actualKcal = dayActuals.reduce((sum, a) => sum + a.kcal, 0);
       calendarDays.push({
         key,

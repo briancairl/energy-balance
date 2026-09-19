@@ -1511,7 +1511,7 @@ function App() {
       `}</style>
 
       <div style={{ borderBottom: `1px solid ${line}` }}>
-        <div style={{ padding: "14px clamp(12px, 4vw, 28px)", maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", rowGap: 10 }}>
+        <div style={{ padding: "14px clamp(12px, 4vw, 28px)", maxWidth: 1400, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", rowGap: 10 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <img src="/logo-header.png" alt="" width={28} height={28} style={{ borderRadius: 6, display: "block" }} />
             <div>
@@ -1552,7 +1552,7 @@ function App() {
         </div>
       </div>
 
-      <div style={{ padding: "20px clamp(12px, 4vw, 28px)", maxWidth: 1080, margin: "0 auto" }}>
+      <div style={{ padding: "20px clamp(12px, 4vw, 28px)", maxWidth: 1400, margin: "0 auto" }}>
         {tab === "setup" && (
           <SetupTab profile={profile} setProfile={setProfile} bmr={bmr} onFetch={pullAll}
             fetching={fetching || stravaFetching} fetchError={fetchError} rangeDays={rangeDays} setRangeDays={setRangeDays}
@@ -1599,7 +1599,7 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
   const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
   const [heightText, onHeightChange] = useUnitInput(profile.heightCm, units, cmToDisplayLen, displayToCm, 1);
   return (
-    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" }}>
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16 }}>Athlete profile</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 14 }}>
@@ -1692,7 +1692,7 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
         {lastFetched && <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>last synced {new Date(lastFetched).toLocaleString()} · {intervalsSyncedCount} day{intervalsSyncedCount === 1 ? "" : "s"} covered</div>}
       </div>
 
-      <div className="card" style={{ padding: 22 }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
           <Field label="Days of history">
             <select className="inp" style={{ width: 120 }} value={rangeDays} onChange={(e) => setRangeDays(parseInt(e.target.value))}>
@@ -1877,7 +1877,7 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
   const dayCount = Object.keys(nutrition).length;
   const weightCount = Object.keys(weightLog).length;
   return (
-    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" }}>
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
       <ManualEntryCard nutrition={nutrition} onSave={onSaveManualDay} />
       <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} units={units} />
 
@@ -1951,7 +1951,7 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
       </div>
 
       {csvPreview && (
-        <div className="card" style={{ padding: 22 }}>
+        <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Map columns</div>
           <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>{csvPreview.rows.length} rows found. Match the columns to the fields below.</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 12 }}>
@@ -1968,7 +1968,7 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
         </div>
       )}
 
-      <div className="card" style={{ padding: 22 }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored nutrition log</div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 }}>{dayCount} day{dayCount === 1 ? "" : "s"} of intake saved. Click a row to edit it.</div>
         {dayCount > 0 && (
@@ -1978,7 +1978,7 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
         )}
       </div>
 
-      <div className="card" style={{ padding: 22 }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored weight log</div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 }}>{weightCount} day{weightCount === 1 ? "" : "s"} of weight saved. Click a row to edit it.</div>
         {weightCount > 0 && (
@@ -2590,8 +2590,8 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
   const todayKey = toLocalISODate(new Date());
 
   return (
-    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" }}>
-      <div className="card" style={{ padding: 22 }}>
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
           <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
         </div>
@@ -2625,7 +2625,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
             </span>
           )}
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }}>
           {WEEKDAY_LABELS.map((label) => (
             <div key={label} style={{ fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 }}>{label}</div>
           ))}
@@ -2868,7 +2868,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
         {!importFileError && importFileNotice && <Banner kind="success">{importFileNotice}</Banner>}
       </div>
 
-      <div className="card" style={{ padding: 22 }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
           <Icon path={form.kind === "race" ? ICONS.trophy : ICONS.calendar} size={16} color={cyan} /> {editingId ? "Edit scheduled session" : "Add to schedule"}
         </div>

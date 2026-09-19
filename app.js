@@ -446,7 +446,8 @@
     const claimed = /* @__PURE__ */ new Set();
     for (const planned of plannedItems) {
       const forced = overrides[plannedMatchKey(planned)];
-      if (forced) claimed.add(forced);
+      if (Array.isArray(forced)) forced.forEach((k) => claimed.add(k));
+      else if (forced) claimed.add(forced);
     }
     const remaining = actuals.filter((a) => !claimed.has(a.key));
     const pairs = [];
@@ -454,7 +455,14 @@
       const pk = plannedMatchKey(planned);
       if (Object.prototype.hasOwnProperty.call(overrides, pk)) {
         const forced = overrides[pk];
-        pairs.push({ planned, actual: forced ? byKey[forced] || null : null, manual: true });
+        let actual;
+        if (Array.isArray(forced)) {
+          const matched = forced.map((k) => byKey[k]).filter(Boolean);
+          actual = matched.length === 0 ? null : matched.length === 1 ? matched[0] : matched;
+        } else {
+          actual = forced ? byKey[forced] || null : null;
+        }
+        pairs.push({ planned, actual, manual: true });
         continue;
       }
       const candidates = remaining.filter((a) => a.activityType === planned.activityType);
@@ -489,8 +497,10 @@
         if (!actual || planned.isRace) continue;
         const key = `${planned.activityType}_Z${planned.zone}`;
         const t = totals[key] || (totals[key] = { kcal: 0, min: 0, n: 0 });
-        t.kcal += actual.kcal;
-        t.min += actual.durationMin;
+        for (const a of Array.isArray(actual) ? actual : [actual]) {
+          t.kcal += a.kcal;
+          t.min += a.durationMin;
+        }
         t.n += 1;
       }
     }
@@ -742,13 +752,16 @@
       saveSchedule(schedule.filter((s) => s.id !== id));
     }
     async function setScheduleMatchOverride(date, plannedKey, actualKey) {
-      const data = await apiSetScheduleMatchOverride(date, plannedKey, actualKey);
       setMatchOverrides((prev) => {
+        const day = { ...prev[date] || {} };
+        if (actualKey === void 0) delete day[plannedKey];
+        else day[plannedKey] = actualKey;
         const next = { ...prev };
-        if (data.overrides && Object.keys(data.overrides).length) next[date] = data.overrides;
+        if (Object.keys(day).length) next[date] = day;
         else delete next[date];
         return next;
       });
+      await apiSetScheduleMatchOverride(date, plannedKey, actualKey);
     }
     const bmr = useMemo(
       () => calcBMR(profile.sex, parseFloat(profile.weightKg), parseFloat(profile.heightCm), parseFloat(profile.age)),
@@ -1991,13 +2004,13 @@
       const isPast = day.key < todayKey;
       const isFirstOfMonth = day.date.getDate() === 1;
       const clickable = day.sessions.length > 0 || !!day.race;
-      function plannedChip(planned, i) {
+      function plannedChip(planned, i, isGroup) {
         if (planned.isRace) {
           return /* @__PURE__ */ React.createElement(
             "div",
             {
               key: `p${i}`,
-              title: `Race: ${planned.notes || planned.activityType} \xB7 ${planned.durationMin}min`,
+              title: `Race: ${planned.notes || planned.activityType} \xB7 ${planned.durationMin}min${isGroup ? " \xB7 matched to multiple activities" : ""}`,
               style: {
                 background: gold,
                 color: ink,
@@ -2014,14 +2027,15 @@
             },
             /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 9, color: ink }),
             /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, planned.notes || planned.activityType),
-            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, "\u{1F3C6}")
+            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, "\u{1F3C6}"),
+            isGroup && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 8, color: ink })
           );
         }
         return /* @__PURE__ */ React.createElement(
           "div",
           {
             key: `p${i}`,
-            title: `${planned.activityType} \xB7 ${ZONES[planned.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${planned.durationMin}min${planned.notes ? ` \xB7 ${planned.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}`,
+            title: `${planned.activityType} \xB7 ${ZONES[planned.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${planned.durationMin}min${planned.notes ? ` \xB7 ${planned.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}${isGroup ? " \xB7 matched to multiple activities" : ""}`,
             style: {
               background: ACTIVITY_COLORS[planned.activityType] || dim,
               color: ink,
@@ -2039,7 +2053,8 @@
           },
           /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, planned.activityType, " Z", planned.zone, " \xB7 ", planned.durationMin, "m"),
           /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[planned.activityType] || "\u{1F3AF}"),
-          isPreloadWorthy(planned) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink })
+          isPreloadWorthy(planned) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink }),
+          isGroup && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 8, color: ink })
         );
       }
       function actualChip(actual, matched, i, manual) {
@@ -2068,6 +2083,16 @@
           /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[actual.activityType] || "\u{1F3AF}"),
           manual && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 8, color })
         );
+      }
+      function actualChipGroup(actuals, i, manual) {
+        return /* @__PURE__ */ React.createElement("div", { key: `ag${i}`, style: {
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+          border: `1px dashed ${dim}`,
+          borderRadius: 4,
+          padding: 2
+        } }, actuals.map((a, j) => actualChip(a, true, `${i}-${j}`, manual)));
       }
       return /* @__PURE__ */ React.createElement(
         "div",
@@ -2119,7 +2144,10 @@
           /* @__PURE__ */ React.createElement("span", { style: { color: dim } }, "/"),
           /* @__PURE__ */ React.createElement("span", { style: { color: amber, fontWeight: 600 } }, Math.round(day.actualKcal))
         ),
-        showActual ? /* @__PURE__ */ React.createElement(React.Fragment, null, day.pairs.map(({ planned, actual, manual }, i) => /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i), actual ? actualChip(actual, true, i, manual) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null)), day.extras.map((actual, i) => /* @__PURE__ */ React.createElement("div", { key: `extra${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, /* @__PURE__ */ React.createElement("div", null), actualChip(actual, false, i)))) : day.pairs.map(({ planned }, i) => plannedChip(planned, i))
+        showActual ? /* @__PURE__ */ React.createElement(React.Fragment, null, day.pairs.map(({ planned, actual, manual }, i) => {
+          const isGroup = Array.isArray(actual);
+          return /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i, isGroup), isGroup ? actualChipGroup(actual, i, manual) : actual ? actualChip(actual, true, i, manual) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null);
+        }), day.extras.map((actual, i) => /* @__PURE__ */ React.createElement("div", { key: `extra${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, /* @__PURE__ */ React.createElement("div", null), actualChip(actual, false, i)))) : day.pairs.map(({ planned }, i) => plannedChip(planned, i))
       );
     }))), editingMatchDay && (() => {
       const day = calendarDays.find((d) => d.key === editingMatchDay);
@@ -2150,34 +2178,55 @@
           style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }
         },
         "\xD7"
-      )), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Correct which logged activity matches each planned session, if the automatic guess got it wrong."), day.pairs.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16 } }, "Nothing scheduled this day."), day.pairs.map(({ planned, actual }, i) => {
+      )), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: dim, marginBottom: 16, lineHeight: 1.5 } }, 'Correct which logged activity matches each planned session, if the automatic guess got it wrong \u2014 or pick more than one to group several activities into one match (e.g. a "Triathlon" race entry that actually shows up on Strava as a separate swim, bike, and run).'), day.pairs.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16 } }, "Nothing scheduled this day."), day.pairs.map(({ planned, actual }, i) => {
         const pk = plannedMatchKey(planned);
         const label = planned.isRace ? `Race: ${planned.notes || planned.activityType}` : `${planned.activityType} Z${planned.zone} \xB7 ${planned.durationMin}m${planned.notes ? ` \xB7 ${planned.notes}` : ""}`;
         const hasOverride = Object.prototype.hasOwnProperty.call(dayOverrides, pk);
         const overrideValue = dayOverrides[pk];
-        const selectValue = !hasOverride ? "__auto__" : overrideValue === null ? "__none__" : overrideValue;
-        return /* @__PURE__ */ React.createElement("div", { key: i, style: { marginBottom: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, fontWeight: 600, marginBottom: 4, display: "flex", alignItems: "center", gap: 6 } }, /* @__PURE__ */ React.createElement("span", { style: {
+        const mode = !hasOverride ? "auto" : overrideValue === null ? "none" : "custom";
+        const selectedKeys = mode === "custom" ? Array.isArray(overrideValue) ? overrideValue : [overrideValue] : [];
+        const actualNames = actual ? Array.isArray(actual) ? actual.map((a) => a.name) : [actual.name] : [];
+        return /* @__PURE__ */ React.createElement("div", { key: i, style: { marginBottom: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, fontWeight: 600, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 } }, /* @__PURE__ */ React.createElement("span", { style: {
           width: 8,
           height: 8,
           borderRadius: 2,
           background: planned.isRace ? gold : ACTIVITY_COLORS[planned.activityType] || dim,
           display: "inline-block"
-        } }), label), /* @__PURE__ */ React.createElement(
-          "select",
+        } }), label), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 4 } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+          "input",
           {
-            value: selectValue,
-            onChange: (e) => {
-              const v = e.target.value;
-              if (v === "__auto__") onSetMatchOverride(day.key, pk, void 0);
-              else if (v === "__none__") onSetMatchOverride(day.key, pk, null);
-              else onSetMatchOverride(day.key, pk, v);
-            },
-            style: { width: "100%", padding: "6px 8px", borderRadius: 4, background: panel, border: `1px solid ${line}`, color: paper, fontSize: 12.5 }
-          },
-          /* @__PURE__ */ React.createElement("option", { value: "__auto__" }, "Auto (let the app guess)"),
-          /* @__PURE__ */ React.createElement("option", { value: "__none__" }, "No match"),
-          day.dayActuals.map((a) => /* @__PURE__ */ React.createElement("option", { key: a.key, value: a.key }, a.activityType, " \xB7 ", a.durationMin, "m \xB7 ", a.name))
-        ), !hasOverride && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: dim, marginTop: 2 } }, "Auto-detected", actual ? ` \u2014 matched to "${actual.name}"` : " \u2014 no match found"));
+            type: "radio",
+            name: `match-mode-${day.key}-${pk}`,
+            checked: mode === "auto",
+            onChange: () => onSetMatchOverride(day.key, pk, void 0)
+          }
+        ), "Auto (let the app guess)"), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "radio",
+            name: `match-mode-${day.key}-${pk}`,
+            checked: mode === "none",
+            onChange: () => onSetMatchOverride(day.key, pk, null)
+          }
+        ), "No match"), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "radio",
+            name: `match-mode-${day.key}-${pk}`,
+            checked: mode === "custom",
+            onChange: () => onSetMatchOverride(day.key, pk, actual ? Array.isArray(actual) ? actual.map((a) => a.key) : [actual.key] : [])
+          }
+        ), "Choose specific activities"), mode === "custom" && /* @__PURE__ */ React.createElement("div", { style: { marginLeft: 22, display: "flex", flexDirection: "column", gap: 3, marginTop: 2 } }, day.dayActuals.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim } }, "No activities synced this day."), day.dayActuals.map((a) => /* @__PURE__ */ React.createElement("label", { key: a.key, style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "checkbox",
+            checked: selectedKeys.includes(a.key),
+            onChange: () => {
+              const next = selectedKeys.includes(a.key) ? selectedKeys.filter((k) => k !== a.key) : [...selectedKeys, a.key];
+              onSetMatchOverride(day.key, pk, next);
+            }
+          }
+        ), a.activityType, " \xB7 ", a.durationMin, "m \xB7 ", a.name)))), mode === "auto" && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: dim, marginTop: 4 } }, "Auto-detected", actualNames.length ? ` \u2014 matched to "${actualNames.join('", "')}"` : " \u2014 no match found"));
       }), day.dayActuals.length === 0 && day.pairs.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim } }, "No Strava/intervals.icu activities synced for this day.")));
     })(), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " Import schedule from file"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file. It's saved under ", /* @__PURE__ */ React.createElement("code", null, "schedule_sources/"), " and re-imported automatically from then on whenever that file's contents change \u2014 no need to come back here and re-upload it."), /* @__PURE__ */ React.createElement(
       "div",

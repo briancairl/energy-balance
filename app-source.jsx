@@ -1497,6 +1497,11 @@ function App() {
         table.data th:first-child, table.data td:first-child { text-align:left; font-family: ${body}; }
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         .spin { animation: spin 1s linear infinite; }
+        .cal-chip-emoji { display: none; }
+        @media (max-width: 700px) {
+          .cal-chip-text { display: none; }
+          .cal-chip-emoji { display: inline; }
+        }
         * { scrollbar-color: ${line} transparent; scrollbar-width: thin; }
         *::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
         *::-webkit-scrollbar-track { background: transparent; }
@@ -2374,6 +2379,12 @@ function WeightLogTable({ weightLog, onSave, onDelete, units }) {
 
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const ACTIVITY_COLORS = { Run: coral, Ride: cyan, Swim: mint, Row: lavender, Strength: gold, Other: amber };
+// Calendar chips are only ever a fraction of a 7-column grid cell (half that
+// again once the planned/actual columns split it further), so there's no
+// width to spare for "Run Z2 · 30m" once the viewport gets narrow — a
+// .cal-chip-emoji/.cal-chip-text pair (see the <style> block) swaps to these
+// under a media query rather than letting the text force the cell wider.
+const ACTIVITY_EMOJI = { Run: "🏃", Ride: "🚴", Swim: "🏊", Row: "🚣", Strength: "🏋️", Other: "⚡" };
 
 const DEFAULT_TAPER_DAYS = 10; // middle of the commonly-cited 1-2 week taper window
 
@@ -2630,9 +2641,11 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                   <div key={`p${i}`} title={`Race: ${planned.notes || planned.activityType} · ${planned.durationMin}min`}
                     style={{
                       background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
-                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3,
+                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3, overflow: "hidden",
                     }}>
-                    <Icon path={ICONS.trophy} size={9} color={ink} /> {planned.notes || planned.activityType}
+                    <Icon path={ICONS.trophy} size={9} color={ink} />
+                    <span className="cal-chip-text">{planned.notes || planned.activityType}</span>
+                    <span className="cal-chip-emoji">🏆</span>
                   </div>
                 );
               }
@@ -2650,8 +2663,10 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                     alignItems: "center",
                     gap: 3,
                     opacity: day.taper ? 0.65 : 1,
+                    overflow: "hidden",
                   }}>
-                  {planned.activityType} Z{planned.zone} · {planned.durationMin}m
+                  <span className="cal-chip-text">{planned.activityType} Z{planned.zone} · {planned.durationMin}m</span>
+                  <span className="cal-chip-emoji">{ACTIVITY_EMOJI[planned.activityType] || "🎯"}</span>
                   {isPreloadWorthy(planned) && <Icon path={ICONS.flame} size={9} color={ink} />}
                 </div>
               );
@@ -2676,9 +2691,11 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                     display: "flex",
                     alignItems: "center",
                     gap: 3,
+                    overflow: "hidden",
                   }}>
                   {matched && <Icon path={ICONS.check} size={9} color={color} />}
-                  {actual.activityType} · {actual.durationMin}m
+                  <span className="cal-chip-text">{actual.activityType} · {actual.durationMin}m</span>
+                  <span className="cal-chip-emoji">{ACTIVITY_EMOJI[actual.activityType] || "🎯"}</span>
                   {manual && <Icon path={ICONS.pencil} size={8} color={color} />}
                 </div>
               );

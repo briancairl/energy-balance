@@ -1189,6 +1189,11 @@
         table.data th:first-child, table.data td:first-child { text-align:left; font-family: ${body}; }
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         .spin { animation: spin 1s linear infinite; }
+        .cal-chip-emoji { display: none; }
+        @media (max-width: 700px) {
+          .cal-chip-text { display: none; }
+          .cal-chip-emoji { display: inline; }
+        }
         * { scrollbar-color: ${line} transparent; scrollbar-width: thin; }
         *::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
         *::-webkit-scrollbar-track { background: transparent; }
@@ -1699,6 +1704,7 @@
   }
   const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const ACTIVITY_COLORS = { Run: coral, Ride: cyan, Swim: mint, Row: lavender, Strength: gold, Other: amber };
+  const ACTIVITY_EMOJI = { Run: "\u{1F3C3}", Ride: "\u{1F6B4}", Swim: "\u{1F3CA}", Row: "\u{1F6A3}", Strength: "\u{1F3CB}\uFE0F", Other: "\u26A1" };
   const DEFAULT_TAPER_DAYS = 10;
   function emptyScheduleForm() {
     return {
@@ -1962,12 +1968,13 @@
                 fontWeight: 700,
                 display: "flex",
                 alignItems: "center",
-                gap: 3
+                gap: 3,
+                overflow: "hidden"
               }
             },
             /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 9, color: ink }),
-            " ",
-            planned.notes || planned.activityType
+            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, planned.notes || planned.activityType),
+            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, "\u{1F3C6}")
           );
         }
         return /* @__PURE__ */ React.createElement(
@@ -1986,15 +1993,12 @@
               display: "flex",
               alignItems: "center",
               gap: 3,
-              opacity: day.taper ? 0.65 : 1
+              opacity: day.taper ? 0.65 : 1,
+              overflow: "hidden"
             }
           },
-          planned.activityType,
-          " Z",
-          planned.zone,
-          " \xB7 ",
-          planned.durationMin,
-          "m",
+          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, planned.activityType, " Z", planned.zone, " \xB7 ", planned.durationMin, "m"),
+          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[planned.activityType] || "\u{1F3AF}"),
           isPreloadWorthy(planned) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink })
         );
       }
@@ -2015,14 +2019,13 @@
               fontWeight: 600,
               display: "flex",
               alignItems: "center",
-              gap: 3
+              gap: 3,
+              overflow: "hidden"
             }
           },
           matched && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 9, color }),
-          actual.activityType,
-          " \xB7 ",
-          actual.durationMin,
-          "m",
+          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, actual.activityType, " \xB7 ", actual.durationMin, "m"),
+          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[actual.activityType] || "\u{1F3AF}"),
           manual && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 8, color })
         );
       }

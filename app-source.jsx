@@ -1570,7 +1570,8 @@ function App() {
             onDelete={deleteScheduleEntry} stravaData={stravaData} intervalsData={intervalsData}
             onImportFile={handleScheduleFile} importFileError={scheduleImportError}
             importFileNotice={scheduleImportNotice} matchOverrides={matchOverrides}
-            onSetMatchOverride={setScheduleMatchOverride} />
+            onSetMatchOverride={setScheduleMatchOverride} profile={profile} setProfile={setProfile}
+            weightLog={weightLog} />
         )}
         {tab === "dashboard" && (
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
@@ -2411,13 +2412,18 @@ function scheduleRowStyle(highlighted) {
 }
 
 function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData,
-  onImportFile, importFileError, importFileNotice, matchOverrides, onSetMatchOverride }) {
+  onImportFile, importFileError, importFileNotice, matchOverrides, onSetMatchOverride,
+  profile, setProfile, weightLog }) {
   const [form, setForm] = useState(emptyScheduleForm());
   const [editingId, setEditingId] = useState(null);
   const [highlightIds, setHighlightIds] = useState([]);
   const [scheduleDragOver, setScheduleDragOver] = useState(false);
   const [editingMatchDay, setEditingMatchDay] = useState(null); // date key, or null
   const itemRefs = useRef({});
+  // Both default on (undefined !== false) so existing profiles pick up the
+  // new toggles already enabled — nothing changes until someone opts out.
+  const showActual = profile.scheduleShowActual !== false;
+  const showCalories = profile.scheduleShowCalories !== false;
 
   const activityLibrary = useMemo(
     () => getActivityLibrary(stravaData, intervalsData),
@@ -2553,7 +2559,22 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
     const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
     const dayActuals = actualsByDate[key] || [];
     const { pairs, extras } = matchDayActivities(plannedItems, dayActuals, matchOverrides[key]);
-    calendarDays.push({ key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras, dayActuals });
+
+    // Expected vs actual calories burned that day — expected mirrors the
+    // same MET-based estimate dailyRows uses for a not-yet-happened session
+    // (or a sourceActivity-modeled one); actual sums whatever Strava/
+    // intervals.icu kcal getActivityLibrary already computed. Independent of
+    // the planned/actual matching above — this totals ALL of both sides, not
+    // just the ones the heuristic paired up, so a manually-corrected or
+    // unmatched activity still counts.
+    const weightForDay = weightLog[key] ?? (parseFloat(profile.weightKg) || null);
+    const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay), 0);
+    const actualKcal = dayActuals.reduce((sum, a) => sum + a.kcal, 0);
+
+    calendarDays.push({
+      key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras, dayActuals,
+      expectedKcal, actualKcal,
+    });
   }
   const todayKey = toLocalISODate(new Date());
 
@@ -2563,14 +2584,35 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
           <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
         </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 10, flexWrap: "wrap" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+            <input type="checkbox" checked={showActual}
+              onChange={(e) => setProfile((p) => ({ ...p, scheduleShowActual: e.target.checked }))} />
+            Show actual/matched workouts
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+            <input type="checkbox" checked={showCalories}
+              onChange={(e) => setProfile((p) => ({ ...p, scheduleShowCalories: e.target.checked }))} />
+            Show expected/actual calories burned
+          </label>
+        </div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <span>Next 3 weeks</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={amber} /> pre-loads the day before</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.gauge} size={10} color={lavender} /> tapering</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.trophy} size={10} color={gold} /> race day</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}>solid = planned, outline = actual <Icon path={ICONS.check} size={10} color={mint} /> matched</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.pencil} size={10} color={dim} /> click to correct a match</span>
+          {showActual && (
+            <>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>solid = planned, outline = actual <Icon path={ICONS.check} size={10} color={mint} /> matched</span>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.pencil} size={10} color={dim} /> click to correct a match</span>
+            </>
+          )}
+          {showCalories && (
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ color: cyan }}>expected</span> / <span style={{ color: amber }}>actual</span> kcal burned
+            </span>
+          )}
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
           {WEEKDAY_LABELS.map((label) => (
@@ -2661,7 +2703,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                   {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
                   {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
                   {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
-                  {(day.pairs.length > 0 || day.dayActuals.length > 0) && (
+                  {showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && (
                     <button type="button" title="Correct planned/actual matches for this day"
                       onClick={(e) => { e.stopPropagation(); setEditingMatchDay(day.key); }}
                       style={{ marginLeft: "auto", background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }}>
@@ -2669,20 +2711,37 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                     </button>
                   )}
                 </div>
-                {day.pairs.map(({ planned, actual, manual }, i) => (
-                  <div key={`pair${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
-                    {plannedChip(planned, i)}
-                    {actual ? actualChip(actual, true, i, manual) : (day.key <= todayKey
-                      ? <div style={{ fontSize: 10, color: dim, display: "flex", alignItems: "center" }}>not logged</div>
-                      : null)}
+                {showActual ? (
+                  <>
+                    {day.pairs.map(({ planned, actual, manual }, i) => (
+                      <div key={`pair${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
+                        {plannedChip(planned, i)}
+                        {actual ? actualChip(actual, true, i, manual) : (day.key <= todayKey
+                          ? <div style={{ fontSize: 10, color: dim, display: "flex", alignItems: "center" }}>not logged</div>
+                          : null)}
+                      </div>
+                    ))}
+                    {day.extras.map((actual, i) => (
+                      <div key={`extra${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
+                        <div />
+                        {actualChip(actual, false, i)}
+                      </div>
+                    ))}
+                  </>
+                ) : (
+                  day.pairs.map(({ planned }, i) => plannedChip(planned, i))
+                )}
+                {showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && (
+                  <div title={`Expected ${Math.round(day.expectedKcal)} kcal · Actual ${Math.round(day.actualKcal)} kcal burned`}
+                    style={{
+                      borderTop: `1px solid ${line}`, marginTop: 4, paddingTop: 4, fontSize: 10,
+                      display: "flex", justifyContent: "space-between", gap: 4,
+                    }}>
+                    <span style={{ color: cyan, fontWeight: 600 }}>{Math.round(day.expectedKcal)}</span>
+                    <span style={{ color: dim }}>/</span>
+                    <span style={{ color: amber, fontWeight: 600 }}>{Math.round(day.actualKcal)}</span>
                   </div>
-                ))}
-                {day.extras.map((actual, i) => (
-                  <div key={`extra${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
-                    <div />
-                    {actualChip(actual, false, i)}
-                  </div>
-                ))}
+                )}
               </div>
             );
           })}

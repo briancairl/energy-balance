@@ -2058,15 +2058,14 @@
           },
           /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim })
         )),
-        showActual ? /* @__PURE__ */ React.createElement(React.Fragment, null, day.pairs.map(({ planned, actual, manual }, i) => /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i), actual ? actualChip(actual, true, i, manual) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null)), day.extras.map((actual, i) => /* @__PURE__ */ React.createElement("div", { key: `extra${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, /* @__PURE__ */ React.createElement("div", null), actualChip(actual, false, i)))) : day.pairs.map(({ planned }, i) => plannedChip(planned, i)),
         showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && /* @__PURE__ */ React.createElement(
           "div",
           {
             title: `Expected ${Math.round(day.expectedKcal)} kcal \xB7 Actual ${Math.round(day.actualKcal)} kcal burned`,
             style: {
-              borderTop: `1px solid ${line}`,
-              marginTop: 4,
-              paddingTop: 4,
+              borderBottom: `1px solid ${line}`,
+              paddingBottom: 4,
+              marginBottom: 1,
               fontSize: 10,
               display: "flex",
               justifyContent: "space-between",
@@ -2076,7 +2075,8 @@
           /* @__PURE__ */ React.createElement("span", { style: { color: cyan, fontWeight: 600 } }, Math.round(day.expectedKcal)),
           /* @__PURE__ */ React.createElement("span", { style: { color: dim } }, "/"),
           /* @__PURE__ */ React.createElement("span", { style: { color: amber, fontWeight: 600 } }, Math.round(day.actualKcal))
-        )
+        ),
+        showActual ? /* @__PURE__ */ React.createElement(React.Fragment, null, day.pairs.map(({ planned, actual, manual }, i) => /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i), actual ? actualChip(actual, true, i, manual) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null)), day.extras.map((actual, i) => /* @__PURE__ */ React.createElement("div", { key: `extra${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, /* @__PURE__ */ React.createElement("div", null), actualChip(actual, false, i)))) : day.pairs.map(({ planned }, i) => plannedChip(planned, i))
       );
     }))), editingMatchDay && (() => {
       const day = calendarDays.find((d) => d.key === editingMatchDay);

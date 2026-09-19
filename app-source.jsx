@@ -2711,6 +2711,17 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                     </button>
                   )}
                 </div>
+                {showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && (
+                  <div title={`Expected ${Math.round(day.expectedKcal)} kcal · Actual ${Math.round(day.actualKcal)} kcal burned`}
+                    style={{
+                      borderBottom: `1px solid ${line}`, paddingBottom: 4, marginBottom: 1, fontSize: 10,
+                      display: "flex", justifyContent: "space-between", gap: 4,
+                    }}>
+                    <span style={{ color: cyan, fontWeight: 600 }}>{Math.round(day.expectedKcal)}</span>
+                    <span style={{ color: dim }}>/</span>
+                    <span style={{ color: amber, fontWeight: 600 }}>{Math.round(day.actualKcal)}</span>
+                  </div>
+                )}
                 {showActual ? (
                   <>
                     {day.pairs.map(({ planned, actual, manual }, i) => (
@@ -2730,17 +2741,6 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                   </>
                 ) : (
                   day.pairs.map(({ planned }, i) => plannedChip(planned, i))
-                )}
-                {showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && (
-                  <div title={`Expected ${Math.round(day.expectedKcal)} kcal · Actual ${Math.round(day.actualKcal)} kcal burned`}
-                    style={{
-                      borderTop: `1px solid ${line}`, marginTop: 4, paddingTop: 4, fontSize: 10,
-                      display: "flex", justifyContent: "space-between", gap: 4,
-                    }}>
-                    <span style={{ color: cyan, fontWeight: 600 }}>{Math.round(day.expectedKcal)}</span>
-                    <span style={{ color: dim }}>/</span>
-                    <span style={{ color: amber, fontWeight: 600 }}>{Math.round(day.actualKcal)}</span>
-                  </div>
                 )}
               </div>
             );

@@ -201,6 +201,16 @@
     if (!res.ok) throw new Error(result.error || `Import failed (${res.status}).`);
     return result;
   }
+  async function apiSetActivityKcalOverride(activityKey, kcal) {
+    const res = await fetchWithRetry("/api/activity/kcal-override", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ activityKey, kcal })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+    return data;
+  }
   async function apiSetScheduleMatchOverride(date, plannedKey, actualKey) {
     const body2 = { plannedKey };
     if (actualKey !== void 0) body2.actualKey = actualKey;
@@ -338,7 +348,8 @@
     return best.n;
   }
   const ACTIVITY_LIBRARY_DAYS = 180;
-  function getActivityLibrary(stravaData, intervalsData) {
+  function getActivityLibrary(stravaData, intervalsData, kcalOverrides) {
+    kcalOverrides = kcalOverrides || {};
     const byDateStrava = {};
     for (const a of stravaData.activities) {
       const d = (a.start_date_local || "").slice(0, 10);
@@ -362,15 +373,19 @@
         const durationMin = Math.round((a.moving_time || 0) / 60);
         if (!kcal || !durationMin) continue;
         const IF = provider === "strava" ? stravaIntensityFactor(a) : intensityFactor(a);
+        const key = `${provider}-${a.id}`;
+        const hasOverride = Object.prototype.hasOwnProperty.call(kcalOverrides, key) && kcalOverrides[key] != null;
         out.push({
-          key: `${provider}-${a.id}`,
+          key,
           provider,
           date: d,
           name: a.name || a.type || "Activity",
           rawType: a.type,
           activityType: mapToActivityType(a.type),
           durationMin,
-          kcal: Math.round(kcal),
+          kcal: hasOverride ? Math.round(kcalOverrides[key]) : Math.round(kcal),
+          kcalOverridden: hasOverride,
+          autoKcal: Math.round(kcal),
           intensityFactor: IF,
           zone: nearestZone(IF)
         });
@@ -478,8 +493,8 @@
   }
   const MIN_MATCHED_KCAL_SAMPLES = 2;
   const MATCHED_KCAL_LOOKBACK_DAYS = 120;
-  function buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides) {
-    const activityLibrary = getActivityLibrary(stravaData, intervalsData);
+  function buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides, kcalOverrides) {
+    const activityLibrary = getActivityLibrary(stravaData, intervalsData, kcalOverrides);
     const byDate = {};
     for (const a of activityLibrary) (byDate[a.date] || (byDate[a.date] = [])).push(a);
     const races = getRaces(schedule);
@@ -670,6 +685,7 @@
     const [weightLog, setWeightLog] = useState({});
     const [schedule, setSchedule] = useState([]);
     const [matchOverrides, setMatchOverrides] = useState({});
+    const [kcalOverrides, setKcalOverrides] = useState({});
     const [csvPreview, setCsvPreview] = useState(null);
     const [csvPreviewSource, setCsvPreviewSource] = useState(null);
     const [colMap, setColMap] = useState({ date: "", calories: "", protein: "", carbs: "", fat: "" });
@@ -690,12 +706,13 @@
     const [googleError, setGoogleError] = useState(null);
     useEffect(() => {
       (async () => {
-        const [p, n, w, sched, matchOv, cached, stravaCached, gLastSync] = await Promise.all([
+        const [p, n, w, sched, matchOv, kcalOv, cached, stravaCached, gLastSync] = await Promise.all([
           storageGet("profile", null),
           storageGet("nutrition-log", {}),
           storageGet("weight-log", {}),
           storageGet("training-schedule", []),
           storageGet("schedule-match-overrides", {}),
+          storageGet("activity-kcal-overrides", {}),
           storageGet("intervals-cache", null),
           storageGet("strava-cache", null),
           storageGet("google-last-auto-sync", null)
@@ -704,6 +721,7 @@
         setWeightLog(w);
         setSchedule(sched);
         setMatchOverrides(matchOv);
+        setKcalOverrides(kcalOv);
         setGoogleLastAutoSync(gLastSync);
         const latestWeightDate = Object.keys(w).sort().pop();
         const merged = { ...p || {} };
@@ -762,6 +780,15 @@
         return next;
       });
       await apiSetScheduleMatchOverride(date, plannedKey, actualKey);
+    }
+    async function setActivityKcalOverride(activityKey, kcal) {
+      setKcalOverrides((prev) => {
+        const next = { ...prev };
+        if (kcal === null) delete next[activityKey];
+        else next[activityKey] = kcal;
+        return next;
+      });
+      await apiSetActivityKcalOverride(activityKey, kcal);
     }
     const bmr = useMemo(
       () => calcBMR(profile.sex, parseFloat(profile.weightKg), parseFloat(profile.heightCm), parseFloat(profile.age)),
@@ -1002,8 +1029,8 @@
       setTab("dashboard");
     }
     const matchedKcalRates = useMemo(
-      () => buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides),
-      [schedule, stravaData, intervalsData, matchOverrides]
+      () => buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides, kcalOverrides),
+      [schedule, stravaData, intervalsData, matchOverrides, kcalOverrides]
     );
     const dailyRows = useMemo(() => {
       var _a, _b, _c, _d, _e, _f, _g, _h;
@@ -1046,7 +1073,8 @@
         if (stravaActs.length) {
           source = "strava";
           for (const a of stravaActs) {
-            const kcal = typeof a.calories === "number" && a.calories > 0 ? a.calories : typeof a.kilojoules === "number" ? a.kilojoules / 4.184 / 0.24 : 0;
+            const overrideKcal = kcalOverrides[`strava-${a.id}`];
+            const kcal = overrideKcal != null ? overrideKcal : typeof a.calories === "number" && a.calories > 0 ? a.calories : typeof a.kilojoules === "number" ? a.kilojoules / 4.184 / 0.24 : 0;
             exerciseKcal += kcal;
             const IF = stravaIntensityFactor(a);
             epocKcal += kcal * epocFactorFor(IF) * profile.epocSensitivity;
@@ -1056,7 +1084,8 @@
         } else if (intervalsActs.length) {
           source = "intervals";
           for (const a of intervalsActs) {
-            const kcal = activityKcal(a);
+            const overrideKcal = kcalOverrides[`intervals-${a.id}`];
+            const kcal = overrideKcal != null ? overrideKcal : activityKcal(a);
             exerciseKcal += kcal;
             const IF = intensityFactor(a);
             epocKcal += kcal * epocFactorFor(IF) * profile.epocSensitivity;
@@ -1175,7 +1204,7 @@
         });
       }
       return days;
-    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates]);
+    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates, kcalOverrides]);
     const summary = useMemo(() => {
       const withIntake = dailyRows.filter((d) => d.intake !== null);
       const trainingMissingDays = dailyRows.filter((d) => d.trainingMissing).length;
@@ -1336,6 +1365,8 @@
         importFileNotice: scheduleImportNotice,
         matchOverrides,
         onSetMatchOverride: setScheduleMatchOverride,
+        kcalOverrides,
+        onSetKcalOverride: setActivityKcalOverride,
         profile,
         setProfile,
         weightLog,
@@ -1803,6 +1834,8 @@
     importFileNotice,
     matchOverrides,
     onSetMatchOverride,
+    kcalOverrides,
+    onSetKcalOverride,
     profile,
     setProfile,
     weightLog,
@@ -1814,12 +1847,14 @@
     const [highlightIds, setHighlightIds] = useState([]);
     const [scheduleDragOver, setScheduleDragOver] = useState(false);
     const [editingMatchDay, setEditingMatchDay] = useState(null);
+    const [editingKcalActivity, setEditingKcalActivity] = useState(null);
+    const [kcalInput, setKcalInput] = useState("");
     const itemRefs = useRef({});
     const showActual = profile.scheduleShowActual !== false;
     const showCalories = profile.scheduleShowCalories !== false;
     const activityLibrary = useMemo(
-      () => getActivityLibrary(stravaData, intervalsData),
-      [stravaData, intervalsData]
+      () => getActivityLibrary(stravaData, intervalsData, kcalOverrides),
+      [stravaData, intervalsData, kcalOverrides]
     );
     const actualsByDate = useMemo(() => {
       const map = {};
@@ -2063,7 +2098,12 @@
           "div",
           {
             key: `a${i}`,
-            title: `${actual.name} \xB7 ${actual.activityType} \xB7 ${actual.durationMin}min${matched ? " \xB7 matched to the plan" : " \xB7 not on the schedule"}${manual ? " \xB7 manually corrected" : ""}`,
+            title: `${actual.name} \xB7 ${actual.activityType} \xB7 ${actual.durationMin}min \xB7 ${actual.kcal} kcal${matched ? " \xB7 matched to the plan" : " \xB7 not on the schedule"}${manual ? " \xB7 manually corrected match" : ""}${actual.kcalOverridden ? " \xB7 kcal manually overridden (click to edit)" : " \xB7 click to override kcal burned"}`,
+            onClick: (e) => {
+              e.stopPropagation();
+              setEditingKcalActivity(actual.key);
+              setKcalInput(String(actual.kcal));
+            },
             style: {
               border: `1px solid ${color}`,
               color,
@@ -2075,13 +2115,15 @@
               display: "flex",
               alignItems: "center",
               gap: 3,
-              overflow: "hidden"
+              overflow: "hidden",
+              cursor: "pointer"
             }
           },
           matched && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 9, color }),
           /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, actual.activityType, " \xB7 ", actual.durationMin, "m"),
           /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[actual.activityType] || "\u{1F3AF}"),
-          manual && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 8, color })
+          manual && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 8, color }),
+          actual.kcalOverridden && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 8, color })
         );
       }
       function actualChipGroup(actuals, i, manual) {
@@ -2228,6 +2270,63 @@
           }
         ), a.activityType, " \xB7 ", a.durationMin, "m \xB7 ", a.name)))), mode === "auto" && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: dim, marginTop: 4 } }, "Auto-detected", actualNames.length ? ` \u2014 matched to "${actualNames.join('", "')}"` : " \u2014 no match found"));
       }), day.dayActuals.length === 0 && day.pairs.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim } }, "No Strava/intervals.icu activities synced for this day.")));
+    })(), editingKcalActivity && (() => {
+      const act = activityLibrary.find((a) => a.key === editingKcalActivity);
+      if (!act) return null;
+      const closeModal = () => setEditingKcalActivity(null);
+      const parsed = parseFloat(kcalInput);
+      const valid = kcalInput.trim() !== "" && !isNaN(parsed) && parsed >= 0;
+      const save = async () => {
+        if (!valid) return;
+        await onSetKcalOverride(act.key, Math.round(parsed));
+        closeModal();
+      };
+      const clear = async () => {
+        await onSetKcalOverride(act.key, null);
+        closeModal();
+      };
+      return /* @__PURE__ */ React.createElement("div", { style: {
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        zIndex: 50,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20
+      }, onClick: closeModal }, /* @__PURE__ */ React.createElement("div", { onClick: (e) => e.stopPropagation(), style: {
+        background: panel2,
+        border: `1px solid ${line}`,
+        borderRadius: 8,
+        padding: 20,
+        width: 340,
+        maxWidth: "100%"
+      } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 14 } }, "Override calories burned"), /* @__PURE__ */ React.createElement(
+        "button",
+        { onClick: closeModal, style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 } },
+        "\xD7"
+      )), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: dim, marginBottom: 14, lineHeight: 1.5 } }, act.name, " \xB7 ", act.activityType, " \xB7 ", act.durationMin, "m \xB7 ", act.date), /* @__PURE__ */ React.createElement(Field, { label: "Calories burned (kcal)" }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          className: "inp",
+          type: "number",
+          min: "0",
+          autoFocus: true,
+          value: kcalInput,
+          onChange: (e) => setKcalInput(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === "Enter") save();
+          }
+        }
+      )), act.kcalOverridden && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Synced estimate: ", act.autoKcal, " kcal"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 16 } }, /* @__PURE__ */ React.createElement(
+        "button",
+        { className: "btn-primary", disabled: !valid, onClick: save, style: { flex: 1 } },
+        "Save"
+      ), act.kcalOverridden && /* @__PURE__ */ React.createElement(
+        "button",
+        { className: "btn-ghost", onClick: clear },
+        "Reset to synced"
+      ))));
     })(), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " Import schedule from file"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file. It's saved under ", /* @__PURE__ */ React.createElement("code", null, "schedule_sources/"), " and re-imported automatically from then on whenever that file's contents change \u2014 no need to come back here and re-upload it."), /* @__PURE__ */ React.createElement(
       "div",
       {

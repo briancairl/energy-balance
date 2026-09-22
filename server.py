@@ -1202,6 +1202,41 @@ class Handler(BaseHTTPRequestHandler):
                 "overrides": result.get("schedule-match-overrides", {}).get(date, {}),
             })
 
+        # Manual override for a fetched activity's calories-burned figure
+        # (Strava/intervals.icu estimates are sometimes way off for a given
+        # workout). Keyed directly by activity key rather than by date, since
+        # each activity is only ever edited from one place (its own chip) so
+        # there's no cross-device/tab race to guard against like nutrition
+        # and weight logs have.
+        #   {"activityKey": "strava-12345", "kcal": 812}  -> set override
+        #   {"activityKey": "strava-12345", "kcal": null}  -> clear override
+        if path == "/api/activity/kcal-override":
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError:
+                return self._send_json({"error": "invalid JSON body"}, 400)
+            activity_key = body.get("activityKey") if isinstance(body, dict) else None
+            if not activity_key:
+                return self._send_json({"error": "missing activityKey"}, 400)
+            kcal = body.get("kcal") if isinstance(body, dict) else None
+            if kcal is not None and not isinstance(kcal, (int, float)):
+                return self._send_json({"error": "'kcal' must be a number or null"}, 400)
+
+            def mutate(s):
+                overrides = s.get("activity-kcal-overrides") or {}
+                if kcal is None:
+                    overrides.pop(activity_key, None)
+                else:
+                    overrides[activity_key] = kcal
+                s["activity-kcal-overrides"] = overrides
+                return s
+            result = update_store(mutate)
+            return self._send_json({
+                "ok": True,
+                "activityKey": activity_key,
+                "kcal": result.get("activity-kcal-overrides", {}).get(activity_key),
+            })
+
         if path == "/api/nutrition/bulk":
             try:
                 body = self._read_json_body()

@@ -32,12 +32,14 @@ function fmt(n, d = 0) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   return n.toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
 }
-function toISODate(d) { return d.toISOString().slice(0, 10); }
-// toISODate above converts through UTC, which silently rolls to the next day
-// once local time is far enough ahead of UTC (e.g. after ~8pm EDT) — wrong for
-// anything keying a calendar grid off the viewer's own local date. This stays
-// in local time throughout.
-function toLocalISODate(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
+// Local calendar date, not UTC — d.toISOString() would silently roll to the
+// next day once local time is far enough ahead of UTC (e.g. after ~8pm EDT),
+// which used to make dailyRows' per-day keys drift a day ahead of the exact
+// dates schedule entries (single sessions, races) and nutrition/weight logs
+// are keyed by in the evening — schedule lookups for "today" would silently
+// miss, since they'd actually be querying tomorrow. Every date key in the app
+// must go through this one function so they all agree.
+function toISODate(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
 
 // JS's native Date parser is notoriously inconsistent for anything but ISO
 // or unambiguous US slash format — Google Sheets' FORMATTED_VALUE output
@@ -226,6 +228,28 @@ async function apiSetScheduleMatchOverride(date, plannedKey, actualKey) {
   if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
   return data;
 }
+// kcal === null clears the override, reverting to the synced estimate.
+async function apiSetActivityKcalOverride(activityKey, kcal) {
+  const res = await fetchWithRetry("/api/activity/kcal-override", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ activityKey, kcal }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+  return data;
+}
+// mode === null clears the override, reverting to the profile's default NEAT.
+async function apiSetNeatOverride(date, mode, value) {
+  const res = await fetchWithRetry(`/api/neat-override?date=${date}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode, value }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+  return data;
+}
 async function apiSaveWeightDay(date, kg) {
   const res = await fetchWithRetry(`/api/weight/day?date=${date}`, {
     method: "POST",
@@ -396,7 +420,8 @@ function nearestZone(IF) {
 // priority as the main dailyRows model), reshaped into a flat, pickable list
 // for the "model after an actual session" schedule-entry option.
 const ACTIVITY_LIBRARY_DAYS = 180;
-function getActivityLibrary(stravaData, intervalsData) {
+function getActivityLibrary(stravaData, intervalsData, kcalOverrides) {
+  kcalOverrides = kcalOverrides || {};
   const byDateStrava = {};
   for (const a of stravaData.activities) {
     const d = (a.start_date_local || "").slice(0, 10);
@@ -422,15 +447,19 @@ function getActivityLibrary(stravaData, intervalsData) {
       const durationMin = Math.round((a.moving_time || 0) / 60);
       if (!kcal || !durationMin) continue;
       const IF = provider === "strava" ? stravaIntensityFactor(a) : intensityFactor(a);
+      const key = `${provider}-${a.id}`;
+      const hasOverride = Object.prototype.hasOwnProperty.call(kcalOverrides, key) && kcalOverrides[key] != null;
       out.push({
-        key: `${provider}-${a.id}`,
+        key,
         provider,
         date: d,
         name: a.name || a.type || "Activity",
         rawType: a.type,
         activityType: mapToActivityType(a.type),
         durationMin,
-        kcal: Math.round(kcal),
+        kcal: hasOverride ? Math.round(kcalOverrides[key]) : Math.round(kcal),
+        kcalOverridden: hasOverride,
+        autoKcal: Math.round(kcal),
         intensityFactor: IF,
         zone: nearestZone(IF),
       });
@@ -633,8 +662,8 @@ const MATCHED_KCAL_LOOKBACK_DAYS = 120;
 // nothing about this athlete), less specific than sourceActivity (which is
 // one hand-picked real session, not an average) — so it's checked after
 // sourceActivity but before falling back to the MET table.
-function buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides) {
-  const activityLibrary = getActivityLibrary(stravaData, intervalsData);
+function buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides, kcalOverrides) {
+  const activityLibrary = getActivityLibrary(stravaData, intervalsData, kcalOverrides);
   const byDate = {};
   for (const a of activityLibrary) (byDate[a.date] || (byDate[a.date] = [])).push(a);
 
@@ -819,6 +848,7 @@ const ICONS = {
   trophy: "M8 21h8M12 17v4M7 4h10v4a5 5 0 01-10 0V4zM7 4H3v2a4 4 0 004 4M17 4h4v2a4 4 0 01-4 4",
   sun: "M12 17a5 5 0 100-10 5 5 0 000 10zM12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42",
   moon: "M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z",
+  bolt: "M13 2L3 14h9l-1 8 10-12h-9l1-8z",
 };
 
 // Shared severity palette for goal-weight warnings — reuses the same
@@ -883,6 +913,12 @@ function App() {
   // { 'YYYY-MM-DD': { [plannedMatchKey]: actualKey | null } } — manual
   // corrections to the Schedule tab's auto planned-vs-actual matching.
   const [matchOverrides, setMatchOverrides] = useState({});
+  // { 'strava-12345': kcal | null } — manual corrections to a fetched
+  // activity's calories-burned figure, keyed by activity key.
+  const [kcalOverrides, setKcalOverrides] = useState({});
+  // { 'YYYY-MM-DD': { mode: 'offset'|'absolute', value } } — per-day
+  // fine-tuning of NEAT on top of the profile's default multiplier/offset.
+  const [neatOverrides, setNeatOverrides] = useState({});
   // Recurring: { id, kind: "recurring", activityType, zone, durationMin, daysOfWeek, startDate, endDate, notes }
   // Single:    { id, kind: "single", activityType, zone, durationMin, date, notes } — one-off, non-repeating
   // Race:      { id, kind: "race", activityType, zone, durationMin, raceDate, taperDays, notes }
@@ -909,12 +945,14 @@ function App() {
 
   useEffect(() => {
     (async () => {
-      const [p, n, w, sched, matchOv, cached, stravaCached, gLastSync] = await Promise.all([
+      const [p, n, w, sched, matchOv, kcalOv, neatOv, cached, stravaCached, gLastSync] = await Promise.all([
         storageGet("profile", null),
         storageGet("nutrition-log", {}),
         storageGet("weight-log", {}),
         storageGet("training-schedule", []),
         storageGet("schedule-match-overrides", {}),
+        storageGet("activity-kcal-overrides", {}),
+        storageGet("neat-overrides", {}),
         storageGet("intervals-cache", null),
         storageGet("strava-cache", null),
         storageGet("google-last-auto-sync", null),
@@ -923,6 +961,8 @@ function App() {
       setWeightLog(w);
       setSchedule(sched);
       setMatchOverrides(matchOv);
+      setKcalOverrides(kcalOv);
+      setNeatOverrides(neatOv);
       setGoogleLastAutoSync(gLastSync);
 
       // Weight always reflects the most recent logged entry, so a fresh
@@ -1006,6 +1046,30 @@ function App() {
       return next;
     });
     await apiSetScheduleMatchOverride(date, plannedKey, actualKey);
+  }
+
+  // kcal === null clears the override, reverting to the synced estimate.
+  async function setActivityKcalOverride(activityKey, kcal) {
+    setKcalOverrides((prev) => {
+      const next = { ...prev };
+      if (kcal === null) delete next[activityKey];
+      else next[activityKey] = kcal;
+      return next;
+    });
+    await apiSetActivityKcalOverride(activityKey, kcal);
+  }
+
+  // mode === null clears the override for that date, reverting to the
+  // profile's default NEAT. Otherwise mode is "offset" (added on top of the
+  // day's normal baseline) or "absolute" (replaces it outright).
+  async function setNeatOverride(date, mode, value) {
+    setNeatOverrides((prev) => {
+      const next = { ...prev };
+      if (mode === null) delete next[date];
+      else next[date] = { mode, value };
+      return next;
+    });
+    await apiSetNeatOverride(date, mode, value);
   }
 
   const bmr = useMemo(
@@ -1310,8 +1374,8 @@ function App() {
   // MET-table guess. Recomputed whenever the schedule, real activity data,
   // or a manual match correction changes.
   const matchedKcalRates = useMemo(
-    () => buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides),
-    [schedule, stravaData, intervalsData, matchOverrides]
+    () => buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides, kcalOverrides),
+    [schedule, stravaData, intervalsData, matchOverrides, kcalOverrides]
   );
 
   const dailyRows = useMemo(() => {
@@ -1361,7 +1425,8 @@ function App() {
       if (stravaActs.length) {
         source = "strava";
         for (const a of stravaActs) {
-          const kcal = (typeof a.calories === "number" && a.calories > 0)
+          const overrideKcal = kcalOverrides[`strava-${a.id}`];
+          const kcal = overrideKcal != null ? overrideKcal : (typeof a.calories === "number" && a.calories > 0)
             ? a.calories
             : (typeof a.kilojoules === "number" ? a.kilojoules / 4.184 / 0.24 : 0);
           exerciseKcal += kcal;
@@ -1373,7 +1438,8 @@ function App() {
       } else if (intervalsActs.length) {
         source = "intervals";
         for (const a of intervalsActs) {
-          const kcal = activityKcal(a);
+          const overrideKcal = kcalOverrides[`intervals-${a.id}`];
+          const kcal = overrideKcal != null ? overrideKcal : activityKcal(a);
           exerciseKcal += kcal;
           const IF = intensityFactor(a);
           epocKcal += kcal * epocFactorFor(IF) * profile.epocSensitivity;
@@ -1422,9 +1488,18 @@ function App() {
       const atl = w?.atl ?? null;
       const tsb = ctl !== null && atl !== null ? ctl - atl : null;
       const fatigueBuffer = profile.fatigueBuffer && tsb !== null && tsb < -10 ? dayBmr * 0.05 : 0;
-      const baseline = profile.neatMode === "offset"
+      const defaultBaseline = profile.neatMode === "offset"
         ? dayBmr + (parseFloat(profile.neatOffset) || 0)
         : dayBmr * (parseFloat(profile.neatFactor) || 1.15);
+      // Per-day NEAT fine-tuning (Schedule tab): "offset" adds a kcal amount
+      // on top of the day's own default baseline above; "absolute" replaces
+      // it outright (e.g. a known sick/travel day with unusually low NEAT).
+      const neatOverride = neatOverrides[key] || null;
+      const baseline = neatOverride
+        ? (neatOverride.mode === "absolute"
+          ? (parseFloat(neatOverride.value) || 0)
+          : defaultBaseline + (parseFloat(neatOverride.value) || 0))
+        : defaultBaseline;
       const demand = baseline + exerciseKcal + epocKcal + fatigueBuffer;
       const nutritionEntry = effectiveNutritionEntry(nutrition[key]);
       const nutritionSource = nutritionEntry ? (normalizeNutritionEntry(nutrition[key]).macrosfirst ? "macrosfirst" : "manual") : null;
@@ -1526,7 +1601,7 @@ function App() {
       days.push({
         date: key,
         label: d.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
-        bmr: dayBmr, baseline, exerciseKcal, epocKcal, fatigueBuffer, demand, target,
+        bmr: dayBmr, baseline, defaultBaseline, neatOverride, exerciseKcal, epocKcal, fatigueBuffer, demand, target,
         intake, gap, tsb, source,
         weight: weightLog[key] ?? null,
         protein: nutritionEntry?.protein ?? null,
@@ -1543,7 +1618,7 @@ function App() {
       });
     }
     return days;
-  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates]);
+  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates, kcalOverrides, neatOverrides]);
 
 
   const summary = useMemo(() => {
@@ -1687,7 +1762,10 @@ function App() {
             onDelete={deleteScheduleEntry} stravaData={stravaData} intervalsData={intervalsData}
             onImportFile={handleScheduleFile} importFileError={scheduleImportError}
             importFileNotice={scheduleImportNotice} matchOverrides={matchOverrides}
-            onSetMatchOverride={setScheduleMatchOverride} profile={profile} setProfile={setProfile}
+            onSetMatchOverride={setScheduleMatchOverride}
+            kcalOverrides={kcalOverrides} onSetKcalOverride={setActivityKcalOverride}
+            neatOverrides={neatOverrides} onSetNeatOverride={setNeatOverride}
+            profile={profile} setProfile={setProfile}
             weightLog={weightLog} matchedKcalRates={matchedKcalRates} />
         )}
         {tab === "dashboard" && (
@@ -2507,12 +2585,12 @@ function emptyScheduleForm() {
     zone: 2,
     durationMin: "45",
     daysOfWeek: [],
-    startDate: toLocalISODate(new Date()),
+    startDate: toISODate(new Date()),
     endDate: "",
     ongoing: true,
     notes: "",
-    date: toLocalISODate(new Date()),
-    raceDate: toLocalISODate(new Date()),
+    date: toISODate(new Date()),
+    raceDate: toISODate(new Date()),
     taperDays: String(DEFAULT_TAPER_DAYS),
     sourceActivity: null,
   };
@@ -2536,12 +2614,18 @@ function scheduleRowStyle(highlighted) {
 
 function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData,
   onImportFile, importFileError, importFileNotice, matchOverrides, onSetMatchOverride,
+  kcalOverrides, onSetKcalOverride, neatOverrides, onSetNeatOverride,
   profile, setProfile, weightLog, matchedKcalRates }) {
   const [form, setForm] = useState(emptyScheduleForm());
   const [editingId, setEditingId] = useState(null);
   const [highlightIds, setHighlightIds] = useState([]);
   const [scheduleDragOver, setScheduleDragOver] = useState(false);
   const [editingMatchDay, setEditingMatchDay] = useState(null); // date key, or null
+  const [editingKcalActivity, setEditingKcalActivity] = useState(null); // activity key, or null
+  const [kcalInput, setKcalInput] = useState("");
+  const [editingNeatDay, setEditingNeatDay] = useState(null); // date key, or null
+  const [neatMode, setNeatModeInput] = useState("offset");
+  const [neatValueInput, setNeatValueInput] = useState("");
   const itemRefs = useRef({});
   // Both default on (undefined !== false) so existing profiles pick up the
   // new toggles already enabled — nothing changes until someone opts out.
@@ -2549,8 +2633,8 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
   const showCalories = profile.scheduleShowCalories !== false;
 
   const activityLibrary = useMemo(
-    () => getActivityLibrary(stravaData, intervalsData),
-    [stravaData, intervalsData]
+    () => getActivityLibrary(stravaData, intervalsData, kcalOverrides),
+    [stravaData, intervalsData, kcalOverrides]
   );
   const actualsByDate = useMemo(() => {
     const map = {};
@@ -2675,7 +2759,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
   for (let i = 0; i < 21; i++) {
     const d = new Date(calendarStart);
     d.setDate(d.getDate() + i);
-    const key = toLocalISODate(d);
+    const key = toISODate(d);
     const { sessions, taper } = getEffectiveSessionsForDate(schedule, key);
     const raceToday = races.find((r) => r.raceDate === key);
     const carbLoad = getCarbLoadState(schedule, key);
@@ -2694,12 +2778,21 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
     const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay, matchedKcalRates), 0);
     const actualKcal = dayActuals.reduce((sum, a) => sum + a.kcal, 0);
 
+    // Same-day-weight BMR the dashboard's dailyRows uses, minus the
+    // fatigue-buffer/TSB piece (not available here) — good enough as a
+    // reference baseline when fine-tuning that day's NEAT.
+    const dayBmr = weightForDay ? calcBMR(profile.sex, weightForDay, parseFloat(profile.heightCm), parseFloat(profile.age)) : null;
+    const defaultBaseline = dayBmr
+      ? (profile.neatMode === "offset" ? dayBmr + (parseFloat(profile.neatOffset) || 0) : dayBmr * (parseFloat(profile.neatFactor) || 1.15))
+      : null;
+    const neatOverride = neatOverrides[key] || null;
+
     calendarDays.push({
       key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras, dayActuals,
-      expectedKcal, actualKcal,
+      expectedKcal, actualKcal, defaultBaseline, neatOverride,
     });
   }
-  const todayKey = toLocalISODate(new Date());
+  const todayKey = toISODate(new Date());
 
   return (
     <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
@@ -2793,7 +2886,12 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
               const color = ACTIVITY_COLORS[actual.activityType] || dim;
               return (
                 <div key={`a${i}`}
-                  title={`${actual.name} · ${actual.activityType} · ${actual.durationMin}min${matched ? " · matched to the plan" : " · not on the schedule"}${manual ? " · manually corrected" : ""}`}
+                  title={`${actual.name} · ${actual.activityType} · ${actual.durationMin}min · ${actual.kcal} kcal${matched ? " · matched to the plan" : " · not on the schedule"}${manual ? " · manually corrected match" : ""}${actual.kcalOverridden ? " · kcal manually overridden (click to edit)" : " · click to override kcal burned"}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEditingKcalActivity(actual.key);
+                    setKcalInput(String(actual.kcal));
+                  }}
                   style={{
                     border: `1px solid ${color}`,
                     color,
@@ -2806,11 +2904,13 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                     alignItems: "center",
                     gap: 3,
                     overflow: "hidden",
+                    cursor: "pointer",
                   }}>
                   {matched && <Icon path={ICONS.check} size={9} color={color} />}
                   <span className="cal-chip-text">{actual.activityType} · {actual.durationMin}m</span>
                   <span className="cal-chip-emoji">{ACTIVITY_EMOJI[actual.activityType] || "🎯"}</span>
                   {manual && <Icon path={ICONS.pencil} size={8} color={color} />}
+                  {actual.kcalOverridden && <Icon path={ICONS.flame} size={8} color={color} />}
                 </div>
               );
             }
@@ -2849,13 +2949,27 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                   {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
                   {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
                   {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
-                  {showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && (
-                    <button type="button" title="Correct planned/actual matches for this day"
-                      onClick={(e) => { e.stopPropagation(); setEditingMatchDay(day.key); }}
-                      style={{ marginLeft: "auto", background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }}>
-                      <Icon path={ICONS.pencil} size={10} color={dim} />
+                  <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
+                    <button type="button" title={day.neatOverride
+                      ? `NEAT ${day.neatOverride.mode === "absolute" ? "set to" : "offset by"} ${day.neatOverride.mode === "offset" && day.neatOverride.value > 0 ? "+" : ""}${day.neatOverride.value} kcal — click to edit`
+                      : "Fine-tune NEAT for this day"}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setNeatModeInput(day.neatOverride ? day.neatOverride.mode : "offset");
+                        setNeatValueInput(day.neatOverride ? String(day.neatOverride.value) : "");
+                        setEditingNeatDay(day.key);
+                      }}
+                      style={{ background: "none", border: "none", color: day.neatOverride ? amber : dim, cursor: "pointer", padding: 0, display: "flex" }}>
+                      <Icon path={ICONS.bolt} size={10} color={day.neatOverride ? amber : dim} />
                     </button>
-                  )}
+                    {showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && (
+                      <button type="button" title="Correct planned/actual matches for this day"
+                        onClick={(e) => { e.stopPropagation(); setEditingMatchDay(day.key); }}
+                        style={{ background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }}>
+                        <Icon path={ICONS.pencil} size={10} color={dim} />
+                      </button>
+                    )}
+                  </div>
                 </div>
                 {showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && (
                   <div title={`Expected ${Math.round(day.expectedKcal)} kcal · Actual ${Math.round(day.actualKcal)} kcal burned`}
@@ -2995,6 +3109,125 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
               {day.dayActuals.length === 0 && day.pairs.length > 0 && (
                 <div style={{ fontSize: 11, color: dim }}>No Strava/intervals.icu activities synced for this day.</div>
               )}
+            </div>
+          </div>
+        );
+      })()}
+
+      {editingKcalActivity && (() => {
+        const act = activityLibrary.find((a) => a.key === editingKcalActivity);
+        if (!act) return null;
+        const closeModal = () => setEditingKcalActivity(null);
+        const parsed = parseFloat(kcalInput);
+        const valid = kcalInput.trim() !== "" && !isNaN(parsed) && parsed >= 0;
+        const save = async () => {
+          if (!valid) return;
+          await onSetKcalOverride(act.key, Math.round(parsed));
+          closeModal();
+        };
+        const clear = async () => {
+          await onSetKcalOverride(act.key, null);
+          closeModal();
+        };
+        return (
+          <div style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 50,
+            display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
+          }} onClick={closeModal}>
+            <div onClick={(e) => e.stopPropagation()} style={{
+              background: panel2, border: `1px solid ${line}`, borderRadius: 8, padding: 20,
+              width: 340, maxWidth: "100%",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 14 }}>Override calories burned</div>
+                <button onClick={closeModal}
+                  style={{ background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }}>×</button>
+              </div>
+              <div style={{ fontSize: 12, color: dim, marginBottom: 14, lineHeight: 1.5 }}>
+                {act.name} · {act.activityType} · {act.durationMin}m · {act.date}
+              </div>
+              <Field label="Calories burned (kcal)">
+                <input className="inp" type="number" min="0" autoFocus value={kcalInput}
+                  onChange={(e) => setKcalInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") save(); }} />
+              </Field>
+              {act.kcalOverridden && (
+                <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Synced estimate: {act.autoKcal} kcal</div>
+              )}
+              <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+                <button className="btn-primary" disabled={!valid} onClick={save} style={{ flex: 1 }}>Save</button>
+                {act.kcalOverridden && <button className="btn-ghost" onClick={clear}>Reset to synced</button>}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {editingNeatDay && (() => {
+        const day = calendarDays.find((d) => d.key === editingNeatDay);
+        if (!day) return null;
+        const closeModal = () => setEditingNeatDay(null);
+        const existing = day.neatOverride;
+        const mode = neatMode;
+        const valueStr = neatValueInput;
+        const parsed = parseFloat(valueStr);
+        const valid = valueStr.trim() !== "" && !isNaN(parsed) && (mode === "absolute" ? parsed >= 0 : true);
+        const save = async () => {
+          if (!valid) return;
+          await onSetNeatOverride(day.key, mode, parsed);
+          closeModal();
+        };
+        const clear = async () => {
+          await onSetNeatOverride(day.key, null, null);
+          closeModal();
+        };
+        return (
+          <div style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 50,
+            display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
+          }} onClick={closeModal}>
+            <div onClick={(e) => e.stopPropagation()} style={{
+              background: panel2, border: `1px solid ${line}`, borderRadius: 8, padding: 20,
+              width: 360, maxWidth: "100%",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 14 }}>
+                  Fine-tune NEAT · {day.date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}
+                </div>
+                <button onClick={closeModal}
+                  style={{ background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }}>×</button>
+              </div>
+              <div style={{ fontSize: 12, color: dim, marginBottom: 14, lineHeight: 1.5 }}>
+                {day.defaultBaseline
+                  ? <>Default baseline (BMR × NEAT) for this day: <strong style={{ color: paper }}>{Math.round(day.defaultBaseline)} kcal</strong></>
+                  : "Enter weight/height/age in Setup to see a default baseline for this day."}
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                  <input type="radio" name={`neat-mode-${day.key}`} checked={mode === "offset"}
+                    onChange={() => setNeatModeInput("offset")} />
+                  Add offset to baseline (kcal, can be negative)
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                  <input type="radio" name={`neat-mode-${day.key}`} checked={mode === "absolute"}
+                    onChange={() => setNeatModeInput("absolute")} />
+                  Set baseline directly (kcal)
+                </label>
+              </div>
+              <Field label={mode === "absolute" ? "Baseline (kcal)" : "Offset (kcal)"}>
+                <input className="inp" type="number" min={mode === "absolute" ? "0" : undefined} autoFocus
+                  value={valueStr} onChange={(e) => setNeatValueInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") save(); }} />
+              </Field>
+              {day.defaultBaseline && mode === "offset" && valid && (
+                <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
+                  New baseline: {Math.round(day.defaultBaseline + parsed)} kcal
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+                <button className="btn-primary" disabled={!valid} onClick={save} style={{ flex: 1 }}>Save</button>
+                {existing && <button className="btn-ghost" onClick={clear}>Clear override</button>}
+              </div>
             </div>
           </div>
         );

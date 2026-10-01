@@ -32,9 +32,6 @@
     return n.toLocaleString(void 0, { maximumFractionDigits: d, minimumFractionDigits: d });
   }
   function toISODate(d) {
-    return d.toISOString().slice(0, 10);
-  }
-  function toLocalISODate(d) {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   }
   function parseFlexibleDate(raw) {
@@ -201,6 +198,18 @@
     if (!res.ok) throw new Error(result.error || `Import failed (${res.status}).`);
     return result;
   }
+  async function apiSetScheduleMatchOverride(date, plannedKey, actualKey) {
+    const body2 = { plannedKey };
+    if (actualKey !== void 0) body2.actualKey = actualKey;
+    const res = await fetchWithRetry(`/api/schedule/match-override?date=${date}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body2)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
+    return data;
+  }
   async function apiSetActivityKcalOverride(activityKey, kcal) {
     const res = await fetchWithRetry("/api/activity/kcal-override", {
       method: "POST",
@@ -211,13 +220,11 @@
     if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
     return data;
   }
-  async function apiSetScheduleMatchOverride(date, plannedKey, actualKey) {
-    const body2 = { plannedKey };
-    if (actualKey !== void 0) body2.actualKey = actualKey;
-    const res = await fetchWithRetry(`/api/schedule/match-override?date=${date}`, {
+  async function apiSetNeatOverride(date, mode, value) {
+    const res = await fetchWithRetry(`/api/neat-override?date=${date}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body2)
+      body: JSON.stringify({ mode, value })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || `Save failed (${res.status}).`);
@@ -629,7 +636,8 @@
     calendar: "M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z",
     trophy: "M8 21h8M12 17v4M7 4h10v4a5 5 0 01-10 0V4zM7 4H3v2a4 4 0 004 4M17 4h4v2a4 4 0 01-4 4",
     sun: "M12 17a5 5 0 100-10 5 5 0 000 10zM12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42",
-    moon: "M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"
+    moon: "M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z",
+    bolt: "M13 2L3 14h9l-1 8 10-12h-9l1-8z"
   };
   const SEVERITY_COLOR = { low: cyan, medium: amber, high: coral };
   const SEVERITY_BG = { low: "rgba(79,209,217,0.08)", medium: "rgba(232,163,61,0.1)", high: "rgba(225,96,77,0.12)" };
@@ -686,6 +694,7 @@
     const [schedule, setSchedule] = useState([]);
     const [matchOverrides, setMatchOverrides] = useState({});
     const [kcalOverrides, setKcalOverrides] = useState({});
+    const [neatOverrides, setNeatOverrides] = useState({});
     const [csvPreview, setCsvPreview] = useState(null);
     const [csvPreviewSource, setCsvPreviewSource] = useState(null);
     const [colMap, setColMap] = useState({ date: "", calories: "", protein: "", carbs: "", fat: "" });
@@ -706,13 +715,14 @@
     const [googleError, setGoogleError] = useState(null);
     useEffect(() => {
       (async () => {
-        const [p, n, w, sched, matchOv, kcalOv, cached, stravaCached, gLastSync] = await Promise.all([
+        const [p, n, w, sched, matchOv, kcalOv, neatOv, cached, stravaCached, gLastSync] = await Promise.all([
           storageGet("profile", null),
           storageGet("nutrition-log", {}),
           storageGet("weight-log", {}),
           storageGet("training-schedule", []),
           storageGet("schedule-match-overrides", {}),
           storageGet("activity-kcal-overrides", {}),
+          storageGet("neat-overrides", {}),
           storageGet("intervals-cache", null),
           storageGet("strava-cache", null),
           storageGet("google-last-auto-sync", null)
@@ -722,6 +732,7 @@
         setSchedule(sched);
         setMatchOverrides(matchOv);
         setKcalOverrides(kcalOv);
+        setNeatOverrides(neatOv);
         setGoogleLastAutoSync(gLastSync);
         const latestWeightDate = Object.keys(w).sort().pop();
         const merged = { ...p || {} };
@@ -789,6 +800,15 @@
         return next;
       });
       await apiSetActivityKcalOverride(activityKey, kcal);
+    }
+    async function setNeatOverride(date, mode, value) {
+      setNeatOverrides((prev) => {
+        const next = { ...prev };
+        if (mode === null) delete next[date];
+        else next[date] = { mode, value };
+        return next;
+      });
+      await apiSetNeatOverride(date, mode, value);
     }
     const bmr = useMemo(
       () => calcBMR(profile.sex, parseFloat(profile.weightKg), parseFloat(profile.heightCm), parseFloat(profile.age)),
@@ -1123,7 +1143,9 @@
         const atl = (_c = w == null ? void 0 : w.atl) != null ? _c : null;
         const tsb = ctl !== null && atl !== null ? ctl - atl : null;
         const fatigueBuffer = profile.fatigueBuffer && tsb !== null && tsb < -10 ? dayBmr * 0.05 : 0;
-        const baseline = profile.neatMode === "offset" ? dayBmr + (parseFloat(profile.neatOffset) || 0) : dayBmr * (parseFloat(profile.neatFactor) || 1.15);
+        const defaultBaseline = profile.neatMode === "offset" ? dayBmr + (parseFloat(profile.neatOffset) || 0) : dayBmr * (parseFloat(profile.neatFactor) || 1.15);
+        const neatOverride = neatOverrides[key] || null;
+        const baseline = neatOverride ? neatOverride.mode === "absolute" ? parseFloat(neatOverride.value) || 0 : defaultBaseline + (parseFloat(neatOverride.value) || 0) : defaultBaseline;
         const demand = baseline + exerciseKcal + epocKcal + fatigueBuffer;
         const nutritionEntry = effectiveNutritionEntry(nutrition[key]);
         const nutritionSource = nutritionEntry ? normalizeNutritionEntry(nutrition[key]).macrosfirst ? "macrosfirst" : "manual" : null;
@@ -1169,6 +1191,8 @@
           label: d.toLocaleDateString(void 0, { month: "short", day: "numeric" }),
           bmr: dayBmr,
           baseline,
+          defaultBaseline,
+          neatOverride,
           exerciseKcal,
           epocKcal,
           fatigueBuffer,
@@ -1204,7 +1228,7 @@
         });
       }
       return days;
-    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates, kcalOverrides]);
+    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates, kcalOverrides, neatOverrides]);
     const summary = useMemo(() => {
       const withIntake = dailyRows.filter((d) => d.intake !== null);
       const trainingMissingDays = dailyRows.filter((d) => d.trainingMissing).length;
@@ -1367,6 +1391,8 @@
         onSetMatchOverride: setScheduleMatchOverride,
         kcalOverrides,
         onSetKcalOverride: setActivityKcalOverride,
+        neatOverrides,
+        onSetNeatOverride: setNeatOverride,
         profile,
         setProfile,
         weightLog,
@@ -1796,12 +1822,12 @@
       zone: 2,
       durationMin: "45",
       daysOfWeek: [],
-      startDate: toLocalISODate(/* @__PURE__ */ new Date()),
+      startDate: toISODate(/* @__PURE__ */ new Date()),
       endDate: "",
       ongoing: true,
       notes: "",
-      date: toLocalISODate(/* @__PURE__ */ new Date()),
-      raceDate: toLocalISODate(/* @__PURE__ */ new Date()),
+      date: toISODate(/* @__PURE__ */ new Date()),
+      raceDate: toISODate(/* @__PURE__ */ new Date()),
       taperDays: String(DEFAULT_TAPER_DAYS),
       sourceActivity: null
     };
@@ -1836,6 +1862,8 @@
     onSetMatchOverride,
     kcalOverrides,
     onSetKcalOverride,
+    neatOverrides,
+    onSetNeatOverride,
     profile,
     setProfile,
     weightLog,
@@ -1849,6 +1877,9 @@
     const [editingMatchDay, setEditingMatchDay] = useState(null);
     const [editingKcalActivity, setEditingKcalActivity] = useState(null);
     const [kcalInput, setKcalInput] = useState("");
+    const [editingNeatDay, setEditingNeatDay] = useState(null);
+    const [neatMode, setNeatModeInput] = useState("offset");
+    const [neatValueInput, setNeatValueInput] = useState("");
     const itemRefs = useRef({});
     const showActual = profile.scheduleShowActual !== false;
     const showCalories = profile.scheduleShowCalories !== false;
@@ -1995,7 +2026,7 @@
     for (let i = 0; i < 21; i++) {
       const d = new Date(calendarStart);
       d.setDate(d.getDate() + i);
-      const key = toLocalISODate(d);
+      const key = toISODate(d);
       const { sessions, taper } = getEffectiveSessionsForDate(schedule, key);
       const raceToday = races.find((r) => r.raceDate === key);
       const carbLoad = getCarbLoadState(schedule, key);
@@ -2005,6 +2036,9 @@
       const weightForDay = (_a = weightLog[key]) != null ? _a : parseFloat(profile.weightKg) || null;
       const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay, matchedKcalRates), 0);
       const actualKcal = dayActuals.reduce((sum, a) => sum + a.kcal, 0);
+      const dayBmr = weightForDay ? calcBMR(profile.sex, weightForDay, parseFloat(profile.heightCm), parseFloat(profile.age)) : null;
+      const defaultBaseline = dayBmr ? profile.neatMode === "offset" ? dayBmr + (parseFloat(profile.neatOffset) || 0) : dayBmr * (parseFloat(profile.neatFactor) || 1.15) : null;
+      const neatOverride = neatOverrides[key] || null;
       calendarDays.push({
         key,
         date: d,
@@ -2016,10 +2050,12 @@
         extras,
         dayActuals,
         expectedKcal,
-        actualKcal
+        actualKcal,
+        defaultBaseline,
+        neatOverride
       });
     }
-    const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
+    const todayKey = toISODate(/* @__PURE__ */ new Date());
     return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 16, marginBottom: 10, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
       "input",
       {
@@ -2155,7 +2191,21 @@
             opacity: isPast ? 0.5 : 1
           }
         },
-        /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold })), showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && /* @__PURE__ */ React.createElement(
+        /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold })), /* @__PURE__ */ React.createElement("div", { style: { marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 } }, /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            title: day.neatOverride ? `NEAT ${day.neatOverride.mode === "absolute" ? "set to" : "offset by"} ${day.neatOverride.mode === "offset" && day.neatOverride.value > 0 ? "+" : ""}${day.neatOverride.value} kcal \u2014 click to edit` : "Fine-tune NEAT for this day",
+            onClick: (e) => {
+              e.stopPropagation();
+              setNeatModeInput(day.neatOverride ? day.neatOverride.mode : "offset");
+              setNeatValueInput(day.neatOverride ? String(day.neatOverride.value) : "");
+              setEditingNeatDay(day.key);
+            },
+            style: { background: "none", border: "none", color: day.neatOverride ? amber : dim, cursor: "pointer", padding: 0, display: "flex" }
+          },
+          /* @__PURE__ */ React.createElement(Icon, { path: ICONS.bolt, size: 10, color: day.neatOverride ? amber : dim })
+        ), showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && /* @__PURE__ */ React.createElement(
           "button",
           {
             type: "button",
@@ -2164,10 +2214,10 @@
               e.stopPropagation();
               setEditingMatchDay(day.key);
             },
-            style: { marginLeft: "auto", background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }
+            style: { background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }
           },
           /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim })
-        )),
+        ))),
         showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && /* @__PURE__ */ React.createElement(
           "div",
           {
@@ -2303,7 +2353,10 @@
         maxWidth: "100%"
       } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 14 } }, "Override calories burned"), /* @__PURE__ */ React.createElement(
         "button",
-        { onClick: closeModal, style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 } },
+        {
+          onClick: closeModal,
+          style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }
+        },
         "\xD7"
       )), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: dim, marginBottom: 14, lineHeight: 1.5 } }, act.name, " \xB7 ", act.activityType, " \xB7 ", act.durationMin, "m \xB7 ", act.date), /* @__PURE__ */ React.createElement(Field, { label: "Calories burned (kcal)" }, /* @__PURE__ */ React.createElement(
         "input",
@@ -2318,15 +2371,78 @@
             if (e.key === "Enter") save();
           }
         }
-      )), act.kcalOverridden && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Synced estimate: ", act.autoKcal, " kcal"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 16 } }, /* @__PURE__ */ React.createElement(
+      )), act.kcalOverridden && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Synced estimate: ", act.autoKcal, " kcal"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 16 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", disabled: !valid, onClick: save, style: { flex: 1 } }, "Save"), act.kcalOverridden && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: clear }, "Reset to synced"))));
+    })(), editingNeatDay && (() => {
+      const day = calendarDays.find((d) => d.key === editingNeatDay);
+      if (!day) return null;
+      const closeModal = () => setEditingNeatDay(null);
+      const existing = day.neatOverride;
+      const mode = neatMode;
+      const valueStr = neatValueInput;
+      const parsed = parseFloat(valueStr);
+      const valid = valueStr.trim() !== "" && !isNaN(parsed) && (mode === "absolute" ? parsed >= 0 : true);
+      const save = async () => {
+        if (!valid) return;
+        await onSetNeatOverride(day.key, mode, parsed);
+        closeModal();
+      };
+      const clear = async () => {
+        await onSetNeatOverride(day.key, null, null);
+        closeModal();
+      };
+      return /* @__PURE__ */ React.createElement("div", { style: {
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        zIndex: 50,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20
+      }, onClick: closeModal }, /* @__PURE__ */ React.createElement("div", { onClick: (e) => e.stopPropagation(), style: {
+        background: panel2,
+        border: `1px solid ${line}`,
+        borderRadius: 8,
+        padding: 20,
+        width: 360,
+        maxWidth: "100%"
+      } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 14 } }, "Fine-tune NEAT \xB7 ", day.date.toLocaleDateString(void 0, { weekday: "long", month: "short", day: "numeric" })), /* @__PURE__ */ React.createElement(
         "button",
-        { className: "btn-primary", disabled: !valid, onClick: save, style: { flex: 1 } },
-        "Save"
-      ), act.kcalOverridden && /* @__PURE__ */ React.createElement(
-        "button",
-        { className: "btn-ghost", onClick: clear },
-        "Reset to synced"
-      ))));
+        {
+          onClick: closeModal,
+          style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }
+        },
+        "\xD7"
+      )), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: dim, marginBottom: 14, lineHeight: 1.5 } }, day.defaultBaseline ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Default baseline (BMR \xD7 NEAT) for this day: ", /* @__PURE__ */ React.createElement("strong", { style: { color: paper } }, Math.round(day.defaultBaseline), " kcal")) : "Enter weight/height/age in Setup to see a default baseline for this day."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "radio",
+          name: `neat-mode-${day.key}`,
+          checked: mode === "offset",
+          onChange: () => setNeatModeInput("offset")
+        }
+      ), "Add offset to baseline (kcal, can be negative)"), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "radio",
+          name: `neat-mode-${day.key}`,
+          checked: mode === "absolute",
+          onChange: () => setNeatModeInput("absolute")
+        }
+      ), "Set baseline directly (kcal)")), /* @__PURE__ */ React.createElement(Field, { label: mode === "absolute" ? "Baseline (kcal)" : "Offset (kcal)" }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          className: "inp",
+          type: "number",
+          min: mode === "absolute" ? "0" : void 0,
+          autoFocus: true,
+          value: valueStr,
+          onChange: (e) => setNeatValueInput(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === "Enter") save();
+          }
+        }
+      )), day.defaultBaseline && mode === "offset" && valid && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "New baseline: ", Math.round(day.defaultBaseline + parsed), " kcal"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 16 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", disabled: !valid, onClick: save, style: { flex: 1 } }, "Save"), existing && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: clear }, "Clear override"))));
     })(), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " Import schedule from file"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file. It's saved under ", /* @__PURE__ */ React.createElement("code", null, "schedule_sources/"), " and re-imported automatically from then on whenever that file's contents change \u2014 no need to come back here and re-upload it."), /* @__PURE__ */ React.createElement(
       "div",
       {

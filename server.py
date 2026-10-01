@@ -1237,6 +1237,44 @@ class Handler(BaseHTTPRequestHandler):
                 "kcal": result.get("activity-kcal-overrides", {}).get(activity_key),
             })
 
+        # Per-day fine-tuning of NEAT (the BMR multiplier/offset baseline),
+        # for days where the model's default is known to be off (a sick day,
+        # heavy travel, unusually sedentary/active day, etc). Per-date merge,
+        # same reasoning as the endpoints above.
+        #   {"mode": "offset", "value": -200}    -> add -200 kcal to that
+        #     day's own default baseline (BMR x profile NEAT factor/offset)
+        #   {"mode": "absolute", "value": 1800}  -> replace the baseline
+        #     outright with 1800 kcal
+        #   {"mode": null}                       -> clear the override
+        if path == "/api/neat-override":
+            date = qs.get("date", [None])[0]
+            if not date or not DATE_RE.match(date):
+                return self._send_json({"error": "missing or invalid date (expected YYYY-MM-DD)"}, 400)
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError:
+                return self._send_json({"error": "invalid JSON body"}, 400)
+            mode = body.get("mode") if isinstance(body, dict) else None
+            clear = mode not in ("offset", "absolute")
+            value = body.get("value") if isinstance(body, dict) else None
+            if not clear and not isinstance(value, (int, float)):
+                return self._send_json({"error": "'value' must be a number"}, 400)
+
+            def mutate(s):
+                overrides = s.get("neat-overrides") or {}
+                if clear:
+                    overrides.pop(date, None)
+                else:
+                    overrides[date] = {"mode": mode, "value": value}
+                s["neat-overrides"] = overrides
+                return s
+            result = update_store(mutate)
+            return self._send_json({
+                "ok": True,
+                "date": date,
+                "override": result.get("neat-overrides", {}).get(date),
+            })
+
         if path == "/api/nutrition/bulk":
             try:
                 body = self._read_json_body()

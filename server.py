@@ -68,26 +68,16 @@ HTTPS via Tailscale (optional):
      your tailnet — including the local Strava-connect step in step 4 above,
      which can still use the plain http://localhost URL as before.
 
-MacrosFirst via Google Sheets (optional):
-  MacrosFirst's own API is partner-gated, but it already offers a Premium
-  "Google Sheets Importer" that writes your daily nutrition log to a Sheet
-  you own — this connects to THAT sheet via the standard Google Sheets API,
-  same OAuth-broker pattern as Strava above.
-  1. In MacrosFirst: enable Premium → Google Sheets Importer, and note the
-     Sheet's ID (the long string in its URL between /d/ and /edit).
-  2. In Google Cloud Console (console.cloud.google.com): create a project,
-     enable the "Google Sheets API", and create OAuth 2.0 Client ID
-     credentials (type: Web application). Add
-     http://localhost:<port>/google/callback as an authorized redirect URI.
-     While the app is in "Testing" publish status, add your own Google
-     account as a test user — this is fine and expected for personal use,
-     no Google app-review process needed.
-  3. In config.json, set google_client_id, google_client_secret, and
-     google_sheet_id from the steps above.
-  4. Restart the server, open the localhost URL (same local-only rule as
-     Strava's OAuth), and click "Connect Google Sheets" in the Log tab.
-  5. Use "Sync from Google Sheet" any time to pull the latest rows — you'll
-     map its columns once, same as a CSV import, since export layouts vary.
+MacrosFirst (optional):
+  MacrosFirst now has its own personal API, so nutrition data is pulled
+  directly from https://my.macrosfirst.com/v1/days — no more Google Sheets
+  Importer add-on or column-mapping step.
+  1. Create a personal access token at https://app.macrosfirst.com/personal-access-tokens.
+  2. In config.json, set macrosfirst_api_token to that token (looks like
+     "mf_live_...").
+  3. Restart the server, open the Log tab, and click "Sync now" — or just
+     wait for the nightly automatic sync (macrosfirst_sync_time in
+     config.json, default 04:00).
 """
 
 import base64
@@ -111,7 +101,6 @@ import schedule_sync
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 TOKENS_PATH = os.path.join(HERE, "tokens.json")
-GOOGLE_TOKENS_PATH = os.path.join(HERE, "google_tokens.json")
 CACHE_PATH = os.path.join(HERE, "strava_cache.json")
 INTERVALS_CACHE_PATH = os.path.join(HERE, "intervals_cache.json")
 STORE_PATH = os.path.join(HERE, "app_store.json")
@@ -123,9 +112,8 @@ STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 STRAVA_API = "https://www.strava.com/api/v3"
 INTERVALS_API = "https://intervals.icu/api/v1"
-GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
+MACROSFIRST_API = "https://my.macrosfirst.com"
+MACROSFIRST_SYNC_LOOKBACK_DAYS = 35
 
 # Python's urllib sends "Python-urllib/3.x" by default, which Cloudflare's
 # Browser Integrity Check (and similar bot-detection on other APIs) flags
@@ -377,77 +365,37 @@ def get_config():
     return cfg
 
 
-def get_google_config():
+def get_macrosfirst_config():
     cfg = load_json(CONFIG_PATH, {})
-    if not cfg.get("google_client_id") or not cfg.get("google_client_secret") or not cfg.get("google_sheet_id"):
+    token = cfg.get("macrosfirst_api_token")
+    if not token:
         return None
-    return {
-        "client_id": cfg["google_client_id"],
-        "client_secret": cfg["google_client_secret"],
-        "sheet_id": cfg["google_sheet_id"],
-        "range": cfg.get("google_sheet_range") or "A1:Z1000",
-        "port": cfg.get("port", 8081),
-    }
+    return {"token": token, "sync_time": cfg.get("macrosfirst_sync_time") or "04:00"}
 
 
-def ensure_fresh_google_token(gcfg):
-    """Google's refresh response omits refresh_token (it stays the same and
-    is reused, unlike Strava which rotates it) and returns expires_in
-    (seconds) rather than an absolute expires_at, so that's computed here."""
-    tokens = load_json(GOOGLE_TOKENS_PATH)
-    if not tokens:
-        return None
-    if tokens.get("expires_at", 0) > time.time() + 60:
-        return tokens
-    try:
-        result = http_post_form(GOOGLE_TOKEN_URL, {
-            "client_id": gcfg["client_id"],
-            "client_secret": gcfg["client_secret"],
-            "grant_type": "refresh_token",
-            "refresh_token": tokens["refresh_token"],
-        })
-    except urllib.error.HTTPError as e:
-        print("Google token refresh failed:", e.read())
-        return None
-    tokens["access_token"] = result["access_token"]
-    tokens["expires_at"] = time.time() + result.get("expires_in", 3600)
-    save_json(GOOGLE_TOKENS_PATH, tokens)
-    return tokens
+# Nutrient-map keys (USDA codes, per the MacrosFirst API's DayResponse.nutrients)
+# for the four macros the app tracks. Preferred over the same-named top-level
+# fields on DayResponse, which the API marks deprecated.
+MACROSFIRST_NUTRIENT_KEYS = {"calories": "208", "protein": "203", "carbs": "205", "fat": "204"}
 
 
-def fetch_google_sheet_rows(gcfg, tokens):
-    """Shared by the manual /api/google/sheet endpoint and the background
-    auto-sync job. Returns {fields, rows} in the same shape a CSV import
-    produces, so both paths can reuse the same column-mapping logic."""
-    url = f"{GOOGLE_SHEETS_API}/{gcfg['sheet_id']}/values/{urllib.parse.quote(gcfg['range'])}"
-    data = http_get_json(url, tokens["access_token"])
-    values = data.get("values", [])
-    if not values:
-        return {"fields": [], "rows": []}
-    fields = values[0]
-    rows = []
-    for raw_row in values[1:]:
-        row = {}
-        for idx, field in enumerate(fields):
-            row[field] = raw_row[idx] if idx < len(raw_row) else ""
-        rows.append(row)
-    return {"fields": fields, "rows": rows}
+def macrosfirst_day_macros(day):
+    nutrients = day.get("nutrients") or {}
+    result = {}
+    for field, nutrient_key in MACROSFIRST_NUTRIENT_KEYS.items():
+        value = nutrients.get(nutrient_key)
+        if value is None:
+            value = day.get(field)  # fall back to the deprecated top-level field
+        result[field] = value or 0
+    return result
 
 
-def parse_sheet_date(raw):
-    """Sheets returns dates as their DISPLAYED string by default (not serial
-    numbers), but the exact format depends on the cell's own formatting —
-    try the common ones. Returns an ISO date string, or None if unparseable."""
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    raw = re.sub(r"[T ]\d{1,2}:\d{2}(:\d{2})?(\s*[AaPp][Mm])?$", "", raw)  # strip a trailing time like " 0:00:00", without mangling "Aug 21, 2026"
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%b %d, %Y", "%B %d, %Y", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    return None
+def fetch_macrosfirst_days(token, from_date, to_date):
+    """GET /v1/days, which returns full day detail (including the nutrients
+    map) for every day in the range — max 62 days per the API's own limit,
+    well above MACROSFIRST_SYNC_LOOKBACK_DAYS."""
+    url = f"{MACROSFIRST_API}/v1/days?from_date={from_date}&to_date={to_date}"
+    return http_get_json(url, token)
 
 
 def normalize_nutrition_entry(raw):
@@ -463,9 +411,9 @@ def normalize_nutrition_entry(raw):
 def merge_macrosfirst_into_nutrition(nutrition, updates):
     """Merges {date: {calories,protein,carbs,fat}} into nutrition-log's
     macrosfirst slot per date, preserving each date's manual entry (never
-    touching it). Mutates and returns `nutrition`. Shared by the Google
-    auto-sync background job and the client-triggered CSV/Sheet bulk import,
-    so the two merge rules can't drift apart."""
+    touching it). Mutates and returns `nutrition`. Shared by the MacrosFirst
+    auto-sync background job and the client-triggered CSV/MacrosFirst bulk
+    import, so the two merge rules can't drift apart."""
     for date_key, macros in updates.items():
         existing = normalize_nutrition_entry(nutrition.get(date_key))
         existing["macrosfirst"] = macros
@@ -473,45 +421,18 @@ def merge_macrosfirst_into_nutrition(nutrition, updates):
     return nutrition
 
 
-def auto_sync_google_sheet():
-    """Fetches the sheet, applies the column mapping saved from the last
-    manual "Sync from Google Sheet" + import, and writes results straight
-    into nutrition-log's macrosfirst slot for each date — no browser needed."""
-    gcfg = get_google_config()
-    if not gcfg:
-        return "not configured"
-    tokens = ensure_fresh_google_token(gcfg)
-    if not tokens:
-        return "not connected"
-
-    store = load_store()
-    colmap = store.get("google-sheet-colmap")
-    if not colmap or not colmap.get("date") or not colmap.get("calories"):
-        return "no column mapping saved yet — do one manual sync + import first"
-
-    sheet = fetch_google_sheet_rows(gcfg, tokens)  # network call — kept outside the lock below
-    if not sheet["rows"]:
-        return "sheet returned no rows"
-
-    def num(row, col):
-        if not col:
-            return 0
-        try:
-            return float(str(row.get(col, "0")).replace(",", "") or 0)
-        except ValueError:
-            return 0
-
-    updates = {}
-    for row in sheet["rows"]:
-        date_key = parse_sheet_date(row.get(colmap["date"]))
-        if not date_key:
-            continue
-        updates[date_key] = {
-            "calories": num(row, colmap["calories"]),
-            "protein": num(row, colmap.get("protein")),
-            "carbs": num(row, colmap.get("carbs")),
-            "fat": num(row, colmap.get("fat")),
-        }
+def sync_macrosfirst(mcfg, days_back=MACROSFIRST_SYNC_LOOKBACK_DAYS):
+    """Fetches the last `days_back` days from the MacrosFirst API and writes
+    them straight into nutrition-log's macrosfirst slot for each date.
+    Re-fetching already-synced dates is intentional and harmless (the merge
+    is a per-date overwrite of just the macrosfirst slot) — it's how a
+    correction made in MacrosFirst after the fact still reaches this app.
+    Shared by the manual /api/macrosfirst/sync endpoint and the nightly
+    auto-sync job, so the two can't drift apart."""
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    from_date = time.strftime("%Y-%m-%d", time.localtime(time.time() - days_back * 86400))
+    days = fetch_macrosfirst_days(mcfg["token"], from_date, today)  # network call — kept outside the lock below
+    updates = {day["day"]: macrosfirst_day_macros(day) for day in days}
 
     # Only this part touches the shared file, and it's a fast in-memory merge —
     # re-reads nutrition-log fresh under the lock so a concurrent write to some
@@ -520,10 +441,10 @@ def auto_sync_google_sheet():
         nutrition = s.get("nutrition-log") or {}
         merge_macrosfirst_into_nutrition(nutrition, updates)
         s["nutrition-log"] = nutrition
-        s["google-last-auto-sync"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        s["macrosfirst-last-auto-sync"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         return s
     update_store(mutate)
-    return f"imported {len(updates)} row(s)"
+    return updates
 
 
 def seconds_until_next(hh, mm):
@@ -534,22 +455,26 @@ def seconds_until_next(hh, mm):
     return (target - now).total_seconds()
 
 
-def google_auto_sync_loop():
+def macrosfirst_auto_sync_loop():
     while True:
-        cfg = load_json(CONFIG_PATH, {})
-        time_str = cfg.get("google_sync_time") or "04:00"
+        mcfg = get_macrosfirst_config()
+        time_str = (mcfg or {}).get("sync_time") or "04:00"
         try:
             hh, mm = (int(x) for x in time_str.split(":"))
         except Exception:
             hh, mm = 4, 0
         wait = seconds_until_next(hh, mm)
-        print(f"[google-sync] next automatic sync at {hh:02d}:{mm:02d} (in {wait / 3600:.1f}h)")
+        print(f"[macrosfirst-sync] next automatic sync at {hh:02d}:{mm:02d} (in {wait / 3600:.1f}h)")
         time.sleep(wait)
+        if not mcfg:
+            continue
         try:
-            result = auto_sync_google_sheet()
-            print(f"[google-sync] {result}")
+            updates = sync_macrosfirst(mcfg)
+            print(f"[macrosfirst-sync] imported {len(updates)} day(s)")
+        except urllib.error.HTTPError as e:
+            print(f"[macrosfirst-sync] failed: MacrosFirst API error {e.code}: {e.read().decode()}")
         except Exception as e:
-            print(f"[google-sync] failed: {e}")
+            print(f"[macrosfirst-sync] failed: {e}")
 
 
 def schedule_sources_sync_loop(poll_seconds=30):
@@ -807,88 +732,11 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if path == "/google/login":
-            gcfg = get_google_config()
-            if not gcfg:
-                return self._send_html(MISSING_GOOGLE_CONFIG_HTML, 500)
-            host = (self.headers.get("Host") or "").split(":")[0]
-            if host not in ("localhost", "127.0.0.1"):
-                return self._send_html(WRONG_HOST_LOGIN_HTML.format(port=gcfg["port"]), 400)
-            redirect_uri = f"http://localhost:{gcfg['port']}/google/callback"
-            params = {
-                "client_id": gcfg["client_id"],
-                "redirect_uri": redirect_uri,
-                "response_type": "code",
-                "scope": "https://www.googleapis.com/auth/spreadsheets.readonly",
-                "access_type": "offline",  # needed to get a refresh_token
-                "prompt": "consent",       # forces a refresh_token even on re-auth
-            }
-            url = GOOGLE_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
-            self.send_response(302)
-            self.send_header("Location", url)
-            self.end_headers()
-            return
-
-        if path == "/google/callback":
-            gcfg = get_google_config()
-            if not gcfg:
-                return self._send_html(MISSING_GOOGLE_CONFIG_HTML, 500)
-            error = qs.get("error", [None])[0]
-            if error:
-                return self._send_html(f"<h2>Google authorization failed</h2><p>{error}</p>", 400)
-            code = qs.get("code", [None])[0]
-            if not code:
-                return self._send_html("<h2>Missing authorization code</h2>", 400)
-            redirect_uri = f"http://localhost:{gcfg['port']}/google/callback"
-            try:
-                result = http_post_form(GOOGLE_TOKEN_URL, {
-                    "client_id": gcfg["client_id"],
-                    "client_secret": gcfg["client_secret"],
-                    "code": code,
-                    "grant_type": "authorization_code",
-                    "redirect_uri": redirect_uri,
-                })
-            except urllib.error.HTTPError as e:
-                return self._send_html(f"<h2>Token exchange failed</h2><pre>{e.read().decode()}</pre>", 500)
-            if "refresh_token" not in result:
-                # Happens if the user had already granted consent before and
-                # Google didn't re-issue one — prompt=consent above should
-                # normally prevent this, but fail loudly rather than silently.
-                return self._send_html(
-                    "<h2>No refresh token returned</h2>"
-                    "<p>Revoke this app's access at "
-                    "<a href='https://myaccount.google.com/permissions'>myaccount.google.com/permissions</a> "
-                    "and try connecting again.</p>", 500)
-            tokens = {
-                "access_token": result["access_token"],
-                "refresh_token": result["refresh_token"],
-                "expires_at": time.time() + result.get("expires_in", 3600),
-            }
-            save_json(GOOGLE_TOKENS_PATH, tokens)
-            self.send_response(302)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
-
-        if path == "/api/google/status":
-            gcfg = get_google_config()
-            if not gcfg:
+        if path == "/api/macrosfirst/status":
+            mcfg = get_macrosfirst_config()
+            if not mcfg:
                 return self._send_json({"connected": False, "configError": True})
-            tokens = ensure_fresh_google_token(gcfg)
-            return self._send_json({"connected": tokens is not None})
-
-        if path == "/api/google/sheet":
-            gcfg = get_google_config()
-            if not gcfg:
-                return self._send_json({"error": "Google Sheets not configured. See config.example.json."}, 500)
-            tokens = ensure_fresh_google_token(gcfg)
-            if not tokens:
-                return self._send_json({"error": "Not connected to Google. Visit /google/login first."}, 401)
-            try:
-                sheet = fetch_google_sheet_rows(gcfg, tokens)
-            except urllib.error.HTTPError as e:
-                return self._send_json({"error": f"Google Sheets API error {e.code}: {e.read().decode()}"}, 502)
-            return self._send_json(sheet)
+            return self._send_json({"connected": True})
 
         if path == "/api/strava/status":
             cfg = get_config()
@@ -1122,10 +970,10 @@ class Handler(BaseHTTPRequestHandler):
         # object wholesale — fine for keys only ever edited from one place at
         # a time), these re-read the store fresh under update_store's lock and
         # merge just the one date touched, the same pattern already proven in
-        # auto_sync_google_sheet. This is what actually stops a stale client
-        # (a second device, or a browser tab left open across the nightly
-        # Google auto-sync) from wholesale-overwriting every other date's data
-        # with its own out-of-date in-memory copy.
+        # sync_macrosfirst. This is what actually stops a stale client (a
+        # second device, or a browser tab left open across the nightly
+        # MacrosFirst auto-sync) from wholesale-overwriting every other
+        # date's data with its own out-of-date in-memory copy.
         if path == "/api/nutrition/day":
             date = qs.get("date", [None])[0]
             if not date or not DATE_RE.match(date):
@@ -1254,6 +1102,25 @@ class Handler(BaseHTTPRequestHandler):
             update_store(mutate)
             return self._send_json({"ok": True, "count": len(days)})
 
+        if path == "/api/macrosfirst/sync":
+            mcfg = get_macrosfirst_config()
+            if not mcfg:
+                return self._send_json({"error": "MacrosFirst not configured. Add macrosfirst_api_token to config.json."}, 500)
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError:
+                return self._send_json({"error": "invalid JSON body"}, 400)
+            days_back = (body or {}).get("days") if isinstance(body, dict) else None
+            if days_back is None:
+                days_back = MACROSFIRST_SYNC_LOOKBACK_DAYS
+            elif not isinstance(days_back, int) or isinstance(days_back, bool) or days_back <= 0:
+                return self._send_json({"error": "'days' must be a positive integer"}, 400)
+            try:
+                updates = sync_macrosfirst(mcfg, days_back=days_back)
+            except urllib.error.HTTPError as e:
+                return self._send_json({"error": f"MacrosFirst API error {e.code}: {e.read().decode()}"}, 502)
+            return self._send_json({"ok": True, "count": len(updates), "days": updates})
+
         # Lets the browser's own file picker/drop zone (ScheduleTab) trigger
         # the same import schedule_sources_sync_loop does automatically in
         # the background — but immediately, with a real success/error result
@@ -1359,13 +1226,6 @@ strava.com/settings/api</a> (set Authorization Callback Domain to <code>localhos
 then restart the server.</p>
 """
 
-MISSING_GOOGLE_CONFIG_HTML = """
-<h2>Google Sheets isn't configured</h2>
-<p>Set <code>google_client_id</code>, <code>google_client_secret</code>, and
-<code>google_sheet_id</code> in <code>config.json</code> — see the "MacrosFirst via Google
-Sheets" section at the top of <code>server.py</code> for the full setup, then restart.</p>
-"""
-
 WRONG_HOST_LOGIN_HTML = """
 <h2>Connect from this machine, not over the network</h2>
 <p>This OAuth callback is tied to the domain registered with the provider
@@ -1420,9 +1280,9 @@ def main():
             print("     Make sure MagicDNS + \"Enable HTTPS\" are turned on for your tailnet:")
             print("     https://tailscale.com/docs/how-to/set-up-https-certificates")
 
-    if get_google_config():
-        threading.Thread(target=google_auto_sync_loop, daemon=True).start()
-        print("  Google Sheets auto-sync scheduled (set google_sync_time in config.json, default 04:00).")
+    if get_macrosfirst_config():
+        threading.Thread(target=macrosfirst_auto_sync_loop, daemon=True).start()
+        print("  MacrosFirst auto-sync scheduled (set macrosfirst_sync_time in config.json, default 04:00).")
 
     threading.Thread(target=schedule_sources_sync_loop, daemon=True).start()
     n_sources = len(schedule_sync.discover_schedule_sources(SCHEDULE_SOURCES_DIR))

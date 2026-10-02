@@ -26,7 +26,7 @@ as a small Python server + a React frontend, self-hosted on the athlete's own ma
 
 Data files server.py creates/manages at runtime (same directory, gitignore-worthy, contain
 personal data and secrets — never share these):
-`app_store.json` (main data store), `tokens.json` (Strava), `google_tokens.json` (Google),
+`app_store.json` (main data store), `tokens.json` (Strava),
 `strava_cache.json`, `intervals_cache.json`, `tailscale.crt` / `tailscale.key`.
 
 ## Build process
@@ -77,32 +77,27 @@ app.js` confirms the compiled output is valid JS.
 - Used for CTL/ATL/TSB (recovery/fatigue buffer) and as an activity-data fallback on dates
   Strava has nothing for.
 
-### MacrosFirst (nutrition) via Google Sheets
-- MacrosFirst's own API is partner-gated (not available to individuals). Instead: MacrosFirst
-  Premium has a "Google Sheets Importer" add-on that writes the food log to a Sheet the user
-  owns — we read *that* directly via the standard Google Sheets API.
-- OAuth2 to Google (`/google/login`, `/google/callback`), same localhost-only constraint as
-  Strava. Config: `google_client_id`, `google_client_secret`, `google_sheet_id`,
-  `google_sheet_range` (default `"A1:Z1000"`).
-- **Google does not rotate refresh tokens on renewal** (unlike Strava) —
-  `ensure_fresh_google_token` reuses the original one; don't "fix" this into expecting a new
-  one each refresh.
-- Manual flow: Log tab → "Sync from Google Sheet". If the fetched sheet's columns still match
-  the mapping saved from a previous import (`google-sheet-colmap`), it imports immediately —
-  no re-mapping or a separate "Import Rows" click needed. Only falls back to the manual
-  map-columns-then-import step (same UI/logic as a CSV import) when there's no cached mapping
-  yet, or the sheet's columns have changed since. Either way, the mapping used gets saved back
-  to `google-sheet-colmap`, which is also what seeds the automatic job (below).
-- **Automatic daily sync**: `google_auto_sync_loop` (background thread) wakes at
-  `google_sync_time` (default `"04:00"`) every day, re-fetches the sheet, and merges rows
-  into `nutrition-log`'s `macrosfirst` slot per date. It refuses to run (logs why, doesn't
-  crash) until at least one manual sync+import has happened, since that's what seeds the
-  column mapping. Last-run timestamp recorded at store key `google-last-auto-sync`.
-- Date parsing (`parse_sheet_date` in Python, `parseFlexibleDate` in JS — kept in sync, same
-  test cases) handles ISO, US slash (2- or 4-digit year), month-name format, and any of
-  those with a trailing time component (Sheets' FORMATTED_VALUE output varies a lot by cell
-  format/locale). If an import ever silently returns 0 rows again, the UI now shows the
-  actual unparseable raw value instead of failing silently — check that message first.
+### MacrosFirst (nutrition) via its personal API
+- MacrosFirst now has its own personal API (`https://my.macrosfirst.com`, OpenAPI spec at
+  `/openapi.json`) — no more Google Sheets Importer add-on or column-mapping step. Auth is a
+  static bearer token (a "personal access token", created at
+  `https://app.macrosfirst.com/personal-access-tokens`, looks like `mf_live_...`) — not OAuth,
+  so there's no refresh flow, no `/callback`, no localhost-only constraint.
+- Config: `macrosfirst_api_token`, `macrosfirst_sync_time` (default `"04:00"`).
+- `GET /v1/days?from_date=&to_date=` returns full day detail (max 62 days/request) including a
+  `nutrients` map keyed by USDA nutrient code — `macrosfirst_day_macros()` reads calories/
+  protein/carbs/fat from there (keys `208`/`203`/`205`/`204`), falling back to the same-named
+  top-level fields only if a nutrient key is missing (those top-level fields are marked
+  deprecated in the API's own schema).
+- Manual flow: Log tab → "Sync now" (`/api/macrosfirst/sync`, POST) — fetches the last
+  `MACROSFIRST_SYNC_LOOKBACK_DAYS` (35) days and merges directly into `nutrition-log`'s
+  `macrosfirst` slot per date. No column mapping, no preview step — the API already returns
+  structured macros.
+- **Automatic daily sync**: `macrosfirst_auto_sync_loop` (background thread) wakes at
+  `macrosfirst_sync_time` every day and calls the same `sync_macrosfirst()` the manual endpoint
+  uses. Re-fetching already-synced dates is intentional (cheap, and picks up corrections made
+  in MacrosFirst after the fact) rather than something to "optimize" into an incremental sync.
+  Last-run timestamp recorded at store key `macrosfirst-last-auto-sync`.
 
 ## Data model — things that aren't obvious from a schema alone
 
@@ -201,9 +196,10 @@ looking for the longest valid-JSON prefix) — keep it around.
 - HTTP Basic Auth is **always** required — `ensure_auth_config()` auto-generates
   `access_username`/`access_password` into `config.json` on first run if not already set.
   There's no "off" mode; this was a deliberate choice once the server became LAN-reachable.
-- Server binds `0.0.0.0` (LAN/Tailscale-reachable). OAuth callbacks (Strava, Google) are
-  hardcoded to `localhost` and can only be completed on the machine running `server.py` — see
-  the Strava/Google sections above.
+- Server binds `0.0.0.0` (LAN/Tailscale-reachable). Strava's OAuth callback is hardcoded to
+  `localhost` and can only be completed on the machine running `server.py` — see the Strava
+  section above. MacrosFirst uses a static bearer token instead of OAuth, so it has no such
+  constraint.
 - Optional real HTTPS via Tailscale: `tls_enabled` / `tls_hostname` (auto-detected from
   `tailscale status --json` if blank) / `tls_port` (default `port + 1`). Runs as a **second**
   listener alongside the plain-HTTP one (doesn't replace it — this is what keeps local OAuth
@@ -220,9 +216,8 @@ looking for the longest valid-JSON prefix) — keep it around.
 | `access_username` / `access_password` | auto-generated | Basic Auth login |
 | `intervals_api_key` / `intervals_athlete_id` | — / `"0"` | intervals.icu |
 | `tls_enabled` / `tls_hostname` / `tls_port` | false / auto-detect / `port+1` | Tailscale HTTPS |
-| `google_client_id` / `google_client_secret` / `google_sheet_id` | — | Google OAuth + target sheet |
-| `google_sheet_range` | `"A1:Z1000"` | Range to read |
-| `google_sync_time` | `"04:00"` | Daily auto-sync time (24h, local time) |
+| `macrosfirst_api_token` | — | MacrosFirst personal access token |
+| `macrosfirst_sync_time` | `"04:00"` | Daily auto-sync time (24h, local time) |
 
 ## Known limitations / deliberately not built
 
@@ -296,6 +291,6 @@ import to work — it's a convenience for testing/forcing, not the primary mecha
 2. `dailyRows` (search for it) is the single most important function in the app — nearly
    every number on the dashboard traces back to that one `useMemo`.
 3. Check `server.py`'s module docstring — it has the full setup walkthrough for Strava,
-   intervals.icu, Tailscale HTTPS, and Google Sheets, kept up to date as features were added.
+   intervals.icu, Tailscale HTTPS, and MacrosFirst, kept up to date as features were added.
 4. Anything touching `app_store.json` server-side: use `update_store`, not
    `load_store`/`save_store` separately.

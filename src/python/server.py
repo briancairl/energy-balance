@@ -37,10 +37,10 @@ This uses only the Python standard library — nothing to pip install.
 Setup:
   1. Register an app at https://www.strava.com/settings/api
      - Authorization Callback Domain: localhost
-  2. Copy config.example.json to config.json and fill in your client_id / client_secret.
-     Leave access_username/access_password blank to have credentials generated
-     for you, or set your own.
-  3. Run:  python3 server.py
+  2. Copy configs/config.example.json to configs/config.json and fill in your
+     client_id / client_secret. Leave access_username/access_password blank to
+     have credentials generated for you, or set your own.
+  3. Run (from the project root):  python3 src/python/server.py
      It prints your login credentials (first run only) and two URLs: one for
      this machine, one for other devices on your network.
   4. On THIS machine, open the localhost URL and click "Connect to Strava" —
@@ -99,14 +99,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import schedule_sync
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(HERE, "config.json")
-TOKENS_PATH = os.path.join(HERE, "tokens.json")
-CACHE_PATH = os.path.join(HERE, "strava_cache.json")
-INTERVALS_CACHE_PATH = os.path.join(HERE, "intervals_cache.json")
-STORE_PATH = os.path.join(HERE, "app_store.json")
-SCHEDULE_SOURCES_DIR = os.path.join(HERE, "schedule_sources")
-TLS_CERT_PATH = os.path.join(HERE, "tailscale.crt")
-TLS_KEY_PATH = os.path.join(HERE, "tailscale.key")
+ROOT = os.path.dirname(os.path.dirname(HERE))
+ASSETS_DIR = os.path.join(ROOT, "assets")
+CONFIGS_DIR = os.path.join(ROOT, "configs")
+CACHES_DIR = os.path.join(ROOT, "caches")
+SECRETS_DIR = os.path.join(ROOT, "secrets")
+JS_DIR = os.path.join(ROOT, "src", "js")
+
+CONFIG_PATH = os.path.join(CONFIGS_DIR, "config.json")
+TOKENS_PATH = os.path.join(SECRETS_DIR, "tokens.json")
+CACHE_PATH = os.path.join(CACHES_DIR, "strava_cache.json")
+INTERVALS_CACHE_PATH = os.path.join(CACHES_DIR, "intervals_cache.json")
+STORE_PATH = os.path.join(SECRETS_DIR, "app_store.json")
+SCHEDULE_SOURCES_DIR = os.path.join(CONFIGS_DIR, "schedule_sources")
+TLS_CERT_PATH = os.path.join(CONFIGS_DIR, "tailscale.crt")
+TLS_KEY_PATH = os.path.join(CONFIGS_DIR, "tailscale.key")
 
 STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
@@ -126,16 +133,16 @@ OUTBOUND_HEADERS = {
 
 # Icon/manifest assets served as static files — see logo-master.svg for the source.
 STATIC_ASSETS = {
-    "/favicon.ico": ("favicon.ico", "image/x-icon"),
-    "/favicon-16x16.png": ("favicon-16x16.png", "image/png"),
-    "/favicon-32x32.png": ("favicon-32x32.png", "image/png"),
-    "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
-    "/icon-192.png": ("icon-192.png", "image/png"),
-    "/icon-512.png": ("icon-512.png", "image/png"),
-    "/icon-192-maskable.png": ("icon-192-maskable.png", "image/png"),
-    "/icon-512-maskable.png": ("icon-512-maskable.png", "image/png"),
-    "/logo-header.png": ("logo-header.png", "image/png"),
-    "/manifest.json": ("manifest.json", "application/manifest+json"),
+    "/favicon.ico": (ASSETS_DIR, "favicon.ico", "image/x-icon"),
+    "/favicon-16x16.png": (ASSETS_DIR, "favicon-16x16.png", "image/png"),
+    "/favicon-32x32.png": (ASSETS_DIR, "favicon-32x32.png", "image/png"),
+    "/apple-touch-icon.png": (ASSETS_DIR, "apple-touch-icon.png", "image/png"),
+    "/icon-192.png": (ASSETS_DIR, "icon-192.png", "image/png"),
+    "/icon-512.png": (ASSETS_DIR, "icon-512.png", "image/png"),
+    "/icon-192-maskable.png": (ASSETS_DIR, "icon-192-maskable.png", "image/png"),
+    "/icon-512-maskable.png": (ASSETS_DIR, "icon-512-maskable.png", "image/png"),
+    "/logo-header.png": (ASSETS_DIR, "logo-header.png", "image/png"),
+    "/manifest.json": (CONFIGS_DIR, "manifest.json", "application/manifest+json"),
 }
 
 
@@ -673,12 +680,12 @@ class Handler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(parsed.query)
 
         if path == "/":
-            return self._send_file(os.path.join(HERE, "index.html"), "text/html; charset=utf-8")
+            return self._send_file(os.path.join(ROOT, "index.html"), "text/html; charset=utf-8")
         if path == "/app.js":
-            return self._send_file(os.path.join(HERE, "app.js"), "application/javascript")
+            return self._send_file(os.path.join(JS_DIR, "app.js"), "application/javascript")
         if path in STATIC_ASSETS:
-            fname, ctype = STATIC_ASSETS[path]
-            return self._send_file(os.path.join(HERE, fname), ctype)
+            fdir, fname, ctype = STATIC_ASSETS[path]
+            return self._send_file(os.path.join(fdir, fname), ctype)
 
         if path == "/login":
             cfg = get_config()
@@ -1219,8 +1226,8 @@ class Handler(BaseHTTPRequestHandler):
 
 MISSING_CONFIG_HTML = """
 <h2>config.json not found or incomplete</h2>
-<p>Copy <code>config.example.json</code> to <code>config.json</code> in the same folder as
-<code>server.py</code>, and fill in your Strava <code>client_id</code> and
+<p>Copy <code>configs/config.example.json</code> to <code>configs/config.json</code>,
+and fill in your Strava <code>client_id</code> and
 <code>client_secret</code> from <a href="https://www.strava.com/settings/api">
 strava.com/settings/api</a> (set Authorization Callback Domain to <code>localhost</code>),
 then restart the server.</p>
@@ -1240,8 +1247,8 @@ def main():
     cfg = get_config()
     port = cfg["port"] if cfg else 8081
     if not cfg:
-        print(f"⚠️  No valid config.json found in {HERE}.")
-        print("   Copy config.example.json -> config.json and fill in your Strava client_id/client_secret.")
+        print(f"⚠️  No valid config.json found in {CONFIGS_DIR}.")
+        print("   Copy configs/config.example.json -> configs/config.json and fill in your Strava client_id/client_secret.")
         print(f"   The server will still start on port {port} so you can see setup instructions at /login.")
 
     user, pw, generated = ensure_auth_config()

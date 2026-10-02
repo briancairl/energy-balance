@@ -13,29 +13,41 @@ as a small Python server + a React frontend, self-hosted on the athlete's own ma
 
 ## Files
 
+The tree is grouped by kind rather than flat:
+
+```
+assets/       Icons, logo, PWA manifest image
+configs/      config.json, schedule_sources/, Tailscale cert/key
+caches/       Strava/intervals.icu response caches
+secrets/      app_store.json, tokens.json — gitignored, never committed
+src/js/       Frontend source + compiled output
+src/python/   Backend
+index.html    Served as-is from the project root
+```
+
 | File | What it is |
 |---|---|
-| `server.py` | Python 3, **stdlib only** (no pip installs). HTTP server, OAuth brokers, API proxies, all data storage. |
-| `app-source.jsx` | **The real frontend source** (React/JSX). Edit this, not `app.js`. |
-| `app.js` | Compiled output of `app-source.jsx` (esbuild, IIFE, unminified). Never hand-edit — see Build Process. |
+| `src/python/server.py` | Python 3, **stdlib only** (no pip installs). HTTP server, OAuth brokers, API proxies, all data storage. |
+| `src/js/app-source.jsx` | **The real frontend source** (React/JSX). Edit this, not `app.js`. |
+| `src/js/app.js` | Compiled output of `app-source.jsx` (esbuild, IIFE, unminified). Never hand-edit — see Build Process. |
 | `index.html` | Thin shell: loads React/ReactDOM/Recharts/PapaParse from CDN as globals, then `/app.js`. |
-| `config.json` | Secrets and settings. **Not delivered/committed** — copy from `config.example.json`. |
-| `config.example.json` | Template with every recognized config field. |
-| `repair_store.py` | One-off recovery tool for a corrupted `app_store.json` (see Concurrency below). Keep around. |
-| `favicon.ico`, `icon-*.png`, `apple-touch-icon.png`, `logo-header.png`, `manifest.json`, `logo-master.svg` | App icon set + PWA manifest. `logo-master.svg` is the editable source if the mark ever needs to change. |
+| `configs/config.json` | Secrets and settings. **Not delivered/committed** — copy from `configs/config.example.json`. |
+| `configs/config.example.json` | Template with every recognized config field. |
+| `src/python/repair_store.py` | One-off recovery tool for a corrupted `secrets/app_store.json` (see Concurrency below). Keep around. |
+| `assets/favicon.ico`, `assets/icon-*.png`, `assets/apple-touch-icon.png`, `assets/logo-header.png`, `configs/manifest.json`, `assets/logo-master.svg` | App icon set + PWA manifest. `logo-master.svg` is the editable source if the mark ever needs to change. |
 
-Data files server.py creates/manages at runtime (same directory, gitignore-worthy, contain
-personal data and secrets — never share these):
-`app_store.json` (main data store), `tokens.json` (Strava),
-`strava_cache.json`, `intervals_cache.json`, `tailscale.crt` / `tailscale.key`.
+Data files server.py creates/manages at runtime (gitignore-worthy, contain personal data and
+secrets — never share these):
+`secrets/app_store.json` (main data store), `secrets/tokens.json` (Strava),
+`caches/strava_cache.json`, `caches/intervals_cache.json`, `configs/tailscale.crt` / `configs/tailscale.key`.
 
 ## Build process
 
-Frontend source is `app-source.jsx`. After editing it, recompile with:
+Frontend source is `src/js/app-source.jsx`. After editing it, recompile with (from the project root):
 
 ```
-esbuild app-source.jsx --jsx-factory=React.createElement --jsx-fragment=React.Fragment \
-  --format=iife --target=es2019 --outfile=app.js
+esbuild src/js/app-source.jsx --jsx-factory=React.createElement --jsx-fragment=React.Fragment \
+  --format=iife --target=es2019 --outfile=src/js/app.js
 ```
 
 No bundler config, no `node_modules` needed for the app itself — React, ReactDOM, Recharts,
@@ -46,7 +58,7 @@ broke — see conversation history for why — precompiling sidesteps that entir
 
 Validate before shipping: a brace-balance check + `tsc --noEmit --jsx react-jsx` (used as a
 JSX/syntax linter, not real TypeScript) catches most mistakes before compiling. `node -c
-app.js` confirms the compiled output is valid JS.
+src/js/app.js` confirms the compiled output is valid JS.
 
 ## Integrations
 
@@ -194,7 +206,7 @@ looking for the longest valid-JSON prefix) — keep it around.
 ## Auth / multi-device / networking
 
 - HTTP Basic Auth is **always** required — `ensure_auth_config()` auto-generates
-  `access_username`/`access_password` into `config.json` on first run if not already set.
+  `access_username`/`access_password` into `configs/config.json` on first run if not already set.
   There's no "off" mode; this was a deliberate choice once the server became LAN-reachable.
 - Server binds `0.0.0.0` (LAN/Tailscale-reachable). Strava's OAuth callback is hardcoded to
   `localhost` and can only be completed on the machine running `server.py` — see the Strava
@@ -207,7 +219,7 @@ looking for the longest valid-JSON prefix) — keep it around.
   thread, reloaded into the running `SSLContext` in place (no restart needed). Requires
   MagicDNS + "Enable HTTPS" turned on once in the Tailscale admin console.
 
-## `config.json` field reference
+## `configs/config.json` field reference
 
 | Field | Default if omitted | Purpose |
 |---|---|---|
@@ -280,17 +292,18 @@ a session for any date already covered by an entry from outside that source, so 
 override (or another plan file's entry) is never double-booked.
 
 **Manual/offline use** (previewing a change before saving it, or forcing an immediate re-import
-without waiting ~30s for the background poll): `python3 sync_schedule_from_plan.py
+without waiting ~30s for the background poll): `python3 src/python/sync_schedule_from_plan.py
 [--weeks-ahead 8] [--dry-run] [--file some_plan.json]`. With no `--file`, it syncs every
-`schedule_sources/*.json` file in one pass. This script is *not* required for the automatic
-import to work — it's a convenience for testing/forcing, not the primary mechanism anymore.
+`configs/schedule_sources/*.json` file in one pass. This script is *not* required for the
+automatic import to work — it's a convenience for testing/forcing, not the primary mechanism
+anymore.
 
 ## If you're picking this up cold
 
-1. Read `app-source.jsx` — it's commented at the point of most decisions above.
+1. Read `src/js/app-source.jsx` — it's commented at the point of most decisions above.
 2. `dailyRows` (search for it) is the single most important function in the app — nearly
    every number on the dashboard traces back to that one `useMemo`.
-3. Check `server.py`'s module docstring — it has the full setup walkthrough for Strava,
-   intervals.icu, Tailscale HTTPS, and MacrosFirst, kept up to date as features were added.
-4. Anything touching `app_store.json` server-side: use `update_store`, not
+3. Check `src/python/server.py`'s module docstring — it has the full setup walkthrough for
+   Strava, intervals.icu, Tailscale HTTPS, and MacrosFirst, kept up to date as features were added.
+4. Anything touching `secrets/app_store.json` server-side: use `update_store`, not
    `load_store`/`save_store` separately.

@@ -1,7 +1,14 @@
-config.json
-app_store.json
-*tokens.json
-*cache.json
-*.key
-*.crt
-schedule_sources/
+# Python bytecode cache
+__pycache__/
+
+# Secrets — never committed
+secrets/
+
+# Generated caches
+caches/*cache.json
+
+# Local config / TLS material
+configs/config.json
+configs/*.key
+configs/*.crt
+configs/schedule_sources/

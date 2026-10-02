@@ -34,20 +34,21 @@ before saving it (--dry-run), or forcing a re-import without waiting.
 
 USAGE
 -----
-    python3 sync_schedule_from_plan.py [--weeks-ahead 8] [--dry-run]
-    python3 sync_schedule_from_plan.py --file some_plan.json [--dry-run]
+    python3 src/python/sync_schedule_from_plan.py [--weeks-ahead 8] [--dry-run]
+    python3 src/python/sync_schedule_from_plan.py --file some_plan.json [--dry-run]
 
-With no --file, every schedule_sources/*.json file is synced. Run it from
-inside the energy-balance project directory (it looks for app_store.json and
-schedule_sources/ next to itself).
+With no --file, every schedule_sources/*.json file is synced. It locates
+secrets/app_store.json and configs/schedule_sources/ relative to the project
+root, regardless of the current working directory.
 """
 import json, os, sys, argparse
 
 import schedule_sync
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STORE_PATH = os.path.join(HERE, "app_store.json")
-SOURCES_DIR = os.path.join(HERE, "schedule_sources")
+ROOT = os.path.dirname(os.path.dirname(HERE))
+STORE_PATH = os.path.join(ROOT, "secrets", "app_store.json")
+SOURCES_DIR = os.path.join(ROOT, "configs", "schedule_sources")
 
 
 def load_json(path, default):

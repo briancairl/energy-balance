@@ -171,7 +171,7 @@ async function storageSet(key, value) {
 // client's copy of it completely — fine for keys only ever edited from one
 // place, like training-schedule or profile), these merge just the one date
 // server-side, so a stale client (a second device, or a tab left open across
-// the nightly Google auto-sync in server.py) can never wholesale-overwrite
+// the nightly MacrosFirst auto-sync in server.py) can never wholesale-overwrite
 // every other date's data with its own out-of-date snapshot. These throw on
 // failure (after the same retry treatment) so callers can show a real
 // save-failed state instead of a silent no-op.
@@ -887,7 +887,6 @@ function App() {
   // Single:    { id, kind: "single", activityType, zone, durationMin, date, notes } — one-off, non-repeating
   // Race:      { id, kind: "race", activityType, zone, durationMin, raceDate, taperDays, notes }
   const [csvPreview, setCsvPreview] = useState(null);
-  const [csvPreviewSource, setCsvPreviewSource] = useState(null); // 'csv' | 'sheet'
   const [colMap, setColMap] = useState({ date: "", calories: "", protein: "", carbs: "", fat: "" });
   const [intervalsData, setIntervalsData] = useState({ activities: [], wellness: [], syncedDates: [] });
   const [intervalsStatus, setIntervalsStatus] = useState({ configured: false, checked: false });
@@ -902,14 +901,14 @@ function App() {
   const [stravaError, setStravaError] = useState(null);
   const [stravaLastFetched, setStravaLastFetched] = useState(null);
 
-  const [googleStatus, setGoogleStatus] = useState({ connected: false, checked: false });
-  const [googleLastAutoSync, setGoogleLastAutoSync] = useState(null);
-  const [googleFetching, setGoogleFetching] = useState(false);
-  const [googleError, setGoogleError] = useState(null);
+  const [macrosfirstStatus, setMacrosfirstStatus] = useState({ connected: false, checked: false });
+  const [macrosfirstLastAutoSync, setMacrosfirstLastAutoSync] = useState(null);
+  const [macrosfirstFetching, setMacrosfirstFetching] = useState(false);
+  const [macrosfirstError, setMacrosfirstError] = useState(null);
 
   useEffect(() => {
     (async () => {
-      const [p, n, w, sched, matchOv, cached, stravaCached, gLastSync] = await Promise.all([
+      const [p, n, w, sched, matchOv, cached, stravaCached, mfLastSync] = await Promise.all([
         storageGet("profile", null),
         storageGet("nutrition-log", {}),
         storageGet("weight-log", {}),
@@ -917,13 +916,13 @@ function App() {
         storageGet("schedule-match-overrides", {}),
         storageGet("intervals-cache", null),
         storageGet("strava-cache", null),
-        storageGet("google-last-auto-sync", null),
+        storageGet("macrosfirst-last-auto-sync", null),
       ]);
       setNutrition(n);
       setWeightLog(w);
       setSchedule(sched);
       setMatchOverrides(matchOv);
-      setGoogleLastAutoSync(gLastSync);
+      setMacrosfirstLastAutoSync(mfLastSync);
 
       // Weight always reflects the most recent logged entry, so a fresh
       // session (new device, or a restart with no profile saved yet) starts
@@ -958,9 +957,9 @@ function App() {
       setIntervalsStatus({ ...s, checked: true });
     }).catch(() => setIntervalsStatus({ configured: false, checked: true, unreachable: true }));
 
-    fetch("/api/google/status").then((r) => r.json()).then((s) => {
-      setGoogleStatus({ ...s, checked: true });
-    }).catch(() => setGoogleStatus({ connected: false, checked: true, unreachable: true }));
+    fetch("/api/macrosfirst/status").then((r) => r.json()).then((s) => {
+      setMacrosfirstStatus({ ...s, checked: true });
+    }).catch(() => setMacrosfirstStatus({ connected: false, checked: true, unreachable: true }));
   }, []);
 
   useEffect(() => { if (loaded) storageSet("profile", profile); }, [profile, loaded]);
@@ -1043,7 +1042,6 @@ function App() {
         const fields = res.meta.fields || [];
         setColMap(guessColumnMapping(fields));
         setCsvPreview({ fields, rows: res.data });
-        setCsvPreviewSource("csv");
         setImportError(null);
       },
       error: (err) => setImportError("Could not parse CSV: " + err.message),
@@ -1078,50 +1076,39 @@ function App() {
     }
   }
 
-  async function syncGoogleSheet() {
-    if (!googleStatus.connected) return;
-    setGoogleFetching(true);
-    setGoogleError(null);
+  // The server already returns structured per-day macros (no column mapping
+  // needed — that was only ever a CSV/Sheets concern), so this just triggers
+  // the fetch+merge server-side and applies the days it changed to local state.
+  async function syncMacrosFirst() {
+    if (!macrosfirstStatus.connected) return;
+    setMacrosfirstFetching(true);
+    setMacrosfirstError(null);
     try {
-      const res = await fetch("/api/google/sheet");
+      const res = await fetch("/api/macrosfirst/sync", { method: "POST" });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `Google Sheets request failed (${res.status}).`);
-      if (!data.fields.length) throw new Error("Sheet appears empty — check google_sheet_id and google_sheet_range in config.json.");
-
-      // If the sheet's columns still match what was mapped last time, reuse
-      // that mapping and import right away — no need to make the user click
-      // through "Map columns" -> "Import Rows" again for a layout that hasn't
-      // changed. Only fall back to the manual mapping step if there's no
-      // cached mapping yet, or the sheet's columns have shifted since.
-      const cachedMap = await storageGet("google-sheet-colmap", null);
-      const cachedMapUsable = cachedMap && cachedMap.date && cachedMap.calories
-        && [cachedMap.date, cachedMap.calories, cachedMap.protein, cachedMap.carbs, cachedMap.fat]
-          .every((f) => !f || data.fields.includes(f));
-
-      if (cachedMapUsable) {
-        setColMap(cachedMap);
-        importMappedCSV({ fields: data.fields, rows: data.rows }, cachedMap, "sheet");
-      } else {
-        setColMap(guessColumnMapping(data.fields));
-        setCsvPreview({ fields: data.fields, rows: data.rows });
-        setCsvPreviewSource("sheet");
-      }
+      if (!res.ok) throw new Error(data.error || `MacrosFirst sync failed (${res.status}).`);
+      setNutrition((prev) => {
+        const next = { ...prev };
+        for (const [key, macros] of Object.entries(data.days)) {
+          next[key] = { ...normalizeNutritionEntry(next[key]), macrosfirst: macros };
+        }
+        return next;
+      });
+      const now = new Date().toISOString();
+      setMacrosfirstLastAutoSync(now);
+      storageSet("macrosfirst-last-auto-sync", now);
     } catch (e) {
-      setGoogleError(e.message || "Could not reach the local server's Google Sheets proxy.");
+      setMacrosfirstError(e.message || "Could not reach the local server's MacrosFirst sync.");
     } finally {
-      setGoogleFetching(false);
+      setMacrosfirstFetching(false);
     }
   }
 
-  // Takes explicit preview/map/source rather than always reading state, so
-  // syncGoogleSheet's cached-mapping fast path can import immediately with
-  // freshly-fetched data instead of waiting a render cycle for state to catch up.
-  //
   // Sends the parsed rows to the server's /api/nutrition/bulk, which merges
   // each date's macrosfirst slot in under the store's lock — the client's own
   // possibly-stale copy of *other* dates is never sent back, unlike a plain
   // storageSet('nutrition-log', wholeObject) would.
-  async function importMappedCSV(preview = csvPreview, map = colMap, source = csvPreviewSource) {
+  async function importMappedCSV(preview = csvPreview, map = colMap) {
     if (!preview || !map.date || !map.calories) {
       setImportError("Map at least the date and calories columns first.");
       return;
@@ -1166,10 +1153,6 @@ function App() {
     }
 
     setCsvPreview(null);
-    setCsvPreviewSource(null);
-    if (source === "sheet") {
-      storageSet("google-sheet-colmap", map); // lets the server's auto-sync reuse this mapping
-    }
     if (importedDates.length === 0) {
       setImportNotice(null);
       setImportError(`0 rows imported — the date column's values couldn't be parsed. Example raw value(s): ${skippedExamples.join(", ")}. Double-check the date column is mapped correctly, or tell me what format that is and I'll add support for it.`);
@@ -1666,8 +1649,7 @@ function App() {
 
       <div style={{ padding: "20px clamp(12px, 4vw, 28px)", maxWidth: 1400, margin: "0 auto" }}>
         {tab === "setup" && (
-          <SetupTab profile={profile} setProfile={setProfile} bmr={bmr} onFetch={pullAll}
-            fetching={fetching || stravaFetching} fetchError={fetchError} rangeDays={rangeDays} setRangeDays={setRangeDays}
+          <SetupTab profile={profile} setProfile={setProfile} bmr={bmr}
             lastFetched={lastFetched} stravaStatus={stravaStatus} stravaError={stravaError}
             stravaLastFetched={stravaLastFetched} stravaSyncedCount={stravaData.syncedDates.length}
             intervalsStatus={intervalsStatus} intervalsSyncedCount={intervalsData.syncedDates.length}
@@ -1678,8 +1660,10 @@ function App() {
           <ImportTab onFile={handleCSVFile} csvPreview={csvPreview} colMap={colMap} setColMap={setColMap}
             onImport={importMappedCSV} nutrition={nutrition} onSaveManualDay={saveManualDay}
             onDeleteDay={deleteNutritionDay} weightLog={weightLog} onSaveWeight={saveManualWeight}
-            onDeleteWeight={deleteWeightDay} googleStatus={googleStatus} googleFetching={googleFetching}
-            googleError={googleError} onSyncGoogleSheet={syncGoogleSheet} googleLastAutoSync={googleLastAutoSync}
+            onDeleteWeight={deleteWeightDay} macrosfirstStatus={macrosfirstStatus} macrosfirstFetching={macrosfirstFetching}
+            macrosfirstError={macrosfirstError} onSyncMacrosFirst={syncMacrosFirst} macrosfirstLastAutoSync={macrosfirstLastAutoSync}
+            onFetch={pullAll} fetching={fetching || stravaFetching} fetchError={fetchError}
+            rangeDays={rangeDays} setRangeDays={setRangeDays} lastFetched={lastFetched}
             importError={importError} importNotice={importNotice} units={units} />
         )}
         {tab === "schedule" && (
@@ -1705,7 +1689,7 @@ function Field({ label, children }) {
   return <div><span className="fieldlabel">{label}</span>{children}</div>;
 }
 
-function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, rangeDays, setRangeDays, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
+function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
   const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
   const units = profile.units || "metric";
   const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
@@ -1802,30 +1786,6 @@ function SetupTab({ profile, setProfile, bmr, onFetch, fetching, fetchError, ran
           <div style={{ fontSize: 12.5, color: dim }}>Not configured — add <code>intervals_api_key</code> to <code>config.json</code> and restart the server to enable this.</div>
         )}
         {lastFetched && <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>last synced {new Date(lastFetched).toLocaleString()} · {intervalsSyncedCount} day{intervalsSyncedCount === 1 ? "" : "s"} covered</div>}
-      </div>
-
-      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-          <Field label="Days of history">
-            <select className="inp" style={{ width: 120 }} value={rangeDays} onChange={(e) => setRangeDays(parseInt(e.target.value))}>
-              <option value={14}>14 days</option>
-              <option value={21}>21 days</option>
-              <option value={30}>30 days</option>
-              <option value={60}>60 days</option>
-            </select>
-          </Field>
-          <button className="btn-primary" style={{ marginTop: 18 }} onClick={onFetch} disabled={fetching}>
-            <Icon path={ICONS.refresh} size={13} color={ink} />
-            {fetching ? "Fetching…" : "Pull training data"}
-          </button>
-          {lastFetched && <div style={{ marginTop: 18, fontSize: 11.5, color: dim, fontFamily: mono }}>intervals last synced {new Date(lastFetched).toLocaleString()}</div>}
-        </div>
-        {fetchError && (
-          <div style={{ marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 }}>
-            <Icon path={ICONS.warn} size={15} color={coral} />
-            <span>{fetchError}</span>
-          </div>
-        )}
       </div>
 
       <div className="card" style={{ padding: 22 }}>
@@ -1984,57 +1944,71 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
   );
 }
 
-function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, googleStatus, googleFetching, googleError, onSyncGoogleSheet, googleLastAutoSync, importError, importNotice, units }) {
+function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync, onFetch, fetching, fetchError, rangeDays, setRangeDays, lastFetched, importError, importNotice, units }) {
   const [dragOver, setDragOver] = useState(false);
   const dayCount = Object.keys(nutrition).length;
   const weightCount = Object.keys(weightLog).length;
   return (
     <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+          <Field label="Days of history">
+            <select className="inp" style={{ width: 120 }} value={rangeDays} onChange={(e) => setRangeDays(parseInt(e.target.value))}>
+              <option value={14}>14 days</option>
+              <option value={21}>21 days</option>
+              <option value={30}>30 days</option>
+              <option value={60}>60 days</option>
+            </select>
+          </Field>
+          <button className="btn-primary" style={{ marginTop: 18 }} onClick={onFetch} disabled={fetching}>
+            <Icon path={ICONS.refresh} size={13} color={ink} />
+            {fetching ? "Fetching…" : "Pull training data"}
+          </button>
+          {lastFetched && <div style={{ marginTop: 18, fontSize: 11.5, color: dim, fontFamily: mono }}>intervals last synced {new Date(lastFetched).toLocaleString()}</div>}
+        </div>
+        {fetchError && (
+          <div style={{ marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 }}>
+            <Icon path={ICONS.warn} size={15} color={coral} />
+            <span>{fetchError}</span>
+          </div>
+        )}
+      </div>
+
       <ManualEntryCard nutrition={nutrition} onSave={onSaveManualDay} />
       <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} units={units} />
 
       <div className="card" style={{ padding: 22 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.upload} size={16} color={cyan} /> MacrosFirst via Google Sheets
+          <Icon path={ICONS.upload} size={16} color={cyan} /> MacrosFirst API
         </div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
-          MacrosFirst's own API is partner-gated, but its Premium Google Sheets Importer already
-          writes your daily log to a Sheet you own — this connects to that Sheet directly, through
-          <code> server.py</code>, the same pattern as Strava. See <code>config.example.json</code> for setup.
+          Pulls your daily log directly from MacrosFirst's personal API, through
+          <code> server.py</code>. See <code>config.example.json</code> for setup.
         </div>
-        {!googleStatus.checked ? (
+        {!macrosfirstStatus.checked ? (
           <div style={{ fontSize: 12.5, color: dim }}>Checking connection…</div>
-        ) : googleStatus.unreachable ? (
+        ) : macrosfirstStatus.unreachable ? (
           <div style={{ fontSize: 12.5, color: coral }}>Can't reach the local server. Make sure you're running this page via <code>python3 server.py</code>, not a plain file server.</div>
-        ) : googleStatus.configError ? (
-          <div style={{ fontSize: 12.5, color: coral }}>Not configured — add <code>google_client_id</code>, <code>google_client_secret</code>, and <code>google_sheet_id</code> to <code>config.json</code> and restart the server.</div>
-        ) : googleStatus.connected ? (
+        ) : macrosfirstStatus.configError ? (
+          <div style={{ fontSize: 12.5, color: coral }}>Not configured — add <code>macrosfirst_api_token</code> to <code>config.json</code> and restart the server.</div>
+        ) : (
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
                 <Icon path={ICONS.check} size={15} color={mint} /><span>Connected</span>
               </div>
-              <button className="btn-primary" onClick={onSyncGoogleSheet} disabled={googleFetching}>
-                <Icon path={ICONS.refresh} size={13} color={ink} /> {googleFetching ? "Syncing…" : "Sync from Google Sheet"}
+              <button className="btn-primary" onClick={onSyncMacrosFirst} disabled={macrosfirstFetching}>
+                <Icon path={ICONS.refresh} size={13} color={ink} /> {macrosfirstFetching ? "Syncing…" : "Sync now"}
               </button>
             </div>
             <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>
-              {googleLastAutoSync
-                ? `Last automatic sync: ${new Date(googleLastAutoSync).toLocaleString()}`
-                : "No automatic sync yet — runs daily once you've imported at least once (set google_sync_time in config.json, default 04:00)."}
+              {macrosfirstLastAutoSync
+                ? `Last automatic sync: ${new Date(macrosfirstLastAutoSync).toLocaleString()}`
+                : "No automatic sync yet — runs daily (set macrosfirst_sync_time in config.json, default 04:00), or click \"Sync now\"."}
             </div>
           </div>
-        ) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? (
-          <a className="btn-primary" href="/google/login" style={{ textDecoration: "none", width: "fit-content", display: "inline-flex" }}>
-            <Icon path={ICONS.link} size={13} color={ink} /> Connect Google Sheets
-          </a>
-        ) : (
-          <div style={{ fontSize: 12.5, color: dim, lineHeight: 1.5 }}>
-            Connect from <code>http://localhost:{window.location.port}/</code> on the computer running <code>server.py</code> — Google's OAuth callback only works there.
-            Every device on this network shares that connection automatically once it's made.
-          </div>
         )}
-        {googleError && <Banner kind="error">{googleError}</Banner>}
+        {macrosfirstError && <Banner kind="error">{macrosfirstError}</Banner>}
       </div>
 
       <div className="card" style={{ padding: 22 }}>
@@ -2126,7 +2100,7 @@ function ManualEntryCard({ nutrition, onSave }) {
   // responsiveness, then reconciles against a fresh fetch — this app is
   // used from multiple devices against the same server-side log, so the
   // in-memory copy here can be behind whatever another device (or the
-  // nightly Google auto-sync) has already written for this date.
+  // nightly MacrosFirst auto-sync) has already written for this date.
   useEffect(() => {
     dateRef.current = date;
     const applyPrefill = (source) => {
@@ -2239,7 +2213,7 @@ function NutritionLogTable({ nutrition, onSave, onDelete }) {
     setErrorMsg(null);
     const eff = effectiveNutritionEntry(nutrition[date]);
     setDraft({ protein: String(eff?.protein ?? ""), carbs: String(eff?.carbs ?? ""), fat: String(eff?.fat ?? "") });
-    // Another device (or the nightly Google auto-sync) may have changed this
+    // Another device (or the nightly MacrosFirst auto-sync) may have changed this
     // day since this table's props were loaded — refresh before editing so a
     // stale prefill can't get submitted back as an "intentional" edit.
     storageGet("nutrition-log", null).then((fresh) => {

@@ -7,4 +7,4 @@ COPY . .
 
 EXPOSE 8081 8082
 
-CMD ["python3", "server.py"]
+CMD ["python3", "src/python/server.py"]

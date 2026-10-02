@@ -12,7 +12,7 @@ whatever structures were still open and parse the result), and writes that
 out as a separate file for you to review — it never touches your original.
 
 Usage:
-    python3 repair_store.py app_store.json
+    python3 src/python/repair_store.py secrets/app_store.json
     (or point it at the .corrupt-<timestamp> backup the fixed server.py
     creates automatically the first time it encounters the corrupted file)
 
@@ -58,7 +58,7 @@ def attempt_recovery(text):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 repair_store.py <corrupted-file>")
+        print("Usage: python3 src/python/repair_store.py <corrupted-file>")
         sys.exit(1)
     path = sys.argv[1]
     with open(path, "r") as f:

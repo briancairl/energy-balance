@@ -11,4 +11,15 @@ services:
     # src/js/app-source.jsx or just running the server.
     volumes:
       - .:/app
+      # Lets `tailscale cert`/`tailscale status` (run from inside the
+      # container — see Dockerfile) reach the HOST's already-authenticated
+      # tailscaled over its control socket, instead of the container needing
+      # its own tailnet login. Without this, tls_enabled silently fails
+      # inside Docker (no tailscale CLI, no daemon to talk to) and the server
+      # falls back to HTTP-only — which is why phones with "always use secure
+      # connections" couldn't log in once this moved into Docker. Linux
+      # Docker host only (Tailscale doesn't expose this socket path the same
+      # way on Windows/Mac Docker Desktop) — remove this line if tls_enabled
+      # is false in config.json or the host has no tailscaled running.
+      - /var/run/tailscale:/var/run/tailscale
     restart: unless-stopped

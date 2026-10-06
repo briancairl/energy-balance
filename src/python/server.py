@@ -387,14 +387,21 @@ MACROSFIRST_NUTRIENT_KEYS = {"calories": "208", "protein": "203", "carbs": "205"
 
 
 def macrosfirst_day_macros(day):
+    """Returns None when the day has no nutrient data at all (e.g. a future
+    date that hasn't been logged yet), so callers can omit it rather than
+    writing a false all-zero entry that the chart would then plot as a real
+    (and wrong) intake value."""
     nutrients = day.get("nutrients") or {}
     result = {}
+    has_data = False
     for field, nutrient_key in MACROSFIRST_NUTRIENT_KEYS.items():
         value = nutrients.get(nutrient_key)
         if value is None:
             value = day.get(field)  # fall back to the deprecated top-level field
+        if value is not None:
+            has_data = True
         result[field] = value or 0
-    return result
+    return result if has_data else None
 
 
 def fetch_macrosfirst_days(token, from_date, to_date):
@@ -440,6 +447,7 @@ def sync_macrosfirst(mcfg, days_back=MACROSFIRST_SYNC_LOOKBACK_DAYS):
     from_date = time.strftime("%Y-%m-%d", time.localtime(time.time() - days_back * 86400))
     days = fetch_macrosfirst_days(mcfg["token"], from_date, today)  # network call — kept outside the lock below
     updates = {day["day"]: macrosfirst_day_macros(day) for day in days}
+    updates = {date_key: macros for date_key, macros in updates.items() if macros is not None}  # skip days with no logged data (e.g. not-yet-happened)
 
     # Only this part touches the shared file, and it's a fast in-memory merge —
     # re-reads nutrition-log fresh under the lock so a concurrent write to some

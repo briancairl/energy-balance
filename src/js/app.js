@@ -520,6 +520,21 @@
     if (profile.goal === "lose") return { sign: -1, ratePct: parseFloat(profile.loseRatePct) || GOAL_DEFAULTS.lose.ratePct, label: "Losing" };
     return { sign: 0, ratePct: 0, label: "Maintaining" };
   }
+  function resolveGoalSettingsForDate(profile, dateKey) {
+    const history = profile.goalHistory;
+    const flat = { goal: profile.goal, buildRatePct: profile.buildRatePct, loseRatePct: profile.loseRatePct };
+    if (!Array.isArray(history) || history.length === 0) return flat;
+    let effective = null;
+    let earliest = null;
+    for (const entry of history) {
+      if (!earliest || entry.date < earliest.date) earliest = entry;
+      if (entry.date <= dateKey && (!effective || entry.date > effective.date)) effective = entry;
+    }
+    return effective || earliest || flat;
+  }
+  function getGoalParamsForDate(profile, dateKey) {
+    return getGoalParams(resolveGoalSettingsForDate(profile, dateKey));
+  }
   function computeTrendCorrection(weightLog, goalSign, ratePct) {
     const entries = Object.entries(weightLog).filter(([d]) => (/* @__PURE__ */ new Date() - new Date(d)) / 864e5 <= 21).sort(([a], [b]) => a < b ? -1 : 1);
     if (entries.length < 8) return { insufficient: true, n: entries.length };
@@ -653,6 +668,7 @@
       goal: "maintain",
       buildRatePct: GOAL_DEFAULTS.build.ratePct,
       loseRatePct: GOAL_DEFAULTS.lose.ratePct,
+      goalHistory: [],
       targetWeightKg: "",
       trendCalibration: true,
       proteinGPerKg: 1,
@@ -999,7 +1015,7 @@
       [schedule, stravaData, intervalsData, matchOverrides]
     );
     const dailyRows = useMemo(() => {
-      var _a, _b, _c, _d, _e, _f, _g, _h;
+      var _a, _b, _c, _d, _e, _f, _g, _h, _i;
       if (!bmr) return [];
       const wellByDate = {};
       for (const w of intervalsData.wellness) {
@@ -1025,7 +1041,7 @@
       let carryRepaymentKcal = 0;
       for (let i = rangeDays - 1; i >= -FORWARD_DAYS; i--) {
         const d = daysAgo(i);
-        const key = toISODate(d);
+        const key = toLocalISODate(d);
         const stravaActs = stravaByDate[key] || [];
         const intervalsActs = actByDate[key] || [];
         const stravaSynced = stravaSyncedSet.has(key);
@@ -1080,7 +1096,8 @@
         }
         const durationMin = durationSec / 60;
         const avgIF = durationSec > 0 ? ifWeightedSum / durationSec : 0.5;
-        const bmrWeight = profile.goal === "maintain" ? parseFloat(profile.weightKg) || null : weightForDay;
+        const goalParamsForDay = getGoalParamsForDate(profile, key);
+        const bmrWeight = goalParamsForDay.sign === 0 ? parseFloat(profile.weightKg) || null : weightForDay;
         const dayBmr = bmrWeight ? calcBMR(profile.sex, bmrWeight, parseFloat(profile.heightCm), parseFloat(profile.age)) : bmr;
         const w = wellByDate[key];
         const ctl = (_b = w == null ? void 0 : w.ctl) != null ? _b : null;
@@ -1092,11 +1109,11 @@
         const nutritionEntry = effectiveNutritionEntry(nutrition[key]);
         const nutritionSource = nutritionEntry ? normalizeNutritionEntry(nutrition[key]).macrosfirst ? "macrosfirst" : "manual" : null;
         const intake = (_d = nutritionEntry == null ? void 0 : nutritionEntry.calories) != null ? _d : null;
-        const goalAdjustmentKcal = weightForDay ? goalParams.sign * (goalParams.ratePct / 100) * weightForDay * KCAL_PER_KG_TISSUE / 7 : 0;
+        const goalAdjustmentKcal = weightForDay ? goalParamsForDay.sign * (goalParamsForDay.ratePct / 100) * weightForDay * KCAL_PER_KG_TISSUE / 7 : 0;
         const calibrationKcal = profile.trendCalibration && trendCorrection && !trendCorrection.insufficient ? trendCorrection.correctionKcal : 0;
         const baseTarget = demand + goalAdjustmentKcal + calibrationKcal;
         const fuelTier = classifyTrainingTier(durationMin);
-        const tomorrowKey = toISODate(daysAgo(i - 1));
+        const tomorrowKey = toLocalISODate(daysAgo(i - 1));
         const tomorrowSessions = getScheduledSessionsForDate(schedule, tomorrowKey);
         const preloadSession = tomorrowSessions.filter(isPreloadWorthy).sort((a, b) => b.durationMin - a.durationMin)[0];
         const preloadTier = preloadSession ? classifyTrainingTier(preloadSession.durationMin) : null;
@@ -1115,7 +1132,6 @@
         const borrowedKcal = raceLoading ? extraCarbKcal : extraCarbKcal * (isNaN(borrowRatio) ? 1 : borrowRatio);
         const repaidKcal = carryRepaymentKcal;
         const carbDrivenTarget = baseTarget - repaidKcal + borrowedKcal;
-        carryRepaymentKcal = raceLoading ? 0 : borrowedKcal;
         const proteinWeightKg = parseFloat(profile.targetWeightKg) || weightForDay;
         const proteinTargetG = proteinWeightKg ? proteinWeightKg * (parseFloat(profile.proteinGPerKg) || 1) : null;
         const fatFloorG = preloading || raceLoading ? Math.max(carbDrivenTarget * 0.2 / 9, parseFloat(profile.minFatG) || 100) : carbDrivenTarget * 0.2 / 9;
@@ -1123,11 +1139,19 @@
         const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;
         const macroFloorKcal = (carbTargetG || 0) * 4 + (proteinTargetG || 0) * 4 + (fatTargetG || 0) * 9;
         const target = weightForDay ? Math.max(carbDrivenTarget, macroFloorKcal) : carbDrivenTarget;
-        const gap = intake !== null ? intake - target : null;
+        const isFutureOrToday = key >= toLocalISODate(/* @__PURE__ */ new Date());
+        const floorExcessKcal = preloading && !raceLoading && target > carbDrivenTarget ? target - carbDrivenTarget : 0;
+        let carbRepaymentKcal = raceLoading ? 0 : borrowedKcal;
+        if (!raceLoading && preloading && !isFutureOrToday && carbTargetG) {
+          const actualCarbsG = (_e = nutritionEntry == null ? void 0 : nutritionEntry.carbs) != null ? _e : 0;
+          const attainment = Math.min(1, Math.max(0, actualCarbsG / carbTargetG));
+          carbRepaymentKcal *= attainment;
+        }
+        carryRepaymentKcal = carbRepaymentKcal + (raceLoading ? 0 : floorExcessKcal);
+        const gap = intake !== null && !isFutureOrToday ? intake - target : null;
         const trainingMissing = !stravaSynced && intervalsActs.length === 0 && source !== "planned";
         const nutritionMissing = intake === null;
         const weightMissing = weightLog[key] === void 0;
-        const isFutureOrToday = key >= toISODate(/* @__PURE__ */ new Date());
         days.push({
           date: key,
           label: d.toLocaleDateString(void 0, { month: "short", day: "numeric" }),
@@ -1142,10 +1166,10 @@
           gap,
           tsb,
           source,
-          weight: (_e = weightLog[key]) != null ? _e : null,
-          protein: (_f = nutritionEntry == null ? void 0 : nutritionEntry.protein) != null ? _f : null,
-          carbs: (_g = nutritionEntry == null ? void 0 : nutritionEntry.carbs) != null ? _g : null,
-          fat: (_h = nutritionEntry == null ? void 0 : nutritionEntry.fat) != null ? _h : null,
+          weight: (_f = weightLog[key]) != null ? _f : null,
+          protein: (_g = nutritionEntry == null ? void 0 : nutritionEntry.protein) != null ? _g : null,
+          carbs: (_h = nutritionEntry == null ? void 0 : nutritionEntry.carbs) != null ? _h : null,
+          fat: (_i = nutritionEntry == null ? void 0 : nutritionEntry.fat) != null ? _i : null,
           nutritionSource,
           activityCount: stravaActs.length || intervalsActs.length || scheduledSessions.length,
           trainingMissing: trainingMissing && !isFutureOrToday,
@@ -1171,15 +1195,16 @@
     }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates]);
     const summary = useMemo(() => {
       const withIntake = dailyRows.filter((d) => d.intake !== null);
+      const withGap = dailyRows.filter((d) => d.gap !== null);
       const trainingMissingDays = dailyRows.filter((d) => d.trainingMissing).length;
       const nutritionMissingDays = dailyRows.filter((d) => d.nutritionMissing).length;
       if (!withIntake.length) return { trainingMissingDays, nutritionMissingDays, noIntake: true };
-      const avgGap = withIntake.reduce((s, d) => s + d.gap, 0) / withIntake.length;
+      const avgGap = withGap.length ? withGap.reduce((s, d) => s + d.gap, 0) / withGap.length : null;
       const avgDemand = dailyRows.reduce((s, d) => s + d.demand, 0) / dailyRows.length;
       const avgTarget = dailyRows.reduce((s, d) => s + d.target, 0) / dailyRows.length;
       const avgIntake = withIntake.reduce((s, d) => s + d.intake, 0) / withIntake.length;
-      const deficitDays = withIntake.filter((d) => d.gap < -300).length;
-      return { avgGap, avgDemand, avgTarget, avgIntake, deficitDays, trackedDays: withIntake.length, trainingMissingDays, nutritionMissingDays };
+      const deficitDays = withGap.filter((d) => d.gap < -300).length;
+      return { avgGap, avgDemand, avgTarget, avgIntake, deficitDays, trackedDays: withGap.length, trainingMissingDays, nutritionMissingDays };
     }, [dailyRows]);
     const fuelingByTier = useMemo(() => {
       const groups = {};
@@ -1474,8 +1499,19 @@
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.info, size: 14, color: dim }), /* @__PURE__ */ React.createElement("div", null, "BMR uses the Mifflin-St Jeor equation. The training and recovery adjustments beyond that are heuristics commonly used in endurance-coaching practice, not a single peer-reviewed formula \u2014 tune the sliders above to match how your coach or experience calibrates it.")));
   }
+  function recordGoalHistory(p, overrides) {
+    const today = toLocalISODate(/* @__PURE__ */ new Date());
+    const history = Array.isArray(p.goalHistory) ? [...p.goalHistory] : [];
+    if (history.length === 0) {
+      history.push({ date: "0000-01-01", goal: p.goal, buildRatePct: p.buildRatePct, loseRatePct: p.loseRatePct });
+    }
+    const next = { goal: p.goal, buildRatePct: p.buildRatePct, loseRatePct: p.loseRatePct, ...overrides };
+    const filtered = history.filter((h) => h.date !== today);
+    filtered.push({ date: today, goal: next.goal, buildRatePct: next.buildRatePct, loseRatePct: next.loseRatePct });
+    return { ...p, ...overrides, goalHistory: filtered };
+  }
   function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
-    const setGoal = (goal) => setProfile((p) => ({ ...p, goal }));
+    const setGoal = (goal) => setProfile((p) => recordGoalHistory(p, { goal }));
     const range = profile.goal === "build" ? GOAL_DEFAULTS.build : profile.goal === "lose" ? GOAL_DEFAULTS.lose : null;
     const rateKey = profile.goal === "build" ? "buildRatePct" : "loseRatePct";
     const units = profile.units || "metric";
@@ -1506,7 +1542,7 @@
         max: range.max,
         step: "0.05",
         value: profile[rateKey],
-        onChange: (e) => setProfile((p) => ({ ...p, [rateKey]: e.target.value })),
+        onChange: (e) => setProfile((p) => recordGoalHistory(p, { [rateKey]: e.target.value })),
         style: { width: "100%" }
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Safe range ", range.min, "\u2013", range.max, "%/week. Faster ", profile.goal === "build" ? "gains skew toward fat" : "loss risks muscle and performance", ".")), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.trendCalibration, onChange: (e) => setProfile((p) => ({ ...p, trendCalibration: e.target.checked })) }), "Auto-calibrate the target from your logged weight trend"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 6, marginLeft: 24, lineHeight: 1.5 } }, "Compares your actual weight trend (needs ~10+ days logged) against the ", goalParams.label.toLowerCase(), " rate above, and nudges the daily target toward what your real data says you need \u2014 rather than trusting the formula alone."), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries logged so far, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`));
@@ -2445,8 +2481,19 @@
     return /* @__PURE__ */ React.createElement("div", { style: { marginTop: 16, paddingTop: 16, borderTop: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10, marginBottom: fuelingByTier.length ? 18 : 0 } }, FUEL_TIERS.map((t) => /* @__PURE__ */ React.createElement("div", { key: t.tier, style: { background: panel2, border: `1px solid ${line}`, borderRadius: 5, padding: "10px 12px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginBottom: 4 } }, t.label), /* @__PURE__ */ React.createElement("div", { style: { fontFamily: mono, fontSize: 12.5 } }, t.carbLo, "\u2013", t.carbHi, " g/kg carb")))), fuelingByTier.length > 0 && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, fontWeight: 600, marginBottom: 10 } }, "Your averages by tier, this window"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8 } }, fuelingByTier.map((g) => /* @__PURE__ */ React.createElement("div", { key: g.tier, style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 12, fontSize: 12.5 } }, /* @__PURE__ */ React.createElement("div", { style: { width: 130, color: dim, flexShrink: 0 } }, g.label, " ", /* @__PURE__ */ React.createElement("span", { style: { fontFamily: mono } }, "(", g.n, "d)")), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 100px" } }, "Carb: ", /* @__PURE__ */ React.createElement(MacroCell, { actual: g.avgCarb, target: g.avgCarbTarget }), " g"), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 100px" } }, "Protein: ", /* @__PURE__ */ React.createElement(MacroCell, { actual: g.avgProtein, target: g.avgProteinTarget }), " g"), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 100px" } }, "Fat: ", /* @__PURE__ */ React.createElement(MacroCell, { actual: g.avgFat, target: g.avgFatTarget }), " g"))))));
   }
   function CustomTooltip({ active, payload, label }) {
+    var _a;
     if (!active || !payload || !payload.length) return null;
-    return /* @__PURE__ */ React.createElement("div", { style: { background: panel2, border: `1px solid ${line}`, borderRadius: 4, padding: "10px 12px", fontFamily: mono, fontSize: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { color: dim, marginBottom: 6 } }, label), payload.map((p, i) => /* @__PURE__ */ React.createElement("div", { key: i, style: { color: p.color, display: "flex", justifyContent: "space-between", gap: 16 } }, /* @__PURE__ */ React.createElement("span", null, p.name), /* @__PURE__ */ React.createElement("span", null, fmt(p.value)))));
+    const row = (_a = payload[0]) == null ? void 0 : _a.payload;
+    const hasGapSeries = payload.some((p) => p.dataKey === "gap");
+    return /* @__PURE__ */ React.createElement("div", { style: { background: panel2, border: `1px solid ${line}`, borderRadius: 4, padding: "10px 12px", fontFamily: mono, fontSize: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { color: dim, marginBottom: 6 } }, label), payload.map((p, i) => /* @__PURE__ */ React.createElement("div", { key: i, style: { color: p.color, display: "flex", justifyContent: "space-between", gap: 16 } }, /* @__PURE__ */ React.createElement("span", null, p.name), /* @__PURE__ */ React.createElement("span", null, fmt(p.value)))), !hasGapSeries && row && row.gap !== null && row.gap !== void 0 && /* @__PURE__ */ React.createElement("div", { style: {
+      color: row.gap < -200 ? coral : row.gap > 200 ? amber : mint,
+      display: "flex",
+      justifyContent: "space-between",
+      gap: 16,
+      marginTop: 4,
+      paddingTop: 4,
+      borderTop: `1px solid ${line}`
+    } }, /* @__PURE__ */ React.createElement("span", null, "Gap (kcal)"), /* @__PURE__ */ React.createElement("span", null, row.gap >= 0 ? "+" : "", fmt(row.gap))));
   }
   function StatCard({ label, value, color }) {
     return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "16px 18px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em", color: dim, fontWeight: 600, marginBottom: 8 } }, label), /* @__PURE__ */ React.createElement("div", { style: { fontFamily: mono, fontSize: 22, fontWeight: 600, color } }, value));

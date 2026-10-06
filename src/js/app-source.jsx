@@ -702,6 +702,36 @@ function getGoalParams(profile) {
   return { sign: 0, ratePct: 0, label: "Maintaining" };
 }
 
+// Goal/rate settings are recorded with the local date they took effect
+// (see recordGoalHistory, in GoalCard) specifically so switching
+// build/maintain/lose today doesn't retroactively re-price every already-
+// logged past day under the new setting — a day keeps whatever goal was
+// active when it happened. Profiles with no history yet (nobody has ever
+// switched) fall back to the current flat profile fields, so existing
+// users see no behavior change until they actually switch for the first time.
+// Once ANY history exists, a date older than every recorded entry must NOT
+// fall back to the flat profile fields either — those are today's current
+// (possibly just-changed) values, and falling back to them is exactly the
+// retroactive-repricing bug this whole mechanism exists to prevent. Such a
+// date instead inherits the oldest known entry (recordGoalHistory seeds one
+// dated at the dawn of time on the very first change, precisely so this
+// case is covered).
+function resolveGoalSettingsForDate(profile, dateKey) {
+  const history = profile.goalHistory;
+  const flat = { goal: profile.goal, buildRatePct: profile.buildRatePct, loseRatePct: profile.loseRatePct };
+  if (!Array.isArray(history) || history.length === 0) return flat;
+  let effective = null;
+  let earliest = null;
+  for (const entry of history) {
+    if (!earliest || entry.date < earliest.date) earliest = entry;
+    if (entry.date <= dateKey && (!effective || entry.date > effective.date)) effective = entry;
+  }
+  return effective || earliest || flat;
+}
+function getGoalParamsForDate(profile, dateKey) {
+  return getGoalParams(resolveGoalSettingsForDate(profile, dateKey));
+}
+
 // Compares the ACTUAL weight trend from logged entries against the goal's
 // target rate, and returns a daily kcal correction to bring future targets
 // back toward that rate — the same feedback-loop idea trend-based trackers
@@ -864,6 +894,7 @@ function App() {
     sex: "male", weightKg: "", heightCm: "", age: "",
     neatMode: "multiplier", neatFactor: 1.15, neatOffset: 400, epocSensitivity: 1.0, fatigueBuffer: true,
     goal: "maintain", buildRatePct: GOAL_DEFAULTS.build.ratePct, loseRatePct: GOAL_DEFAULTS.lose.ratePct,
+    goalHistory: [],
     targetWeightKg: "",
     trendCalibration: true,
     proteinGPerKg: 1.0,
@@ -1320,7 +1351,7 @@ function App() {
     let carryRepaymentKcal = 0; // debt owed to the CURRENT day by the previous day's pre-load borrowing
     for (let i = rangeDays - 1; i >= -FORWARD_DAYS; i--) {
       const d = daysAgo(i);
-      const key = toISODate(d);
+      const key = toLocalISODate(d);
       const stravaActs = stravaByDate[key] || [];
       const intervalsActs = actByDate[key] || [];
       const stravaSynced = stravaSyncedSet.has(key);
@@ -1391,11 +1422,16 @@ function App() {
       const durationMin = durationSec / 60;
       const avgIF = durationSec > 0 ? ifWeightedSum / durationSec : 0.5;
 
+      // Whatever goal was actually in effect on this calendar day — not
+      // today's current setting — drives this day's target, so switching
+      // build/maintain/lose today never reprices a day that already happened.
+      const goalParamsForDay = getGoalParamsForDate(profile, key);
+
       // Maintenance pins BMR to the athlete's profile weight rather than
       // that day's logged weight — day-to-day water/glycogen swings
       // shouldn't move the "maintain" target. Build/lose intentionally
       // keep tracking the logged weight, since their rate is a % of it.
-      const bmrWeight = profile.goal === "maintain" ? (parseFloat(profile.weightKg) || null) : weightForDay;
+      const bmrWeight = goalParamsForDay.sign === 0 ? (parseFloat(profile.weightKg) || null) : weightForDay;
       const dayBmr = bmrWeight
         ? calcBMR(profile.sex, bmrWeight, parseFloat(profile.heightCm), parseFloat(profile.age))
         : bmr;
@@ -1417,7 +1453,7 @@ function App() {
       // chosen weight-gain/loss rate, plus a trend-calibration correction if
       // the observed weight trend is drifting off that rate. For "maintain"
       // (sign 0, no correction data yet) this reduces to target === demand.
-      const goalAdjustmentKcal = weightForDay ? goalParams.sign * (goalParams.ratePct / 100) * weightForDay * KCAL_PER_KG_TISSUE / 7 : 0;
+      const goalAdjustmentKcal = weightForDay ? goalParamsForDay.sign * (goalParamsForDay.ratePct / 100) * weightForDay * KCAL_PER_KG_TISSUE / 7 : 0;
       const calibrationKcal = (profile.trendCalibration && trendCorrection && !trendCorrection.insufficient) ? trendCorrection.correctionKcal : 0;
       const baseTarget = demand + goalAdjustmentKcal + calibrationKcal;
 
@@ -1433,7 +1469,7 @@ function App() {
       // the (possibly borrow-adjusted) Target, floored at 20% of Target —
       // sports-nutrition consensus treats fat below ~20% of energy as a risk.
       const fuelTier = classifyTrainingTier(durationMin);
-      const tomorrowKey = toISODate(daysAgo(i - 1));
+      const tomorrowKey = toLocalISODate(daysAgo(i - 1));
       const tomorrowSessions = getScheduledSessionsForDate(schedule, tomorrowKey);
       const preloadSession = tomorrowSessions.filter(isPreloadWorthy).sort((a, b) => b.durationMin - a.durationMin)[0];
       const preloadTier = preloadSession ? classifyTrainingTier(preloadSession.durationMin) : null;
@@ -1466,10 +1502,10 @@ function App() {
       const borrowedKcal = raceLoading ? extraCarbKcal : extraCarbKcal * (isNaN(borrowRatio) ? 1 : borrowRatio);
 
       // Apply today: repay what yesterday borrowed from today, then borrow
-      // today's own share from tomorrow.
+      // today's own share from tomorrow. carryRepaymentKcal itself isn't
+      // finalized until after the fat floor below is known — see there.
       const repaidKcal = carryRepaymentKcal; // capture before we overwrite it below
       const carbDrivenTarget = baseTarget - repaidKcal + borrowedKcal;
-      carryRepaymentKcal = raceLoading ? 0 : borrowedKcal; // tomorrow's iteration will subtract this
 
       // Protein scales off goal weight (where the athlete's headed), not the
       // day's fluctuating logged weight — unlike carbs/fat, which track
@@ -1496,7 +1532,43 @@ function App() {
       const macroFloorKcal = (carbTargetG || 0) * 4 + (proteinTargetG || 0) * 4 + (fatTargetG || 0) * 9;
       const target = weightForDay ? Math.max(carbDrivenTarget, macroFloorKcal) : carbDrivenTarget;
 
-      const gap = intake !== null ? intake - target : null;
+      const isFutureOrToday = key >= toLocalISODate(new Date());
+
+      // What tomorrow actually owes. Two adjustments on top of the plain
+      // carb-bump borrow:
+      //  - The fat floor above can push `target` above carbDrivenTarget by
+      //    the same "extra kcal pulled forward" mechanism as the carb bump
+      //    (it just fills fat instead of carbs) — left out of borrowedKcal
+      //    entirely, that excess would never get repaid and a preload day
+      //    plus its fat floor could jointly push a 2-day total past the
+      //    caloric limit with nothing clawing it back. This only applies on
+      //    preloading days themselves: the ordinary 20%-of-target fat floor
+      //    binds on plenty of regular (non-preload) training days too, and
+      //    that's normal fat-flooring with nothing borrowed from anywhere —
+      //    treating it as debt there would manufacture a false repayment on
+      //    every such day and cascade through the whole date range. Race
+      //    loading is a deliberate, un-repaid surplus by design (see note
+      //    above), so it's exempt from this too.
+      //  - Once a preload day is over, only repay tomorrow for the carbs
+      //    actually eaten: targeted-but-never-logged preload carbs were
+      //    never really borrowed, so debiting tomorrow for them would
+      //    manufacture a deficit out of calories nobody consumed — give that
+      //    unused slice back instead of carrying it forward.
+      const floorExcessKcal = (preloading && !raceLoading && target > carbDrivenTarget) ? target - carbDrivenTarget : 0;
+      let carbRepaymentKcal = raceLoading ? 0 : borrowedKcal;
+      if (!raceLoading && preloading && !isFutureOrToday && carbTargetG) {
+        const actualCarbsG = nutritionEntry?.carbs ?? 0;
+        const attainment = Math.min(1, Math.max(0, actualCarbsG / carbTargetG));
+        carbRepaymentKcal *= attainment;
+      }
+      carryRepaymentKcal = carbRepaymentKcal + (raceLoading ? 0 : floorExcessKcal); // tomorrow's iteration will subtract this
+
+      // A day that hasn't happened yet (today included — it isn't over) has
+      // no real gap to report: any logged intake so far is partial, and
+      // comparing it against a full-day target would read as a false
+      // deficit, dragging down averages/off-target-day counts for days that
+      // simply haven't finished.
+      const gap = (intake !== null && !isFutureOrToday) ? intake - target : null;
 
       // A day only counts as "missing training data" if we genuinely don't know
       // (no actual sync, and no plan either) — a confirmed rest day, or a
@@ -1504,7 +1576,6 @@ function App() {
       const trainingMissing = !stravaSynced && intervalsActs.length === 0 && source !== "planned";
       const nutritionMissing = intake === null;
       const weightMissing = weightLog[key] === undefined;
-      const isFutureOrToday = key >= toISODate(new Date());
 
       days.push({
         date: key,
@@ -1531,15 +1602,21 @@ function App() {
 
   const summary = useMemo(() => {
     const withIntake = dailyRows.filter((d) => d.intake !== null);
+    // Gap is null for a day that hasn't happened yet even when it already
+    // has a (partial) logged intake — e.g. today — so this must be its own
+    // filter rather than reusing withIntake, or a plain `+ d.gap` reduction
+    // would silently add `null` (coerced to 0) while still counting that day
+    // in the denominator, dragging the average toward zero.
+    const withGap = dailyRows.filter((d) => d.gap !== null);
     const trainingMissingDays = dailyRows.filter((d) => d.trainingMissing).length;
     const nutritionMissingDays = dailyRows.filter((d) => d.nutritionMissing).length;
     if (!withIntake.length) return { trainingMissingDays, nutritionMissingDays, noIntake: true };
-    const avgGap = withIntake.reduce((s, d) => s + d.gap, 0) / withIntake.length;
+    const avgGap = withGap.length ? withGap.reduce((s, d) => s + d.gap, 0) / withGap.length : null;
     const avgDemand = dailyRows.reduce((s, d) => s + d.demand, 0) / dailyRows.length;
     const avgTarget = dailyRows.reduce((s, d) => s + d.target, 0) / dailyRows.length;
     const avgIntake = withIntake.reduce((s, d) => s + d.intake, 0) / withIntake.length;
-    const deficitDays = withIntake.filter((d) => d.gap < -300).length;
-    return { avgGap, avgDemand, avgTarget, avgIntake, deficitDays, trackedDays: withIntake.length, trainingMissingDays, nutritionMissingDays };
+    const deficitDays = withGap.filter((d) => d.gap < -300).length;
+    return { avgGap, avgDemand, avgTarget, avgIntake, deficitDays, trackedDays: withGap.length, trainingMissingDays, nutritionMissingDays };
   }, [dailyRows]);
 
   // Groups days by training-load tier and compares actual vs. targeted carb/
@@ -1865,8 +1942,29 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
   );
 }
 
+// Stamps a goal/rate change with the local date it took effect, so dailyRows
+// can look up what was active on any given past day rather than always
+// applying today's current setting retroactively (see
+// resolveGoalSettingsForDate). Repeated edits on the same day just replace
+// that day's entry instead of piling up.
+function recordGoalHistory(p, overrides) {
+  const today = toLocalISODate(new Date());
+  const history = (Array.isArray(p.goalHistory) ? [...p.goalHistory] : []);
+  // On the very first change ever, anchor everything before today to
+  // whatever was in effect up to now (the pre-override flat fields) — with
+  // no anchor, this history would contain only today's new entry, and any
+  // past day would have nothing dated earlier to inherit from.
+  if (history.length === 0) {
+    history.push({ date: "0000-01-01", goal: p.goal, buildRatePct: p.buildRatePct, loseRatePct: p.loseRatePct });
+  }
+  const next = { goal: p.goal, buildRatePct: p.buildRatePct, loseRatePct: p.loseRatePct, ...overrides };
+  const filtered = history.filter((h) => h.date !== today);
+  filtered.push({ date: today, goal: next.goal, buildRatePct: next.buildRatePct, loseRatePct: next.loseRatePct });
+  return { ...p, ...overrides, goalHistory: filtered };
+}
+
 function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
-  const setGoal = (goal) => setProfile((p) => ({ ...p, goal }));
+  const setGoal = (goal) => setProfile((p) => recordGoalHistory(p, { goal }));
   const range = profile.goal === "build" ? GOAL_DEFAULTS.build : profile.goal === "lose" ? GOAL_DEFAULTS.lose : null;
   const rateKey = profile.goal === "build" ? "buildRatePct" : "loseRatePct";
   const units = profile.units || "metric";
@@ -1918,7 +2016,7 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
       {range && (
         <Field label={`${profile.goal === "build" ? "Weight gain" : "Weight loss"} rate — ${profile[rateKey]}%/week`}>
           <input type="range" min={range.min} max={range.max} step="0.05" value={profile[rateKey]}
-            onChange={(e) => setProfile((p) => ({ ...p, [rateKey]: e.target.value }))} style={{ width: "100%" }} />
+            onChange={(e) => setProfile((p) => recordGoalHistory(p, { [rateKey]: e.target.value }))} style={{ width: "100%" }} />
           <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
             Safe range {range.min}–{range.max}%/week. Faster {profile.goal === "build" ? "gains skew toward fat" : "loss risks muscle and performance"}.
           </div>
@@ -3556,6 +3654,13 @@ function FuelingReferencePanel({ fuelingByTier }) {
 
 function CustomTooltip({ active, payload, label }) {
   if (!active || !payload || !payload.length) return null;
+  // The gap chart already plots "gap" as its own Bar (it'll show up in
+  // payload below, no need to repeat it); every other chart just has the
+  // underlying row data riding along via payload[0].payload, so pull Gap
+  // in from there too rather than making every other chart plot it as an
+  // invisible series just to get it into the tooltip.
+  const row = payload[0]?.payload;
+  const hasGapSeries = payload.some((p) => p.dataKey === "gap");
   return (
     <div style={{ background: panel2, border: `1px solid ${line}`, borderRadius: 4, padding: "10px 12px", fontFamily: mono, fontSize: 12 }}>
       <div style={{ color: dim, marginBottom: 6 }}>{label}</div>
@@ -3564,6 +3669,15 @@ function CustomTooltip({ active, payload, label }) {
           <span>{p.name}</span><span>{fmt(p.value)}</span>
         </div>
       ))}
+      {!hasGapSeries && row && row.gap !== null && row.gap !== undefined && (
+        <div style={{
+          color: row.gap < -200 ? coral : row.gap > 200 ? amber : mint,
+          display: "flex", justifyContent: "space-between", gap: 16,
+          marginTop: 4, paddingTop: 4, borderTop: `1px solid ${line}`,
+        }}>
+          <span>Gap (kcal)</span><span>{row.gap >= 0 ? "+" : ""}{fmt(row.gap)}</span>
+        </div>
+      )}
     </div>
   );
 }

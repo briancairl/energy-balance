@@ -687,6 +687,16 @@ function buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrid
 // a precise metabolic constant.
 const KCAL_PER_KG_TISSUE = 7700;
 
+// Cap on outstanding pre-load repayment debt under the "rolloverCapped"
+// debt-handling strategy (profile.preloadDebtStrategy). Without a cap, a
+// macro setup where carbs+protein minimums routinely swallow the repayment
+// (see the "absorb" vs "rolloverCapped" comments below) would let unpaid
+// debt compound night after night with no way to ever actually collect it,
+// crashing Target toward implausibly low numbers. A few hundred kcal is
+// roughly one day's worth of realistic fat-kcal swing — past that, further
+// carrying the debt isn't realistic either, so it's written off instead.
+const ROLLOVER_DEBT_CAP_KCAL = 600;
+
 // Defaults reflect commonly-cited practical guidelines for lifters training
 // 2–3x/week: ~0.25% bodyweight/week for gaining (Helms' "no more than 0.25%/wk
 // for advanced trainees" ceiling, widely used as a lean-bulk default) and
@@ -901,6 +911,7 @@ function App() {
     minFatG: 100,
     maxPreloadCarbGPerKg: 12,
     preloadBorrowRatio: 1.0,
+    preloadDebtStrategy: "absorb",
     units: "metric",
   });
   const units = profile.units || "metric";
@@ -1532,6 +1543,37 @@ function App() {
       const macroFloorKcal = (carbTargetG || 0) * 4 + (proteinTargetG || 0) * 4 + (fatTargetG || 0) * 9;
       const target = weightForDay ? Math.max(carbDrivenTarget, macroFloorKcal) : carbDrivenTarget;
 
+      // ---------- pre-load debt-handling strategy ----------
+      // carbDrivenTarget already has repaidKcal subtracted, but on a macro
+      // setup where carbs + protein minimums alone exceed it, `target` above
+      // just snaps to macroFloorKcal — which has no idea repaidKcal exists —
+      // so the repayment silently has no visible effect. Three ways to
+      // handle that:
+      //   "absorb" (default) — leave it: the unpaid portion of repaidKcal is
+      //     simply written off below. Simple, but on a high-carb/
+      //     high-protein setup the repayment can be invisible most days.
+      //   "flexCarbs" — let THIS (non-preloading) day's own carb target flex
+      //     down toward its tier's low end (never below it) to free up
+      //     enough room for the repayment to actually reduce Target, instead
+      //     of carbs+protein's fixed minimums crowding it out.
+      //   "rolloverCapped" — same as "absorb" here (target still snaps to
+      //     the floor), but the portion the floor swallowed rolls into
+      //     tomorrow's debt instead of vanishing — capped at
+      //     ROLLOVER_DEBT_CAP_KCAL outstanding so it can't compound forever.
+      const debtStrategy = profile.preloadDebtStrategy || "absorb";
+      let carbTargetGDisplay = carbTargetG;
+      let fatTargetGDisplay = fatTargetG;
+      let targetDisplay = target;
+      if (debtStrategy === "flexCarbs" && !preloading && !raceLoading && carbTargetG !== null && target > carbDrivenTarget) {
+        const carbFlexFloorG = weightForDay * fuelTier.carbLo; // this day's own tier low-end — never flex below what its actual training still needs
+        const neededCarbTargetG = (carbDrivenTarget - (proteinTargetG || 0) * 4 - fatFloorG * 9) / 4;
+        carbTargetGDisplay = Math.max(carbFlexFloorG, Math.min(carbTargetG, neededCarbTargetG));
+        const fatRemainderGDisplay = (carbDrivenTarget - carbTargetGDisplay * 4 - (proteinTargetG || 0) * 4) / 9;
+        fatTargetGDisplay = Math.max(fatFloorG, fatRemainderGDisplay);
+        const macroFloorKcalDisplay = carbTargetGDisplay * 4 + (proteinTargetG || 0) * 4 + fatTargetGDisplay * 9;
+        targetDisplay = Math.max(carbDrivenTarget, macroFloorKcalDisplay);
+      }
+
       const isFutureOrToday = key >= toLocalISODate(new Date());
 
       // What tomorrow actually owes. Two adjustments on top of the plain
@@ -1549,26 +1591,48 @@ function App() {
       //    every such day and cascade through the whole date range. Race
       //    loading is a deliberate, un-repaid surplus by design (see note
       //    above), so it's exempt from this too.
-      //  - Once a preload day is over, only repay tomorrow for the carbs
-      //    actually eaten: targeted-but-never-logged preload carbs were
-      //    never really borrowed, so debiting tomorrow for them would
-      //    manufacture a deficit out of calories nobody consumed — give that
-      //    unused slice back instead of carrying it forward.
-      const floorExcessKcal = (preloading && !raceLoading && target > carbDrivenTarget) ? target - carbDrivenTarget : 0;
+      //  - Once a preload day is over, only repay tomorrow for the carbs (or,
+      //    for the fat-floor excess, the fat) actually eaten: targeted-but-
+      //    never-logged preload macros were never really borrowed, so
+      //    debiting tomorrow for them would manufacture a deficit out of
+      //    calories nobody consumed — give that unused slice back instead of
+      //    carrying it forward. Fat gets its own attainment ratio rather than
+      //    reusing the carb one: the two macros are independent, and a day
+      //    that nailed its carb bump but skipped the fat floor (or vice
+      //    versa) must only repay the macro it actually ate.
+      let floorExcessKcal = (preloading && !raceLoading && target > carbDrivenTarget) ? target - carbDrivenTarget : 0;
       let carbRepaymentKcal = raceLoading ? 0 : borrowedKcal;
       if (!raceLoading && preloading && !isFutureOrToday && carbTargetG) {
         const actualCarbsG = nutritionEntry?.carbs ?? 0;
         const attainment = Math.min(1, Math.max(0, actualCarbsG / carbTargetG));
         carbRepaymentKcal *= attainment;
       }
-      carryRepaymentKcal = carbRepaymentKcal + (raceLoading ? 0 : floorExcessKcal); // tomorrow's iteration will subtract this
+      if (!raceLoading && preloading && !isFutureOrToday && fatTargetG) {
+        const actualFatG = nutritionEntry?.fat ?? 0;
+        const fatAttainment = Math.min(1, Math.max(0, actualFatG / fatTargetG));
+        floorExcessKcal *= fatAttainment;
+      }
+      const newDebtToday = carbRepaymentKcal + (raceLoading ? 0 : floorExcessKcal);
+      if (debtStrategy === "rolloverCapped") {
+        // How much of THIS day's own repaidKcal actually moved target vs.
+        // how much the macro floor silently absorbed (comparing against the
+        // hypothetical target if repaidKcal had been 0) — only the
+        // unrealized remainder rolls forward; capped so an unfundable setup
+        // can't compound debt indefinitely (see ROLLOVER_DEBT_CAP_KCAL).
+        const targetWithoutRepay = weightForDay ? Math.max(baseTarget + borrowedKcal, macroFloorKcal) : (baseTarget + borrowedKcal);
+        const realizedRepayment = targetWithoutRepay - target;
+        const unrealizedRepayment = Math.max(0, repaidKcal - realizedRepayment);
+        carryRepaymentKcal = Math.min(newDebtToday + unrealizedRepayment, ROLLOVER_DEBT_CAP_KCAL);
+      } else {
+        carryRepaymentKcal = newDebtToday; // tomorrow's iteration will subtract this
+      }
 
       // A day that hasn't happened yet (today included — it isn't over) has
       // no real gap to report: any logged intake so far is partial, and
       // comparing it against a full-day target would read as a false
       // deficit, dragging down averages/off-target-day counts for days that
       // simply haven't finished.
-      const gap = (intake !== null && !isFutureOrToday) ? intake - target : null;
+      const gap = (intake !== null && !isFutureOrToday) ? intake - targetDisplay : null;
 
       // A day only counts as "missing training data" if we genuinely don't know
       // (no actual sync, and no plan either) — a confirmed rest day, or a
@@ -1580,7 +1644,7 @@ function App() {
       days.push({
         date: key,
         label: d.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
-        bmr: dayBmr, baseline, exerciseKcal, epocKcal, fatigueBuffer, demand, target,
+        bmr: dayBmr, baseline, exerciseKcal, epocKcal, fatigueBuffer, demand, target: targetDisplay,
         intake, gap, tsb, source,
         weight: weightLog[key] ?? null,
         protein: nutritionEntry?.protein ?? null,
@@ -1591,7 +1655,7 @@ function App() {
         trainingMissing: trainingMissing && !isFutureOrToday,
         nutritionMissing: nutritionMissing && !isFutureOrToday,
         weightMissing: weightMissing && !isFutureOrToday,
-        durationMin, fuelTier, carbTargetG, proteinTargetG, fatTargetG, isFutureOrToday,
+        durationMin, fuelTier, carbTargetG: carbTargetGDisplay, proteinTargetG, fatTargetG: fatTargetGDisplay, isFutureOrToday,
         scheduledSessions, preloading, preloadSession, borrowedKcal, repaidKcal,
         taper, raceLoading, race: taper?.race || carbLoad?.race || raceToday || null,
       });
@@ -1923,6 +1987,21 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
             <input type="range" min="40" max="150" step="5" value={profile.minFatG}
               onChange={(e) => setProfile((p) => ({ ...p, minFatG: e.target.value }))} style={{ width: "100%" }} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load/race-load day can still price it down near nothing — this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100–150g/day typical range for an athlete's calorie load.</div>
+          </Field>
+          <Field label="Pre-load debt handling">
+            <select className="inp" value={profile.preloadDebtStrategy || "absorb"}
+              onChange={(e) => setProfile((p) => ({ ...p, preloadDebtStrategy: e.target.value }))}>
+              <option value="absorb">1 — Absorb at the floor (default)</option>
+              <option value="flexCarbs">2 — Flex carbs to collect the debt</option>
+              <option value="rolloverCapped">3 — Roll debt forward (capped)</option>
+            </select>
+            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
+              {profile.preloadDebtStrategy === "flexCarbs"
+                ? "On the day a pre-load is repaid, if carbs + protein alone already exceed what's owed back, that day's carb target itself flexes down toward its tier's low end (never below it) so the repayment actually reduces Target instead of being swallowed by the macro floor."
+                : profile.preloadDebtStrategy === "rolloverCapped"
+                ? `Any repayment the macro floor swallows (see "Absorb") rolls forward to the next day instead of being written off, capped at ${ROLLOVER_DEBT_CAP_KCAL} kcal outstanding so it can't compound indefinitely — anything past the cap is still written off.`
+                : "The usual behavior: if carb + protein minimums alone leave no room for a pre-load repayment to lower Target, that unpaid portion is simply written off rather than carried or forced through. Simple, but on a high-carb/high-protein setup the repayment can be invisible most of the time."}
+            </div>
           </Field>
         </div>
         <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" }}>

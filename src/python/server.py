@@ -119,6 +119,16 @@ STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 STRAVA_API = "https://www.strava.com/api/v3"
 INTERVALS_API = "https://intervals.icu/api/v1"
+
+# A device (watch, bike computer) can take a while to sync a finished
+# activity up to Strava/intervals.icu — well past midnight into the next
+# day, in practice. Treating only literal "today" as live meant a session
+# recorded late on a day that had already rolled over to "not today" could
+# get cached-as-final without it, and (since only "today" is ever rechecked)
+# would then never be picked up at all short of a manual ?refresh=true. Keep
+# today AND yesterday live so a late-arriving activity still gets picked up
+# on the next normal poll.
+LIVE_REFETCH_DAYS = 1
 MACROSFIRST_API = "https://my.macrosfirst.com"
 MACROSFIRST_SYNC_LOOKBACK_DAYS = 35
 
@@ -803,6 +813,7 @@ class Handler(BaseHTTPRequestHandler):
             dates_param = qs.get("dates", [None])[0]
             force_refresh = qs.get("refresh", ["false"])[0].lower() == "true"
             today = time.strftime("%Y-%m-%d", time.localtime())
+            live_cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - LIVE_REFETCH_DAYS * 86400))
 
             if dates_param:
                 requested_dates = sorted(set(d for d in dates_param.split(",") if d))
@@ -816,8 +827,10 @@ class Handler(BaseHTTPRequestHandler):
             wellness_by_date = cache.setdefault("wellness_by_date", {})
 
             # Same idea as the Strava cache: skip intervals.icu entirely for
-            # any date we've already fetched, except today.
-            dates_to_fetch = [d for d in requested_dates if force_refresh or d == today or d not in acts_by_date]
+            # any date we've already fetched, except the still-live window
+            # (today and the last LIVE_REFETCH_DAYS day(s), to catch
+            # activities a device synced up late).
+            dates_to_fetch = [d for d in requested_dates if force_refresh or d >= live_cutoff or d not in acts_by_date]
 
             if dates_to_fetch:
                 oldest_f, newest_f = min(dates_to_fetch), max(dates_to_fetch)
@@ -880,6 +893,7 @@ class Handler(BaseHTTPRequestHandler):
             dates_param = qs.get("dates", [None])[0]
             force_refresh = qs.get("refresh", ["false"])[0].lower() == "true"
             today = time.strftime("%Y-%m-%d", time.localtime())
+            live_cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - LIVE_REFETCH_DAYS * 86400))
 
             if dates_param:
                 requested_dates = sorted(set(d for d in dates_param.split(",") if d))
@@ -892,9 +906,11 @@ class Handler(BaseHTTPRequestHandler):
             cache = load_cache()
             by_date = cache.setdefault("by_date", {})
 
-            # Skip Strava entirely for any date already on disk — except today,
-            # which stays "live" since more activities can still land on it.
-            dates_to_fetch = [d for d in requested_dates if force_refresh or d == today or d not in by_date]
+            # Skip Strava entirely for any date already on disk — except the
+            # still-live window (today and the last LIVE_REFETCH_DAYS day(s)),
+            # which stays "live" since more activities can still land on it
+            # (including a late device sync of a session from that day).
+            dates_to_fetch = [d for d in requested_dates if force_refresh or d >= live_cutoff or d not in by_date]
 
             if dates_to_fetch:
                 oldest_f, newest_f = min(dates_to_fetch), max(dates_to_fetch)

@@ -511,6 +511,7 @@
     return rates;
   }
   const KCAL_PER_KG_TISSUE = 7700;
+  const ROLLOVER_DEBT_CAP_KCAL = 600;
   const GOAL_DEFAULTS = {
     build: { ratePct: 0.25, min: 0.1, max: 0.75 },
     lose: { ratePct: 0.5, min: 0.25, max: 1.5 }
@@ -675,6 +676,7 @@
       minFatG: 100,
       maxPreloadCarbGPerKg: 12,
       preloadBorrowRatio: 1,
+      preloadDebtStrategy: "absorb",
       units: "metric"
     });
     const units = profile.units || "metric";
@@ -1015,7 +1017,7 @@
       [schedule, stravaData, intervalsData, matchOverrides]
     );
     const dailyRows = useMemo(() => {
-      var _a, _b, _c, _d, _e, _f, _g, _h, _i;
+      var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
       if (!bmr) return [];
       const wellByDate = {};
       for (const w of intervalsData.wellness) {
@@ -1139,16 +1141,42 @@
         const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;
         const macroFloorKcal = (carbTargetG || 0) * 4 + (proteinTargetG || 0) * 4 + (fatTargetG || 0) * 9;
         const target = weightForDay ? Math.max(carbDrivenTarget, macroFloorKcal) : carbDrivenTarget;
+        const debtStrategy = profile.preloadDebtStrategy || "absorb";
+        let carbTargetGDisplay = carbTargetG;
+        let fatTargetGDisplay = fatTargetG;
+        let targetDisplay = target;
+        if (debtStrategy === "flexCarbs" && !preloading && !raceLoading && carbTargetG !== null && target > carbDrivenTarget) {
+          const carbFlexFloorG = weightForDay * fuelTier.carbLo;
+          const neededCarbTargetG = (carbDrivenTarget - (proteinTargetG || 0) * 4 - fatFloorG * 9) / 4;
+          carbTargetGDisplay = Math.max(carbFlexFloorG, Math.min(carbTargetG, neededCarbTargetG));
+          const fatRemainderGDisplay = (carbDrivenTarget - carbTargetGDisplay * 4 - (proteinTargetG || 0) * 4) / 9;
+          fatTargetGDisplay = Math.max(fatFloorG, fatRemainderGDisplay);
+          const macroFloorKcalDisplay = carbTargetGDisplay * 4 + (proteinTargetG || 0) * 4 + fatTargetGDisplay * 9;
+          targetDisplay = Math.max(carbDrivenTarget, macroFloorKcalDisplay);
+        }
         const isFutureOrToday = key >= toLocalISODate(/* @__PURE__ */ new Date());
-        const floorExcessKcal = preloading && !raceLoading && target > carbDrivenTarget ? target - carbDrivenTarget : 0;
+        let floorExcessKcal = preloading && !raceLoading && target > carbDrivenTarget ? target - carbDrivenTarget : 0;
         let carbRepaymentKcal = raceLoading ? 0 : borrowedKcal;
         if (!raceLoading && preloading && !isFutureOrToday && carbTargetG) {
           const actualCarbsG = (_e = nutritionEntry == null ? void 0 : nutritionEntry.carbs) != null ? _e : 0;
           const attainment = Math.min(1, Math.max(0, actualCarbsG / carbTargetG));
           carbRepaymentKcal *= attainment;
         }
-        carryRepaymentKcal = carbRepaymentKcal + (raceLoading ? 0 : floorExcessKcal);
-        const gap = intake !== null && !isFutureOrToday ? intake - target : null;
+        if (!raceLoading && preloading && !isFutureOrToday && fatTargetG) {
+          const actualFatG = (_f = nutritionEntry == null ? void 0 : nutritionEntry.fat) != null ? _f : 0;
+          const fatAttainment = Math.min(1, Math.max(0, actualFatG / fatTargetG));
+          floorExcessKcal *= fatAttainment;
+        }
+        const newDebtToday = carbRepaymentKcal + (raceLoading ? 0 : floorExcessKcal);
+        if (debtStrategy === "rolloverCapped") {
+          const targetWithoutRepay = weightForDay ? Math.max(baseTarget + borrowedKcal, macroFloorKcal) : baseTarget + borrowedKcal;
+          const realizedRepayment = targetWithoutRepay - target;
+          const unrealizedRepayment = Math.max(0, repaidKcal - realizedRepayment);
+          carryRepaymentKcal = Math.min(newDebtToday + unrealizedRepayment, ROLLOVER_DEBT_CAP_KCAL);
+        } else {
+          carryRepaymentKcal = newDebtToday;
+        }
+        const gap = intake !== null && !isFutureOrToday ? intake - targetDisplay : null;
         const trainingMissing = !stravaSynced && intervalsActs.length === 0 && source !== "planned";
         const nutritionMissing = intake === null;
         const weightMissing = weightLog[key] === void 0;
@@ -1161,15 +1189,15 @@
           epocKcal,
           fatigueBuffer,
           demand,
-          target,
+          target: targetDisplay,
           intake,
           gap,
           tsb,
           source,
-          weight: (_f = weightLog[key]) != null ? _f : null,
-          protein: (_g = nutritionEntry == null ? void 0 : nutritionEntry.protein) != null ? _g : null,
-          carbs: (_h = nutritionEntry == null ? void 0 : nutritionEntry.carbs) != null ? _h : null,
-          fat: (_i = nutritionEntry == null ? void 0 : nutritionEntry.fat) != null ? _i : null,
+          weight: (_g = weightLog[key]) != null ? _g : null,
+          protein: (_h = nutritionEntry == null ? void 0 : nutritionEntry.protein) != null ? _h : null,
+          carbs: (_i = nutritionEntry == null ? void 0 : nutritionEntry.carbs) != null ? _i : null,
+          fat: (_j = nutritionEntry == null ? void 0 : nutritionEntry.fat) != null ? _j : null,
           nutritionSource,
           activityCount: stravaActs.length || intervalsActs.length || scheduledSessions.length,
           trainingMissing: trainingMissing && !isFutureOrToday,
@@ -1177,9 +1205,9 @@
           weightMissing: weightMissing && !isFutureOrToday,
           durationMin,
           fuelTier,
-          carbTargetG,
+          carbTargetG: carbTargetGDisplay,
           proteinTargetG,
-          fatTargetG,
+          fatTargetG: fatTargetGDisplay,
           isFutureOrToday,
           scheduledSessions,
           preloading,
@@ -1487,7 +1515,17 @@
         onChange: (e) => setProfile((p) => ({ ...p, minFatG: e.target.value })),
         style: { width: "100%" }
       }
-    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load/race-load day can still price it down near nothing \u2014 this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100\u2013150g/day typical range for an athlete's calorie load."))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.fatigueBuffer, onChange: (e) => setProfile((p) => ({ ...p, fatigueBuffer: e.target.checked })) }), "Add a +5% BMR recovery buffer on days with a strongly negative training stress balance (TSB < \u221210)")), /* @__PURE__ */ React.createElement(
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load/race-load day can still price it down near nothing \u2014 this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100\u2013150g/day typical range for an athlete's calorie load.")), /* @__PURE__ */ React.createElement(Field, { label: "Pre-load debt handling" }, /* @__PURE__ */ React.createElement(
+      "select",
+      {
+        className: "inp",
+        value: profile.preloadDebtStrategy || "absorb",
+        onChange: (e) => setProfile((p) => ({ ...p, preloadDebtStrategy: e.target.value }))
+      },
+      /* @__PURE__ */ React.createElement("option", { value: "absorb" }, "1 \u2014 Absorb at the floor (default)"),
+      /* @__PURE__ */ React.createElement("option", { value: "flexCarbs" }, "2 \u2014 Flex carbs to collect the debt"),
+      /* @__PURE__ */ React.createElement("option", { value: "rolloverCapped" }, "3 \u2014 Roll debt forward (capped)")
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, profile.preloadDebtStrategy === "flexCarbs" ? "On the day a pre-load is repaid, if carbs + protein alone already exceed what's owed back, that day's carb target itself flexes down toward its tier's low end (never below it) so the repayment actually reduces Target instead of being swallowed by the macro floor." : profile.preloadDebtStrategy === "rolloverCapped" ? `Any repayment the macro floor swallows (see "Absorb") rolls forward to the next day instead of being written off, capped at ${ROLLOVER_DEBT_CAP_KCAL} kcal outstanding so it can't compound indefinitely \u2014 anything past the cap is still written off.` : "The usual behavior: if carb + protein minimums alone leave no room for a pre-load repayment to lower Target, that unpaid portion is simply written off rather than carried or forced through. Simple, but on a high-carb/high-protein setup the repayment can be invisible most of the time."))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.fatigueBuffer, onChange: (e) => setProfile((p) => ({ ...p, fatigueBuffer: e.target.checked })) }), "Add a +5% BMR recovery buffer on days with a strongly negative training stress balance (TSB < \u221210)")), /* @__PURE__ */ React.createElement(
       GoalCard,
       {
         profile,

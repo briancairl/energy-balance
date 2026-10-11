@@ -2664,6 +2664,7 @@ function emptyScheduleForm() {
     notes: "",
     date: toLocalISODate(new Date()),
     raceDate: toLocalISODate(new Date()),
+    taperEnabled: true,
     taperDays: String(DEFAULT_TAPER_DAYS),
     sourceActivity: null,
   };
@@ -2749,7 +2750,8 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
       setForm({
         ...emptyScheduleForm(),
         kind: "race", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
-        raceDate: s.raceDate, taperDays: String(s.taperDays ?? DEFAULT_TAPER_DAYS), notes: s.notes || "",
+        raceDate: s.raceDate, taperEnabled: (s.taperDays ?? DEFAULT_TAPER_DAYS) > 0,
+        taperDays: String(s.taperDays || DEFAULT_TAPER_DAYS), notes: s.notes || "",
         sourceActivity: s.sourceActivity || null,
       });
     } else if (s.kind === "single") {
@@ -2780,7 +2782,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
         zone: form.zone,
         durationMin: parseInt(form.durationMin) || 0,
         raceDate: form.raceDate,
-        taperDays: Math.max(0, parseInt(form.taperDays) || 0),
+        taperDays: form.taperEnabled ? Math.max(1, parseInt(form.taperDays) || DEFAULT_TAPER_DAYS) : 0,
         notes: form.notes,
         sourceActivity: form.sourceActivity,
       };
@@ -3263,13 +3265,22 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
         </Field>
 
         {form.kind === "race" ? (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginTop: 14 }}>
-            <Field label="Race date">
-              <input className="inp" type="date" value={form.raceDate} onChange={(e) => setForm((f) => ({ ...f, raceDate: e.target.value }))} />
-            </Field>
-            <Field label="Taper starts (days before race)">
-              <input className="inp" type="number" min="0" value={form.taperDays} onChange={(e) => setForm((f) => ({ ...f, taperDays: e.target.value }))} />
-            </Field>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" }}>
+            <div style={{ flex: "1 1 150px" }}>
+              <Field label="Race date">
+                <input className="inp" type="date" value={form.raceDate} onChange={(e) => setForm((f) => ({ ...f, raceDate: e.target.value }))} />
+              </Field>
+            </div>
+            <div style={{ flex: "1 1 150px" }}>
+              <Field label="Taper starts (days before race)">
+                <input className="inp" type="number" min="1" value={form.taperDays} disabled={!form.taperEnabled}
+                  onChange={(e) => setForm((f) => ({ ...f, taperDays: e.target.value }))} style={{ opacity: form.taperEnabled ? 1 : 0.5 }} />
+              </Field>
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
+              <input type="checkbox" checked={form.taperEnabled} onChange={(e) => setForm((f) => ({ ...f, taperEnabled: e.target.checked }))} />
+              Enable tapering
+            </label>
           </div>
         ) : form.kind === "single" ? (
           <div style={{ marginTop: 14 }}>
@@ -3336,7 +3347,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                 <div style={{ flex: 1 }}>
                   <b>{s.notes || s.activityType}</b> · {s.activityType} · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
                   <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
-                    {s.raceDate} · taper starts {s.taperDays}d out
+                    {s.raceDate} · {s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper"}
                     {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
                   </div>
                 </div>

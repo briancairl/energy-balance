@@ -527,13 +527,22 @@ function getEffectiveSessionsForDate(schedule, dateStr) {
 // high-volume tier for a short window, independent of that day's own (now
 // tapered-down) training load. Only worth doing ahead of races long enough to
 // meaningfully deplete glycogen in the first place.
+//
+// The window length is per race (`carbLoadDays`, 0 = off); races saved before
+// that field existed fall back to CARB_LOAD_DAYS. Common protocols run
+// anywhere from 1-2 days (modern short-load) to 3-4 (classic).
 const CARB_LOAD_DAYS = 3;
 const CARB_LOAD_MIN_DURATION = 90;
+function raceCarbLoadDays(race) {
+  return race.carbLoadDays ?? CARB_LOAD_DAYS;
+}
 function getCarbLoadState(schedule, dateStr) {
   const race = getUpcomingRace(schedule, dateStr);
   if (!race || race.durationMin < CARB_LOAD_MIN_DURATION) return null;
+  const carbLoadDays = raceCarbLoadDays(race);
+  if (!carbLoadDays) return null;
   const daysToRace = daysBetween(dateStr, race.raceDate);
-  if (daysToRace <= 0 || daysToRace > CARB_LOAD_DAYS) return null;
+  if (daysToRace <= 0 || daysToRace > carbLoadDays) return null;
   return { race, daysToRace };
 }
 
@@ -909,6 +918,7 @@ function App() {
     trendCalibration: true,
     proteinGPerKg: 1.0,
     minFatG: 100,
+    carbLoadFatFloorPct: 10,
     maxPreloadCarbGPerKg: 12,
     preloadBorrowRatio: 1.0,
     preloadDebtStrategy: "absorb",
@@ -927,7 +937,7 @@ function App() {
   const [matchOverrides, setMatchOverrides] = useState({});
   // Recurring: { id, kind: "recurring", activityType, zone, durationMin, daysOfWeek, startDate, endDate, notes }
   // Single:    { id, kind: "single", activityType, zone, durationMin, date, notes } — one-off, non-repeating
-  // Race:      { id, kind: "race", activityType, zone, durationMin, raceDate, taperDays, notes }
+  // Race:      { id, kind: "race", activityType, zone, durationMin, raceDate, taperDays, carbLoadDays, notes }
   const [csvPreview, setCsvPreview] = useState(null);
   const [colMap, setColMap] = useState({ date: "", calories: "", protein: "", carbs: "", fat: "" });
   const [intervalsData, setIntervalsData] = useState({ activities: [], wellness: [], syncedDates: [] });
@@ -1531,7 +1541,18 @@ function App() {
       // it there; applying it on every day would flatten an absolute floor
       // over what should be a demand-scaled number, inflating Target on
       // easy/rest days for no training reason.
-      const fatFloorG = (preloading || raceLoading)
+      //
+      // Race carb-loading is the exception: the whole point of those few days
+      // is to displace other macros with carbohydrate, so neither the flat
+      // gram minimum nor the usual 20% floor applies — fat only keeps a much
+      // lower %-of-Target floor (profile.carbLoadFatFloorPct, default 10%).
+      // Holding fat at its normal minimum there would just stack its kcal on
+      // top of the carb load and inflate Target, rather than letting carbs
+      // stand in for it.
+      const carbLoadFatFloorPct = parseFloat(profile.carbLoadFatFloorPct);
+      const fatFloorG = raceLoading
+        ? carbDrivenTarget * (isNaN(carbLoadFatFloorPct) ? 10 : carbLoadFatFloorPct) / 100 / 9
+        : preloading
         ? Math.max(carbDrivenTarget * 0.20 / 9, parseFloat(profile.minFatG) || 100)
         : carbDrivenTarget * 0.20 / 9;
       const fatRemainderG = (carbDrivenTarget - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
@@ -1986,7 +2007,12 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
           <Field label={`Minimum fat target — ${profile.minFatG}g/day`}>
             <input type="range" min="40" max="150" step="5" value={profile.minFatG}
               onChange={(e) => setProfile((p) => ({ ...p, minFatG: e.target.value }))} style={{ width: "100%" }} />
-            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load/race-load day can still price it down near nothing — this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100–150g/day typical range for an athlete's calorie load.</div>
+            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load day can still price it down near nothing — this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100–150g/day typical range for an athlete's calorie load. Doesn't apply on race carb-loading days (see below).</div>
+          </Field>
+          <Field label={`Carb-loading fat floor — ${profile.carbLoadFatFloorPct ?? 10}% of Target`}>
+            <input type="range" min="0" max="20" step="1" value={profile.carbLoadFatFloorPct ?? 10}
+              onChange={(e) => setProfile((p) => ({ ...p, carbLoadFatFloorPct: e.target.value }))} style={{ width: "100%" }} />
+            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>On a race's carb-loading days, carbs deliberately displace other macros, so the usual 20% floor and the gram minimum above are lifted and fat is only held to this (lower) share of Target. Short-term loading protocols commonly run fat around 10–15% of intake.</div>
           </Field>
           <Field label="Pre-load debt handling">
             <select className="inp" value={profile.preloadDebtStrategy || "absorb"}
@@ -2666,6 +2692,8 @@ function emptyScheduleForm() {
     raceDate: toLocalISODate(new Date()),
     taperEnabled: true,
     taperDays: String(DEFAULT_TAPER_DAYS),
+    carbLoadEnabled: true,
+    carbLoadDays: String(CARB_LOAD_DAYS),
     sourceActivity: null,
   };
 }
@@ -2751,7 +2779,9 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
         ...emptyScheduleForm(),
         kind: "race", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
         raceDate: s.raceDate, taperEnabled: (s.taperDays ?? DEFAULT_TAPER_DAYS) > 0,
-        taperDays: String(s.taperDays || DEFAULT_TAPER_DAYS), notes: s.notes || "",
+        taperDays: String(s.taperDays || DEFAULT_TAPER_DAYS),
+        carbLoadEnabled: raceCarbLoadDays(s) > 0,
+        carbLoadDays: String(raceCarbLoadDays(s) || CARB_LOAD_DAYS), notes: s.notes || "",
         sourceActivity: s.sourceActivity || null,
       });
     } else if (s.kind === "single") {
@@ -2783,6 +2813,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
         durationMin: parseInt(form.durationMin) || 0,
         raceDate: form.raceDate,
         taperDays: form.taperEnabled ? Math.max(1, parseInt(form.taperDays) || DEFAULT_TAPER_DAYS) : 0,
+        carbLoadDays: form.carbLoadEnabled ? Math.max(1, parseInt(form.carbLoadDays) || CARB_LOAD_DAYS) : 0,
         notes: form.notes,
         sourceActivity: form.sourceActivity,
       };
@@ -3281,6 +3312,19 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
               <input type="checkbox" checked={form.taperEnabled} onChange={(e) => setForm((f) => ({ ...f, taperEnabled: e.target.checked }))} />
               Enable tapering
             </label>
+            <div style={{ flex: "1 1 150px" }}>
+              <Field label="Carb-load starts (days before race)">
+                <input className="inp" type="number" min="1" value={form.carbLoadDays} disabled={!form.carbLoadEnabled}
+                  onChange={(e) => setForm((f) => ({ ...f, carbLoadDays: e.target.value }))} style={{ opacity: form.carbLoadEnabled ? 1 : 0.5 }} />
+              </Field>
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
+              <input type="checkbox" checked={form.carbLoadEnabled} onChange={(e) => setForm((f) => ({ ...f, carbLoadEnabled: e.target.checked }))} />
+              Enable carb-loading
+            </label>
+            {form.carbLoadEnabled && (parseInt(form.durationMin) || 0) < CARB_LOAD_MIN_DURATION && (
+              <div style={{ flex: "1 1 100%", fontSize: 11, color: dim }}>Carb-loading only kicks in for races of {CARB_LOAD_MIN_DURATION}+ min — shorter efforts don't deplete enough glycogen to benefit.</div>
+            )}
           </div>
         ) : form.kind === "single" ? (
           <div style={{ marginTop: 14 }}>
@@ -3348,6 +3392,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                   <b>{s.notes || s.activityType}</b> · {s.activityType} · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
                   <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
                     {s.raceDate} · {s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper"}
+                    {" · "}{raceCarbLoadDays(s) > 0 ? `carb-load ${raceCarbLoadDays(s)}d` : "no carb-load"}
                     {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
                   </div>
                 </div>

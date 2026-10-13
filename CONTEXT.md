@@ -155,7 +155,9 @@ history and just persist as entered.
   - Protein: flat, adjustable g/kg/day (`profile.proteinGPerKg`, default 1.0) — **not**
     tier-scaled (this was deliberately simplified from an earlier ISSN-tier-based version).
   - Fat: whatever's left of Target after carb+protein calories, floored at 20% of Target so
-    it can't get squeezed toward zero.
+    it can't get squeezed toward zero. On race carb-loading days that floor drops to
+    `profile.carbLoadFatFloorPct` (default 10%) and the flat `minFatG` doesn't apply — carbs
+    are meant to displace fat there, not stack on top of it.
 - **Pre-loading**: if *tomorrow* has a scheduled session ≥90 min or Zone 4+, today's carb
   target escalates to tomorrow's (higher) tier. The resulting extra carb calories get funded
   per `profile.preloadBorrowRatio` (default 1.0 = fully borrowed): 0% shrinks today's fat to
@@ -180,7 +182,7 @@ history and just persist as entered.
   taper/carb-load math can look at the same array as recurring sessions. Inside the taper
   window, recurring sessions get duration scaled down to as low as 40% on race-eve while
   intensity is only mildly trimmed (floor 90%) — standard taper guidance (Mujika & Padilla,
-  2003) is to shed volume, not intensity. The final `CARB_LOAD_DAYS` (3) before a race
+  2003) is to shed volume, not intensity. The final `carbLoadDays` (per race, 0 = off; `CARB_LOAD_DAYS` = 3 if unset) before a race
   ≥`CARB_LOAD_MIN_DURATION` (90 min) pin carb targets to the top tier's top end regardless of
   that day's own (tapered) training, and — unlike ordinary pre-loading — that surplus is *not*
   funded by debiting a later day; it's a deliberate short-term glycogen-loading overshoot, not

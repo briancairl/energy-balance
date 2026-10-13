@@ -429,11 +429,17 @@
   }
   const CARB_LOAD_DAYS = 3;
   const CARB_LOAD_MIN_DURATION = 90;
+  function raceCarbLoadDays(race) {
+    var _a;
+    return (_a = race.carbLoadDays) != null ? _a : CARB_LOAD_DAYS;
+  }
   function getCarbLoadState(schedule, dateStr) {
     const race = getUpcomingRace(schedule, dateStr);
     if (!race || race.durationMin < CARB_LOAD_MIN_DURATION) return null;
+    const carbLoadDays = raceCarbLoadDays(race);
+    if (!carbLoadDays) return null;
     const daysToRace = daysBetween(dateStr, race.raceDate);
-    if (daysToRace <= 0 || daysToRace > CARB_LOAD_DAYS) return null;
+    if (daysToRace <= 0 || daysToRace > carbLoadDays) return null;
     return { race, daysToRace };
   }
   function plannedMatchKey(planned) {
@@ -674,6 +680,7 @@
       trendCalibration: true,
       proteinGPerKg: 1,
       minFatG: 100,
+      carbLoadFatFloorPct: 10,
       maxPreloadCarbGPerKg: 12,
       preloadBorrowRatio: 1,
       preloadDebtStrategy: "absorb",
@@ -1136,7 +1143,8 @@
         const carbDrivenTarget = baseTarget - repaidKcal + borrowedKcal;
         const proteinWeightKg = parseFloat(profile.targetWeightKg) || weightForDay;
         const proteinTargetG = proteinWeightKg ? proteinWeightKg * (parseFloat(profile.proteinGPerKg) || 1) : null;
-        const fatFloorG = preloading || raceLoading ? Math.max(carbDrivenTarget * 0.2 / 9, parseFloat(profile.minFatG) || 100) : carbDrivenTarget * 0.2 / 9;
+        const carbLoadFatFloorPct = parseFloat(profile.carbLoadFatFloorPct);
+        const fatFloorG = raceLoading ? carbDrivenTarget * (isNaN(carbLoadFatFloorPct) ? 10 : carbLoadFatFloorPct) / 100 / 9 : preloading ? Math.max(carbDrivenTarget * 0.2 / 9, parseFloat(profile.minFatG) || 100) : carbDrivenTarget * 0.2 / 9;
         const fatRemainderG = (carbDrivenTarget - (carbTargetG || 0) * 4 - (proteinTargetG || 0) * 4) / 9;
         const fatTargetG = weightForDay ? Math.max(fatFloorG, fatRemainderG) : null;
         const macroFloorKcal = (carbTargetG || 0) * 4 + (proteinTargetG || 0) * 4 + (fatTargetG || 0) * 9;
@@ -1409,7 +1417,7 @@
     return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "fieldlabel" }, label), children);
   }
   function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
-    var _a;
+    var _a, _b, _c;
     const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
     const units = profile.units || "metric";
     const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
@@ -1515,7 +1523,18 @@
         onChange: (e) => setProfile((p) => ({ ...p, minFatG: e.target.value })),
         style: { width: "100%" }
       }
-    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load/race-load day can still price it down near nothing \u2014 this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100\u2013150g/day typical range for an athlete's calorie load.")), /* @__PURE__ */ React.createElement(Field, { label: "Pre-load debt handling" }, /* @__PURE__ */ React.createElement(
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load day can still price it down near nothing \u2014 this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100\u2013150g/day typical range for an athlete's calorie load. Doesn't apply on race carb-loading days (see below).")), /* @__PURE__ */ React.createElement(Field, { label: `Carb-loading fat floor \u2014 ${(_b = profile.carbLoadFatFloorPct) != null ? _b : 10}% of Target` }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "range",
+        min: "0",
+        max: "20",
+        step: "1",
+        value: (_c = profile.carbLoadFatFloorPct) != null ? _c : 10,
+        onChange: (e) => setProfile((p) => ({ ...p, carbLoadFatFloorPct: e.target.value })),
+        style: { width: "100%" }
+      }
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "On a race's carb-loading days, carbs deliberately displace other macros, so the usual 20% floor and the gram minimum above are lifted and fat is only held to this (lower) share of Target. Short-term loading protocols commonly run fat around 10\u201315% of intake.")), /* @__PURE__ */ React.createElement(Field, { label: "Pre-load debt handling" }, /* @__PURE__ */ React.createElement(
       "select",
       {
         className: "inp",
@@ -1841,6 +1860,8 @@
       raceDate: toLocalISODate(/* @__PURE__ */ new Date()),
       taperEnabled: true,
       taperDays: String(DEFAULT_TAPER_DAYS),
+      carbLoadEnabled: true,
+      carbLoadDays: String(CARB_LOAD_DAYS),
       sourceActivity: null
     };
   }
@@ -1940,6 +1961,8 @@
           raceDate: s.raceDate,
           taperEnabled: ((_a2 = s.taperDays) != null ? _a2 : DEFAULT_TAPER_DAYS) > 0,
           taperDays: String(s.taperDays || DEFAULT_TAPER_DAYS),
+          carbLoadEnabled: raceCarbLoadDays(s) > 0,
+          carbLoadDays: String(raceCarbLoadDays(s) || CARB_LOAD_DAYS),
           notes: s.notes || "",
           sourceActivity: s.sourceActivity || null
         });
@@ -1983,6 +2006,7 @@
           durationMin: parseInt(form.durationMin) || 0,
           raceDate: form.raceDate,
           taperDays: form.taperEnabled ? Math.max(1, parseInt(form.taperDays) || DEFAULT_TAPER_DAYS) : 0,
+          carbLoadDays: form.carbLoadEnabled ? Math.max(1, parseInt(form.carbLoadDays) || CARB_LOAD_DAYS) : 0,
           notes: form.notes,
           sourceActivity: form.sourceActivity
         };
@@ -2372,7 +2396,29 @@
       },
       "Z",
       z.n
-    ))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, ZONES[form.zone - 1].label, " \xB7 ", ZONES[form.zone - 1].hrPct)), form.kind === "race" ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Race date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.raceDate, onChange: (e) => setForm((f) => ({ ...f, raceDate: e.target.value })) }))), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Taper starts (days before race)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "1", value: form.taperDays, disabled: !form.taperEnabled, onChange: (e) => setForm((f) => ({ ...f, taperDays: e.target.value })), style: { opacity: form.taperEnabled ? 1 : 0.5 } }))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.taperEnabled, onChange: (e) => setForm((f) => ({ ...f, taperEnabled: e.target.checked })) }), "Enable tapering")) : form.kind === "single" ? /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.date, onChange: (e) => setForm((f) => ({ ...f, date: e.target.value })) }))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement("span", { className: "fieldlabel" }, "Days of week"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, WEEKDAY_LABELS.map((label, n) => /* @__PURE__ */ React.createElement(
+    ))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, ZONES[form.zone - 1].label, " \xB7 ", ZONES[form.zone - 1].hrPct)), form.kind === "race" ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Race date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.raceDate, onChange: (e) => setForm((f) => ({ ...f, raceDate: e.target.value })) }))), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Taper starts (days before race)" }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        className: "inp",
+        type: "number",
+        min: "1",
+        value: form.taperDays,
+        disabled: !form.taperEnabled,
+        onChange: (e) => setForm((f) => ({ ...f, taperDays: e.target.value })),
+        style: { opacity: form.taperEnabled ? 1 : 0.5 }
+      }
+    ))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.taperEnabled, onChange: (e) => setForm((f) => ({ ...f, taperEnabled: e.target.checked })) }), "Enable tapering"), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Carb-load starts (days before race)" }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        className: "inp",
+        type: "number",
+        min: "1",
+        value: form.carbLoadDays,
+        disabled: !form.carbLoadEnabled,
+        onChange: (e) => setForm((f) => ({ ...f, carbLoadDays: e.target.value })),
+        style: { opacity: form.carbLoadEnabled ? 1 : 0.5 }
+      }
+    ))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.carbLoadEnabled, onChange: (e) => setForm((f) => ({ ...f, carbLoadEnabled: e.target.checked })) }), "Enable carb-loading"), form.carbLoadEnabled && (parseInt(form.durationMin) || 0) < CARB_LOAD_MIN_DURATION && /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 100%", fontSize: 11, color: dim } }, "Carb-loading only kicks in for races of ", CARB_LOAD_MIN_DURATION, "+ min \u2014 shorter efforts don't deplete enough glycogen to benefit.")) : form.kind === "single" ? /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.date, onChange: (e) => setForm((f) => ({ ...f, date: e.target.value })) }))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement("span", { className: "fieldlabel" }, "Days of week"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, WEEKDAY_LABELS.map((label, n) => /* @__PURE__ */ React.createElement(
       "button",
       {
         key: n,
@@ -2393,7 +2439,7 @@
       }
     ))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.ongoing, onChange: (e) => setForm((f) => ({ ...f, ongoing: e.target.checked })) }), "Ongoing"))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Notes (optional)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: form.notes, onChange: (e) => setForm((f) => ({ ...f, notes: e.target.value })), placeholder: form.kind === "race" ? "e.g. Boston Marathon" : "e.g. track intervals" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 18 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSubmit }, editingId ? "Save changes" : form.kind === "race" ? "Add race" : "Add to schedule"), editingId && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: cancelEdit }, "Cancel"))), races.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 16, color: gold }), " Races"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 } }, races.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, ref: (el) => {
       itemRefs.current[s.id] = el;
-    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.notes || s.activityType), " \xB7 ", s.activityType, " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.raceDate, " \xB7 ", s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper", s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
+    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.notes || s.activityType), " \xB7 ", s.activityType, " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.raceDate, " \xB7 ", s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper", " \xB7 ", raceCarbLoadDays(s) > 0 ? `carb-load ${raceCarbLoadDays(s)}d` : "no carb-load", s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
       if (confirm("Delete this race?")) onDelete(s.id);
     }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))), singles.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 } }, "Single sessions"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 } }, singles.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, ref: (el) => {
       itemRefs.current[s.id] = el;

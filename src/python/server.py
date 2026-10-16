@@ -670,7 +670,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_file(self, path, content_type):
+    def _send_file(self, path, content_type, no_cache=False):
+        """no_cache forces the browser to revalidate on every load — without it,
+        mobile browsers (and home-screen PWAs especially) can keep running a
+        stale app.js for days after a deploy, silently computing targets with
+        old logic against the same server-side data."""
         if not os.path.exists(path):
             self.send_response(404)
             self.end_headers()
@@ -680,6 +684,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if no_cache:
+            self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -698,9 +704,9 @@ class Handler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(parsed.query)
 
         if path == "/":
-            return self._send_file(os.path.join(ROOT, "index.html"), "text/html; charset=utf-8")
+            return self._send_file(os.path.join(ROOT, "index.html"), "text/html; charset=utf-8", no_cache=True)
         if path == "/app.js":
-            return self._send_file(os.path.join(JS_DIR, "app.js"), "application/javascript")
+            return self._send_file(os.path.join(JS_DIR, "app.js"), "application/javascript", no_cache=True)
         if path in STATIC_ASSETS:
             fdir, fname, ctype = STATIC_ASSETS[path]
             return self._send_file(os.path.join(fdir, fname), ctype)

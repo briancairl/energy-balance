@@ -1851,6 +1851,36 @@ function Field({ label, children }) {
   return <div><span className="fieldlabel">{label}</span>{children}</div>;
 }
 
+// Range slider that doesn't commit on drag. Tuning sliders were easy to nudge by
+// accident (e.g. while scrolling on a phone), silently changing the model — so
+// moving one only stages a draft, and an inline Apply/Cancel prompt has to be
+// confirmed before onCommit fires. `format` renders a value for the prompt.
+function ConfirmRange({ value, onCommit, format = (v) => v, ...rangeProps }) {
+  const [draft, setDraft] = useState(null);
+  useEffect(() => { setDraft(null); }, [value]);
+  const pending = draft !== null && String(draft) !== String(value);
+  return (
+    <>
+      <input type="range" {...rangeProps} value={draft ?? value}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (!pending) return;
+          if (e.key === "Enter") { e.preventDefault(); onCommit(draft); }
+          else if (e.key === "Escape") { e.preventDefault(); setDraft(null); }
+        }}
+        style={{ width: "100%", ...(pending ? { accentColor: amber } : null) }} />
+      {pending && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, padding: "6px 8px", border: `1px solid ${amber}`, borderRadius: 4, fontSize: 12 }}>
+          <span style={{ flex: 1 }}>Change {format(value)} → <b>{format(draft)}</b>?</span>
+          <button onClick={() => onCommit(draft)}
+            style={{ padding: "4px 10px", borderRadius: 4, fontWeight: 700, fontSize: 12, cursor: "pointer", border: "none", background: amber, color: ink }}>Apply</button>
+          <button className="btn-ghost" onClick={() => setDraft(null)} style={{ padding: "4px 10px", fontSize: 12 }}>Cancel</button>
+        </div>
+      )}
+    </>
+  );
+}
+
 function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
   const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
   const units = profile.units || "metric";
@@ -1975,43 +2005,44 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
               </>
             ) : (
               <>
-                <input type="range" min="1.0" max="1.4" step="0.01" value={profile.neatFactor}
-                  onChange={(e) => setProfile((p) => ({ ...p, neatFactor: e.target.value }))} style={{ width: "100%" }} />
+                <ConfirmRange min="1.0" max="1.4" step="0.01" value={profile.neatFactor} format={(v) => `${v}×`}
+                  onCommit={(v) => setProfile((p) => ({ ...p, neatFactor: v }))} />
                 <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>BMR × {profile.neatFactor}× covers daily NEAT/light activity, before training is added on top.</div>
               </>
             )}
           </Field>
           <Field label={`EPOC / recovery sensitivity — ${profile.epocSensitivity}×`}>
-            <input type="range" min="0.5" max="1.5" step="0.05" value={profile.epocSensitivity}
-              onChange={(e) => setProfile((p) => ({ ...p, epocSensitivity: e.target.value }))} style={{ width: "100%" }} />
+            <ConfirmRange min="0.5" max="1.5" step="0.05" value={profile.epocSensitivity} format={(v) => `${v}×`}
+              onCommit={(v) => setProfile((p) => ({ ...p, epocSensitivity: v }))} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Scales the post-exercise afterburn estimate (5–12% of session kcal by intensity).</div>
           </Field>
           <Field label={`Protein target — ${fmt(gPerKgToDisplay(parseFloat(profile.proteinGPerKg) || 0, units), 2)} g/${weightUnitLabel(units)}/day`}>
-            <input type="range" min={units === "imperial" ? 0.3 : 0.6} max={units === "imperial" ? 1.2 : 2.5} step={units === "imperial" ? 0.02 : 0.05}
+            <ConfirmRange min={units === "imperial" ? 0.3 : 0.6} max={units === "imperial" ? 1.2 : 2.5} step={units === "imperial" ? 0.02 : 0.05}
               value={gPerKgToDisplay(parseFloat(profile.proteinGPerKg) || 0, units)}
-              onChange={(e) => setProfile((p) => ({ ...p, proteinGPerKg: String(displayToGPerKg(parseFloat(e.target.value), units)) }))} style={{ width: "100%" }} />
+              format={(v) => `${fmt(parseFloat(v), 2)} g/${weightUnitLabel(units)}`}
+              onCommit={(v) => setProfile((p) => ({ ...p, proteinGPerKg: String(displayToGPerKg(parseFloat(v), units)) }))} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
               Flat daily rate, not tier-scaled like carbs. Default {fmt(gPerKgToDisplay(1.0, units), 2)} g/{weightUnitLabel(units)}; athlete guidelines typically range {fmt(gPerKgToDisplay(1.2, units), 2)}–{fmt(gPerKgToDisplay(2.0, units), 2)}+ g/{weightUnitLabel(units)}.
             </div>
           </Field>
           <Field label={`Max carb pre-load — ${profile.maxPreloadCarbGPerKg} g/kg/day`}>
-            <input type="range" min="6" max="14" step="0.5" value={profile.maxPreloadCarbGPerKg}
-              onChange={(e) => setProfile((p) => ({ ...p, maxPreloadCarbGPerKg: e.target.value }))} style={{ width: "100%" }} />
+            <ConfirmRange min="6" max="14" step="0.5" value={profile.maxPreloadCarbGPerKg} format={(v) => `${v} g/kg`}
+              onCommit={(v) => setProfile((p) => ({ ...p, maxPreloadCarbGPerKg: v }))} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Ceiling on the tomorrow's-session/race pre-load bump only — a day's own carbs for training actually done that day are never capped by this. Classic carb-loading protocols top out around 10–12 g/kg/day; more shows no extra glycogen benefit and raises GI-distress risk.</div>
           </Field>
           <Field label={`Pre-load funding — ${Math.round(profile.preloadBorrowRatio * 100)}% borrowed`}>
-            <input type="range" min="0" max="1" step="0.05" value={profile.preloadBorrowRatio}
-              onChange={(e) => setProfile((p) => ({ ...p, preloadBorrowRatio: e.target.value }))} style={{ width: "100%" }} />
+            <ConfirmRange min="0" max="1" step="0.05" value={profile.preloadBorrowRatio} format={(v) => `${Math.round(v * 100)}%`}
+              onCommit={(v) => setProfile((p) => ({ ...p, preloadBorrowRatio: v }))} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>How pre-loaded carbs get funded: 0% shrinks that day's fat target to make room; 100% raises that day's calorie Target instead, and debits the same amount from the next day's Target to balance it out.</div>
           </Field>
           <Field label={`Minimum fat target — ${profile.minFatG}g/day`}>
-            <input type="range" min="40" max="150" step="5" value={profile.minFatG}
-              onChange={(e) => setProfile((p) => ({ ...p, minFatG: e.target.value }))} style={{ width: "100%" }} />
+            <ConfirmRange min="40" max="150" step="5" value={profile.minFatG} format={(v) => `${v}g`}
+              onCommit={(v) => setProfile((p) => ({ ...p, minFatG: v }))} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load day can still price it down near nothing — this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100–150g/day typical range for an athlete's calorie load. Doesn't apply on race carb-loading days (see below).</div>
           </Field>
           <Field label={`Carb-loading fat floor — ${profile.carbLoadFatFloorPct ?? 10}% of Target`}>
-            <input type="range" min="0" max="20" step="1" value={profile.carbLoadFatFloorPct ?? 10}
-              onChange={(e) => setProfile((p) => ({ ...p, carbLoadFatFloorPct: e.target.value }))} style={{ width: "100%" }} />
+            <ConfirmRange min="0" max="20" step="1" value={profile.carbLoadFatFloorPct ?? 10} format={(v) => `${v}%`}
+              onCommit={(v) => setProfile((p) => ({ ...p, carbLoadFatFloorPct: v }))} />
             <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>On a race's carb-loading days, carbs deliberately displace other macros, so the usual 20% floor and the gram minimum above are lifted and fat is only held to this (lower) share of Target. Short-term loading protocols commonly run fat around 10–15% of intake.</div>
           </Field>
           <Field label="Pre-load debt handling">
@@ -2120,8 +2151,8 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
 
       {range && (
         <Field label={`${profile.goal === "build" ? "Weight gain" : "Weight loss"} rate — ${profile[rateKey]}%/week`}>
-          <input type="range" min={range.min} max={range.max} step="0.05" value={profile[rateKey]}
-            onChange={(e) => setProfile((p) => recordGoalHistory(p, { [rateKey]: e.target.value }))} style={{ width: "100%" }} />
+          <ConfirmRange min={range.min} max={range.max} step="0.05" value={profile[rateKey]} format={(v) => `${v}%/week`}
+            onCommit={(v) => setProfile((p) => recordGoalHistory(p, { [rateKey]: v }))} />
           <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
             Safe range {range.min}–{range.max}%/week. Faster {profile.goal === "build" ? "gains skew toward fat" : "loss risks muscle and performance"}.
           </div>

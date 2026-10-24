@@ -1416,6 +1416,40 @@
   function Field({ label, children }) {
     return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "fieldlabel" }, label), children);
   }
+  function ConfirmRange({ value, onCommit, format = (v) => v, ...rangeProps }) {
+    const [draft, setDraft] = useState(null);
+    useEffect(() => {
+      setDraft(null);
+    }, [value]);
+    const pending = draft !== null && String(draft) !== String(value);
+    return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "range",
+        ...rangeProps,
+        value: draft != null ? draft : value,
+        onChange: (e) => setDraft(e.target.value),
+        onKeyDown: (e) => {
+          if (!pending) return;
+          if (e.key === "Enter") {
+            e.preventDefault();
+            onCommit(draft);
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            setDraft(null);
+          }
+        },
+        style: { width: "100%", ...pending ? { accentColor: amber } : null }
+      }
+    ), pending && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 6, padding: "6px 8px", border: `1px solid ${amber}`, borderRadius: 4, fontSize: 12 } }, /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }, "Change ", format(value), " \u2192 ", /* @__PURE__ */ React.createElement("b", null, format(draft)), "?"), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: () => onCommit(draft),
+        style: { padding: "4px 10px", borderRadius: 4, fontWeight: 700, fontSize: 12, cursor: "pointer", border: "none", background: amber, color: ink }
+      },
+      "Apply"
+    ), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: () => setDraft(null), style: { padding: "4px 10px", fontSize: 12 } }, "Cancel")));
+  }
   function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
     var _a, _b, _c;
     const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
@@ -1458,81 +1492,74 @@
         style: { width: "100%" }
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "A flat kcal/day added to BMR to cover daily NEAT/light activity, before training is added on top.")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
-      "input",
+      ConfirmRange,
       {
-        type: "range",
         min: "1.0",
         max: "1.4",
         step: "0.01",
         value: profile.neatFactor,
-        onChange: (e) => setProfile((p) => ({ ...p, neatFactor: e.target.value })),
-        style: { width: "100%" }
+        format: (v) => `${v}\xD7`,
+        onCommit: (v) => setProfile((p) => ({ ...p, neatFactor: v }))
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "BMR \xD7 ", profile.neatFactor, "\xD7 covers daily NEAT/light activity, before training is added on top."))), /* @__PURE__ */ React.createElement(Field, { label: `EPOC / recovery sensitivity \u2014 ${profile.epocSensitivity}\xD7` }, /* @__PURE__ */ React.createElement(
-      "input",
+      ConfirmRange,
       {
-        type: "range",
         min: "0.5",
         max: "1.5",
         step: "0.05",
         value: profile.epocSensitivity,
-        onChange: (e) => setProfile((p) => ({ ...p, epocSensitivity: e.target.value })),
-        style: { width: "100%" }
+        format: (v) => `${v}\xD7`,
+        onCommit: (v) => setProfile((p) => ({ ...p, epocSensitivity: v }))
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Scales the post-exercise afterburn estimate (5\u201312% of session kcal by intensity).")), /* @__PURE__ */ React.createElement(Field, { label: `Protein target \u2014 ${fmt(gPerKgToDisplay(parseFloat(profile.proteinGPerKg) || 0, units), 2)} g/${weightUnitLabel(units)}/day` }, /* @__PURE__ */ React.createElement(
-      "input",
+      ConfirmRange,
       {
-        type: "range",
         min: units === "imperial" ? 0.3 : 0.6,
         max: units === "imperial" ? 1.2 : 2.5,
         step: units === "imperial" ? 0.02 : 0.05,
         value: gPerKgToDisplay(parseFloat(profile.proteinGPerKg) || 0, units),
-        onChange: (e) => setProfile((p) => ({ ...p, proteinGPerKg: String(displayToGPerKg(parseFloat(e.target.value), units)) })),
-        style: { width: "100%" }
+        format: (v) => `${fmt(parseFloat(v), 2)} g/${weightUnitLabel(units)}`,
+        onCommit: (v) => setProfile((p) => ({ ...p, proteinGPerKg: String(displayToGPerKg(parseFloat(v), units)) }))
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Flat daily rate, not tier-scaled like carbs. Default ", fmt(gPerKgToDisplay(1, units), 2), " g/", weightUnitLabel(units), "; athlete guidelines typically range ", fmt(gPerKgToDisplay(1.2, units), 2), "\u2013", fmt(gPerKgToDisplay(2, units), 2), "+ g/", weightUnitLabel(units), ".")), /* @__PURE__ */ React.createElement(Field, { label: `Max carb pre-load \u2014 ${profile.maxPreloadCarbGPerKg} g/kg/day` }, /* @__PURE__ */ React.createElement(
-      "input",
+      ConfirmRange,
       {
-        type: "range",
         min: "6",
         max: "14",
         step: "0.5",
         value: profile.maxPreloadCarbGPerKg,
-        onChange: (e) => setProfile((p) => ({ ...p, maxPreloadCarbGPerKg: e.target.value })),
-        style: { width: "100%" }
+        format: (v) => `${v} g/kg`,
+        onCommit: (v) => setProfile((p) => ({ ...p, maxPreloadCarbGPerKg: v }))
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Ceiling on the tomorrow's-session/race pre-load bump only \u2014 a day's own carbs for training actually done that day are never capped by this. Classic carb-loading protocols top out around 10\u201312 g/kg/day; more shows no extra glycogen benefit and raises GI-distress risk.")), /* @__PURE__ */ React.createElement(Field, { label: `Pre-load funding \u2014 ${Math.round(profile.preloadBorrowRatio * 100)}% borrowed` }, /* @__PURE__ */ React.createElement(
-      "input",
+      ConfirmRange,
       {
-        type: "range",
         min: "0",
         max: "1",
         step: "0.05",
         value: profile.preloadBorrowRatio,
-        onChange: (e) => setProfile((p) => ({ ...p, preloadBorrowRatio: e.target.value })),
-        style: { width: "100%" }
+        format: (v) => `${Math.round(v * 100)}%`,
+        onCommit: (v) => setProfile((p) => ({ ...p, preloadBorrowRatio: v }))
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "How pre-loaded carbs get funded: 0% shrinks that day's fat target to make room; 100% raises that day's calorie Target instead, and debits the same amount from the next day's Target to balance it out.")), /* @__PURE__ */ React.createElement(Field, { label: `Minimum fat target \u2014 ${profile.minFatG}g/day` }, /* @__PURE__ */ React.createElement(
-      "input",
+      ConfirmRange,
       {
-        type: "range",
         min: "40",
         max: "150",
         step: "5",
         value: profile.minFatG,
-        onChange: (e) => setProfile((p) => ({ ...p, minFatG: e.target.value })),
-        style: { width: "100%" }
+        format: (v) => `${v}g`,
+        onCommit: (v) => setProfile((p) => ({ ...p, minFatG: v }))
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Fat is normally floored at 20% of Target (ISSN's usual minimum), but a big carb pre-load day can still price it down near nothing \u2014 this flat gram floor backstops that for essential-fatty-acid and fat-soluble-vitamin intake. 100g defaults comfortably inside the ~100\u2013150g/day typical range for an athlete's calorie load. Doesn't apply on race carb-loading days (see below).")), /* @__PURE__ */ React.createElement(Field, { label: `Carb-loading fat floor \u2014 ${(_b = profile.carbLoadFatFloorPct) != null ? _b : 10}% of Target` }, /* @__PURE__ */ React.createElement(
-      "input",
+      ConfirmRange,
       {
-        type: "range",
         min: "0",
         max: "20",
         step: "1",
         value: (_c = profile.carbLoadFatFloorPct) != null ? _c : 10,
-        onChange: (e) => setProfile((p) => ({ ...p, carbLoadFatFloorPct: e.target.value })),
-        style: { width: "100%" }
+        format: (v) => `${v}%`,
+        onCommit: (v) => setProfile((p) => ({ ...p, carbLoadFatFloorPct: v }))
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "On a race's carb-loading days, carbs deliberately displace other macros, so the usual 20% floor and the gram minimum above are lifted and fat is only held to this (lower) share of Target. Short-term loading protocols commonly run fat around 10\u201315% of intake.")), /* @__PURE__ */ React.createElement(Field, { label: "Pre-load debt handling" }, /* @__PURE__ */ React.createElement(
       "select",
@@ -1592,15 +1619,14 @@
         placeholder: units === "imperial" ? "154" : "70"
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "What ", goalParams.label.toLowerCase(), " is aiming for \u2014 kept separate from the current weight above so the goal doesn't shift just because you logged a new weigh-in.", weightTrendAvg !== null && ` Currently averaging ${fmt(kgToDisplay(weightTrendAvg, units), 1)} ${wUnit} (7-day).`)), weightGoalStatus && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, display: "flex", gap: 8, background: SEVERITY_BG[weightGoalStatus.severity], border: `1px solid ${SEVERITY_COLOR[weightGoalStatus.severity]}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: SEVERITY_COLOR[weightGoalStatus.severity] }), /* @__PURE__ */ React.createElement("span", null, formatWeightGoalMessage(weightGoalStatus, units))), range && /* @__PURE__ */ React.createElement(Field, { label: `${profile.goal === "build" ? "Weight gain" : "Weight loss"} rate \u2014 ${profile[rateKey]}%/week` }, /* @__PURE__ */ React.createElement(
-      "input",
+      ConfirmRange,
       {
-        type: "range",
         min: range.min,
         max: range.max,
         step: "0.05",
         value: profile[rateKey],
-        onChange: (e) => setProfile((p) => recordGoalHistory(p, { [rateKey]: e.target.value })),
-        style: { width: "100%" }
+        format: (v) => `${v}%/week`,
+        onCommit: (v) => setProfile((p) => recordGoalHistory(p, { [rateKey]: v }))
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Safe range ", range.min, "\u2013", range.max, "%/week. Faster ", profile.goal === "build" ? "gains skew toward fat" : "loss risks muscle and performance", ".")), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.trendCalibration, onChange: (e) => setProfile((p) => ({ ...p, trendCalibration: e.target.checked })) }), "Auto-calibrate the target from your logged weight trend"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 6, marginLeft: 24, lineHeight: 1.5 } }, "Compares your actual weight trend (needs ~10+ days logged) against the ", goalParams.label.toLowerCase(), " rate above, and nudges the daily target toward what your real data says you need \u2014 rather than trusting the formula alone."), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries logged so far, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`));
   }

@@ -751,23 +751,63 @@ function getGoalParamsForDate(profile, dateKey) {
   return getGoalParams(resolveGoalSettingsForDate(profile, dateKey));
 }
 
+// Shifts a 'YYYY-MM-DD' key by n calendar days. Goes through UTC noon so
+// neither DST nor the viewer's offset can roll it onto the wrong day.
+function shiftDateKey(key, n) {
+  const d = new Date(`${key}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function daysBetweenKeys(a, b) {
+  return Math.round((Date.parse(`${b}T12:00:00Z`) - Date.parse(`${a}T12:00:00Z`)) / 86400000);
+}
+
+// How many days of weight history a day's target looks back over (trend
+// calibration, maintenance weight baseline, and the warm-up for the
+// pre-load carry-forward). Tunable via profile.targetWindowDays.
+const DEFAULT_TARGET_WINDOW_DAYS = 21;
+const TARGET_WINDOW_MIN_DAYS = 14; // trend calibration needs 8+ entries spanning 10+ days
+const TARGET_WINDOW_MAX_DAYS = 60;
+function getTargetWindowDays(profile) {
+  const n = parseInt(profile.targetWindowDays, 10);
+  if (isNaN(n)) return DEFAULT_TARGET_WINDOW_DAYS;
+  return Math.max(TARGET_WINDOW_MIN_DAYS, Math.min(TARGET_WINDOW_MAX_DAYS, n));
+}
+
+// The date a day's target window ends at (exclusive). A past day or today
+// looks only at the windowDays before it — so its target is locked in at the
+// start of the day and never moves as later weigh-ins arrive or as the
+// dashboard's visible range scrolls forward. Future days can't see data that
+// doesn't exist yet, so they all anchor at tomorrow (= everything logged
+// through today) — exactly the window tomorrow will use once it arrives.
+function targetAnchorKey(dateKey, todayKey) {
+  const tomorrowKey = shiftDateKey(todayKey, 1);
+  return dateKey < tomorrowKey ? dateKey : tomorrowKey;
+}
+function weightEntriesInWindow(weightLog, anchorKey, windowDays) {
+  const startKey = shiftDateKey(anchorKey, -windowDays);
+  return Object.entries(weightLog)
+    .filter(([d]) => d >= startKey && d < anchorKey)
+    .sort(([a], [b]) => (a < b ? -1 : 1));
+}
+
 // Compares the ACTUAL weight trend from logged entries against the goal's
 // target rate, and returns a daily kcal correction to bring future targets
 // back toward that rate — the same feedback-loop idea trend-based trackers
 // (e.g. MacroFactor-style adaptive TDEE) use instead of trusting a formula
 // alone. Needs a reasonable spread of data before it will speak up.
-function computeTrendCorrection(weightLog, goalSign, ratePct) {
-  const entries = Object.entries(weightLog)
-    .filter(([d]) => (new Date() - new Date(d)) / 86400000 <= 21)
-    .sort(([a], [b]) => (a < b ? -1 : 1));
+// Uses only the windowDays of entries before anchorKey (see targetAnchorKey),
+// never "the last N days from now", so a given day's correction is fixed.
+function computeTrendCorrection(weightLog, goalSign, ratePct, anchorKey, windowDays = DEFAULT_TARGET_WINDOW_DAYS) {
+  const entries = weightEntriesInWindow(weightLog, anchorKey, windowDays);
   if (entries.length < 8) return { insufficient: true, n: entries.length };
-  const t0 = new Date(entries[0][0]).getTime();
-  const spanDays = (new Date(entries[entries.length - 1][0]).getTime() - t0) / 86400000;
+  const d0 = entries[0][0];
+  const spanDays = daysBetweenKeys(d0, entries[entries.length - 1][0]);
   if (spanDays < 10) return { insufficient: true, n: entries.length, spanDays };
 
   // Linear regression (kg vs. day index) — more robust to daily water/glycogen
   // noise than just diffing the first and last data points.
-  const xs = entries.map(([d]) => (new Date(d).getTime() - t0) / 86400000);
+  const xs = entries.map(([d]) => daysBetweenKeys(d0, d));
   const ys = entries.map(([, kg]) => kg);
   const n = xs.length;
   const meanX = xs.reduce((a, b) => a + b, 0) / n;
@@ -781,6 +821,20 @@ function computeTrendCorrection(weightLog, goalSign, ratePct) {
   // Clamp so a noisy or short window can't swing the target wildly in one go.
   const correctionKcal = Math.max(-400, Math.min(400, rawCorrection));
   return { insufficient: false, n, spanDays, actualWeeklyRateKg, targetWeeklyRateKg, correctionKcal };
+}
+
+// Most recent logged weight on or before dateKey (null if none). Used as a
+// day's weight when it has no weigh-in of its own, instead of the profile's
+// current weight — which is overwritten with the latest entry on every load
+// and would otherwise reprice every un-weighed past day after each new
+// weigh-in. sortedKeys: weightLog's keys, ascending.
+function weightOnOrBefore(weightLog, sortedKeys, dateKey) {
+  let lo = 0, hi = sortedKeys.length - 1, found = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (sortedKeys[mid] <= dateKey) { found = sortedKeys[mid]; lo = mid + 1; } else hi = mid - 1;
+  }
+  return found === null ? null : weightLog[found];
 }
 
 // Trailing average ending at the most recent logged date (not necessarily
@@ -916,6 +970,7 @@ function App() {
     goalHistory: [],
     targetWeightKg: "",
     trendCalibration: true,
+    targetWindowDays: DEFAULT_TARGET_WINDOW_DAYS,
     proteinGPerKg: 1.0,
     minFatG: 100,
     carbLoadFatFloorPct: 10,
@@ -1065,9 +1120,11 @@ function App() {
   );
 
   const goalParams = useMemo(() => getGoalParams(profile), [profile.goal, profile.buildRatePct, profile.loseRatePct]);
+  const targetWindowDays = getTargetWindowDays(profile);
+  // Today's correction, for display — dailyRows computes each day's own.
   const trendCorrection = useMemo(
-    () => computeTrendCorrection(weightLog, goalParams.sign, goalParams.ratePct),
-    [weightLog, goalParams]
+    () => computeTrendCorrection(weightLog, goalParams.sign, goalParams.ratePct, toLocalISODate(new Date()), targetWindowDays),
+    [weightLog, goalParams, targetWindowDays]
   );
   const weightTrendAvg = useMemo(() => computeRollingAvgWeight(weightLog), [weightLog]);
   const weightGoalStatus = useMemo(
@@ -1368,11 +1425,18 @@ function App() {
       stravaByDate[d].push(a);
     }
     const stravaSyncedSet = new Set(stravaData.syncedDates);
+    const todayKey = toLocalISODate(new Date());
+    const sortedWeightKeys = Object.keys(weightLog).sort();
     const days = [];
     let carryRepaymentKcal = 0; // debt owed to the CURRENT day by the previous day's pre-load borrowing
-    for (let i = rangeDays - 1; i >= -FORWARD_DAYS; i--) {
+    // The pre-load carry-forward starts targetWindowDays before the first
+    // visible day (those warm-up rows are computed, then dropped), so the
+    // oldest visible day still gets its repayment from the day before it,
+    // and changing rangeDays or the date rolling forward can't change it.
+    for (let i = rangeDays - 1 + targetWindowDays; i >= -FORWARD_DAYS; i--) {
       const d = daysAgo(i);
       const key = toLocalISODate(d);
+      const anchorKey = targetAnchorKey(key, todayKey);
       const stravaActs = stravaByDate[key] || [];
       const intervalsActs = actByDate[key] || [];
       const stravaSynced = stravaSyncedSet.has(key);
@@ -1385,7 +1449,9 @@ function App() {
       // weight shifts across a training block, and this keeps demand/fueling
       // numbers tracking the athlete rather than a single fixed profile value.
       // (Computed early since planned-session kcal estimates need it too.)
-      const weightForDay = weightLog[key] ?? (parseFloat(profile.weightKg) || null);
+      // Days with no weigh-in carry forward the last one before them (future
+      // days therefore use the latest), never the profile's current weight.
+      const weightForDay = weightLog[key] ?? weightOnOrBefore(weightLog, sortedWeightKeys, key) ?? (parseFloat(profile.weightKg) || null);
 
       // Prefer Strava's own per-activity `calories` (accurate) when we have it
       // for this day; fall back to intervals.icu; fall back further to a
@@ -1448,11 +1514,15 @@ function App() {
       // build/maintain/lose today never reprices a day that already happened.
       const goalParamsForDay = getGoalParamsForDate(profile, key);
 
-      // Maintenance pins BMR to the athlete's profile weight rather than
-      // that day's logged weight — day-to-day water/glycogen swings
-      // shouldn't move the "maintain" target. Build/lose intentionally
-      // keep tracking the logged weight, since their rate is a % of it.
-      const bmrWeight = goalParamsForDay.sign === 0 ? (parseFloat(profile.weightKg) || null) : weightForDay;
+      // Maintenance pins BMR to the average weight over this day's fixed
+      // target window rather than that day's logged weight — day-to-day
+      // water/glycogen swings shouldn't move the "maintain" target, and
+      // (unlike the profile's current weight) the window average for a past
+      // day never changes. Build/lose intentionally keep tracking the logged
+      // weight, since their rate is a % of it.
+      const windowWeights = weightEntriesInWindow(weightLog, anchorKey, targetWindowDays);
+      const windowAvgWeight = windowWeights.length ? windowWeights.reduce((sum, [, kg]) => sum + kg, 0) / windowWeights.length : null;
+      const bmrWeight = goalParamsForDay.sign === 0 ? (windowAvgWeight ?? weightForDay) : weightForDay;
       const dayBmr = bmrWeight
         ? calcBMR(profile.sex, bmrWeight, parseFloat(profile.heightCm), parseFloat(profile.age))
         : bmr;
@@ -1475,7 +1545,13 @@ function App() {
       // the observed weight trend is drifting off that rate. For "maintain"
       // (sign 0, no correction data yet) this reduces to target === demand.
       const goalAdjustmentKcal = weightForDay ? goalParamsForDay.sign * (goalParamsForDay.ratePct / 100) * weightForDay * KCAL_PER_KG_TISSUE / 7 : 0;
-      const calibrationKcal = (profile.trendCalibration && trendCorrection && !trendCorrection.insufficient) ? trendCorrection.correctionKcal : 0;
+      // Each day's correction comes from its own fixed window (and its own
+      // goal), not today's — so a past day's target doesn't drift as new
+      // weigh-ins land.
+      const dayTrendCorrection = profile.trendCalibration
+        ? computeTrendCorrection(weightLog, goalParamsForDay.sign, goalParamsForDay.ratePct, anchorKey, targetWindowDays)
+        : null;
+      const calibrationKcal = (dayTrendCorrection && !dayTrendCorrection.insufficient) ? dayTrendCorrection.correctionKcal : 0;
       const baseTarget = demand + goalAdjustmentKcal + calibrationKcal;
 
       // Fueling targets: carbs scale with the IOC/Burke tier as before. If
@@ -1595,7 +1671,7 @@ function App() {
         targetDisplay = Math.max(carbDrivenTarget, macroFloorKcalDisplay);
       }
 
-      const isFutureOrToday = key >= toLocalISODate(new Date());
+      const isFutureOrToday = key >= todayKey;
 
       // What tomorrow actually owes. Two adjustments on top of the plain
       // carb-bump borrow:
@@ -1662,6 +1738,7 @@ function App() {
       const nutritionMissing = intake === null;
       const weightMissing = weightLog[key] === undefined;
 
+      if (i > rangeDays - 1) continue; // warm-up row — only here to seed carryRepaymentKcal
       days.push({
         date: key,
         label: d.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
@@ -1682,7 +1759,7 @@ function App() {
       });
     }
     return days;
-  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates]);
+  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, targetWindowDays, matchedKcalRates]);
 
 
   const summary = useMemo(() => {
@@ -2167,10 +2244,18 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
         Compares your actual weight trend (needs ~10+ days logged) against the {goalParams.label.toLowerCase()} rate above,
         and nudges the daily target toward what your real data says you need — rather than trusting the formula alone.
       </div>
+      <Field label={`Target window — ${getTargetWindowDays(profile)} days`}>
+        <ConfirmRange min={TARGET_WINDOW_MIN_DAYS} max={TARGET_WINDOW_MAX_DAYS} step="1" value={getTargetWindowDays(profile)} format={(v) => `${v} days`}
+          onCommit={(v) => setProfile((p) => ({ ...p, targetWindowDays: parseInt(v, 10) }))} />
+        <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
+          Each day's target is computed from the weigh-ins in the fixed window of days just before it (trend calibration and the maintenance weight baseline),
+          so a past day's target never moves as new data arrives or as the dashboard range scrolls. Longer = steadier but slower to react.
+        </div>
+      </Field>
       {trendCorrection && (
         <div style={{ marginTop: 12, fontFamily: mono, fontSize: 12, color: dim }}>
           {trendCorrection.insufficient
-            ? `Gathering data — ${trendCorrection.n} weight entries logged so far, need ~8+ spanning 10+ days.`
+            ? `Gathering data — ${trendCorrection.n} weight entries in the last ${getTargetWindowDays(profile)} days, need ~8+ spanning 10+ days.`
             : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target → correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`}
         </div>
       )}

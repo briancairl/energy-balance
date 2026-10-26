@@ -542,13 +542,37 @@
   function getGoalParamsForDate(profile, dateKey) {
     return getGoalParams(resolveGoalSettingsForDate(profile, dateKey));
   }
-  function computeTrendCorrection(weightLog, goalSign, ratePct) {
-    const entries = Object.entries(weightLog).filter(([d]) => (/* @__PURE__ */ new Date() - new Date(d)) / 864e5 <= 21).sort(([a], [b]) => a < b ? -1 : 1);
+  function shiftDateKey(key, n) {
+    const d = /* @__PURE__ */ new Date(`${key}T12:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+  }
+  function daysBetweenKeys(a, b) {
+    return Math.round((Date.parse(`${b}T12:00:00Z`) - Date.parse(`${a}T12:00:00Z`)) / 864e5);
+  }
+  const DEFAULT_TARGET_WINDOW_DAYS = 21;
+  const TARGET_WINDOW_MIN_DAYS = 14;
+  const TARGET_WINDOW_MAX_DAYS = 60;
+  function getTargetWindowDays(profile) {
+    const n = parseInt(profile.targetWindowDays, 10);
+    if (isNaN(n)) return DEFAULT_TARGET_WINDOW_DAYS;
+    return Math.max(TARGET_WINDOW_MIN_DAYS, Math.min(TARGET_WINDOW_MAX_DAYS, n));
+  }
+  function targetAnchorKey(dateKey, todayKey) {
+    const tomorrowKey = shiftDateKey(todayKey, 1);
+    return dateKey < tomorrowKey ? dateKey : tomorrowKey;
+  }
+  function weightEntriesInWindow(weightLog, anchorKey, windowDays) {
+    const startKey = shiftDateKey(anchorKey, -windowDays);
+    return Object.entries(weightLog).filter(([d]) => d >= startKey && d < anchorKey).sort(([a], [b]) => a < b ? -1 : 1);
+  }
+  function computeTrendCorrection(weightLog, goalSign, ratePct, anchorKey, windowDays = DEFAULT_TARGET_WINDOW_DAYS) {
+    const entries = weightEntriesInWindow(weightLog, anchorKey, windowDays);
     if (entries.length < 8) return { insufficient: true, n: entries.length };
-    const t0 = new Date(entries[0][0]).getTime();
-    const spanDays = (new Date(entries[entries.length - 1][0]).getTime() - t0) / 864e5;
+    const d0 = entries[0][0];
+    const spanDays = daysBetweenKeys(d0, entries[entries.length - 1][0]);
     if (spanDays < 10) return { insufficient: true, n: entries.length, spanDays };
-    const xs = entries.map(([d]) => (new Date(d).getTime() - t0) / 864e5);
+    const xs = entries.map(([d]) => daysBetweenKeys(d0, d));
     const ys = entries.map(([, kg]) => kg);
     const n = xs.length;
     const meanX = xs.reduce((a, b) => a + b, 0) / n;
@@ -564,6 +588,17 @@
     const rawCorrection = (targetWeeklyRateKg - actualWeeklyRateKg) * KCAL_PER_KG_TISSUE / 7;
     const correctionKcal = Math.max(-400, Math.min(400, rawCorrection));
     return { insufficient: false, n, spanDays, actualWeeklyRateKg, targetWeeklyRateKg, correctionKcal };
+  }
+  function weightOnOrBefore(weightLog, sortedKeys, dateKey) {
+    let lo = 0, hi = sortedKeys.length - 1, found = null;
+    while (lo <= hi) {
+      const mid = lo + hi >> 1;
+      if (sortedKeys[mid] <= dateKey) {
+        found = sortedKeys[mid];
+        lo = mid + 1;
+      } else hi = mid - 1;
+    }
+    return found === null ? null : weightLog[found];
   }
   function computeRollingAvgWeight(weightLog, windowDays = 7) {
     const entries = Object.entries(weightLog);
@@ -678,6 +713,7 @@
       goalHistory: [],
       targetWeightKg: "",
       trendCalibration: true,
+      targetWindowDays: DEFAULT_TARGET_WINDOW_DAYS,
       proteinGPerKg: 1,
       minFatG: 100,
       carbLoadFatFloorPct: 10,
@@ -792,9 +828,10 @@
       [profile.sex, profile.weightKg, profile.heightCm, profile.age]
     );
     const goalParams = useMemo(() => getGoalParams(profile), [profile.goal, profile.buildRatePct, profile.loseRatePct]);
+    const targetWindowDays = getTargetWindowDays(profile);
     const trendCorrection = useMemo(
-      () => computeTrendCorrection(weightLog, goalParams.sign, goalParams.ratePct),
-      [weightLog, goalParams]
+      () => computeTrendCorrection(weightLog, goalParams.sign, goalParams.ratePct, toLocalISODate(/* @__PURE__ */ new Date()), targetWindowDays),
+      [weightLog, goalParams, targetWindowDays]
     );
     const weightTrendAvg = useMemo(() => computeRollingAvgWeight(weightLog), [weightLog]);
     const weightGoalStatus = useMemo(
@@ -1024,7 +1061,7 @@
       [schedule, stravaData, intervalsData, matchOverrides]
     );
     const dailyRows = useMemo(() => {
-      var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
+      var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k;
       if (!bmr) return [];
       const wellByDate = {};
       for (const w of intervalsData.wellness) {
@@ -1046,11 +1083,14 @@
         stravaByDate[d].push(a);
       }
       const stravaSyncedSet = new Set(stravaData.syncedDates);
+      const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
+      const sortedWeightKeys = Object.keys(weightLog).sort();
       const days = [];
       let carryRepaymentKcal = 0;
-      for (let i = rangeDays - 1; i >= -FORWARD_DAYS; i--) {
+      for (let i = rangeDays - 1 + targetWindowDays; i >= -FORWARD_DAYS; i--) {
         const d = daysAgo(i);
         const key = toLocalISODate(d);
+        const anchorKey = targetAnchorKey(key, todayKey);
         const stravaActs = stravaByDate[key] || [];
         const intervalsActs = actByDate[key] || [];
         const stravaSynced = stravaSyncedSet.has(key);
@@ -1058,7 +1098,7 @@
         const carbLoad = getCarbLoadState(schedule, key);
         const upcomingRace = getUpcomingRace(schedule, key);
         const raceToday = upcomingRace && upcomingRace.raceDate === key ? upcomingRace : null;
-        const weightForDay = (_a = weightLog[key]) != null ? _a : parseFloat(profile.weightKg) || null;
+        const weightForDay = (_b = (_a = weightLog[key]) != null ? _a : weightOnOrBefore(weightLog, sortedWeightKeys, key)) != null ? _b : parseFloat(profile.weightKg) || null;
         let exerciseKcal = 0, epocKcal = 0, source = null;
         let durationSec = 0, ifWeightedSum = 0;
         if (stravaActs.length) {
@@ -1106,20 +1146,23 @@
         const durationMin = durationSec / 60;
         const avgIF = durationSec > 0 ? ifWeightedSum / durationSec : 0.5;
         const goalParamsForDay = getGoalParamsForDate(profile, key);
-        const bmrWeight = goalParamsForDay.sign === 0 ? parseFloat(profile.weightKg) || null : weightForDay;
+        const windowWeights = weightEntriesInWindow(weightLog, anchorKey, targetWindowDays);
+        const windowAvgWeight = windowWeights.length ? windowWeights.reduce((sum, [, kg]) => sum + kg, 0) / windowWeights.length : null;
+        const bmrWeight = goalParamsForDay.sign === 0 ? windowAvgWeight != null ? windowAvgWeight : weightForDay : weightForDay;
         const dayBmr = bmrWeight ? calcBMR(profile.sex, bmrWeight, parseFloat(profile.heightCm), parseFloat(profile.age)) : bmr;
         const w = wellByDate[key];
-        const ctl = (_b = w == null ? void 0 : w.ctl) != null ? _b : null;
-        const atl = (_c = w == null ? void 0 : w.atl) != null ? _c : null;
+        const ctl = (_c = w == null ? void 0 : w.ctl) != null ? _c : null;
+        const atl = (_d = w == null ? void 0 : w.atl) != null ? _d : null;
         const tsb = ctl !== null && atl !== null ? ctl - atl : null;
         const fatigueBuffer = profile.fatigueBuffer && tsb !== null && tsb < -10 ? dayBmr * 0.05 : 0;
         const baseline = profile.neatMode === "offset" ? dayBmr + (parseFloat(profile.neatOffset) || 0) : dayBmr * (parseFloat(profile.neatFactor) || 1.15);
         const demand = baseline + exerciseKcal + epocKcal + fatigueBuffer;
         const nutritionEntry = effectiveNutritionEntry(nutrition[key]);
         const nutritionSource = nutritionEntry ? normalizeNutritionEntry(nutrition[key]).macrosfirst ? "macrosfirst" : "manual" : null;
-        const intake = (_d = nutritionEntry == null ? void 0 : nutritionEntry.calories) != null ? _d : null;
+        const intake = (_e = nutritionEntry == null ? void 0 : nutritionEntry.calories) != null ? _e : null;
         const goalAdjustmentKcal = weightForDay ? goalParamsForDay.sign * (goalParamsForDay.ratePct / 100) * weightForDay * KCAL_PER_KG_TISSUE / 7 : 0;
-        const calibrationKcal = profile.trendCalibration && trendCorrection && !trendCorrection.insufficient ? trendCorrection.correctionKcal : 0;
+        const dayTrendCorrection = profile.trendCalibration ? computeTrendCorrection(weightLog, goalParamsForDay.sign, goalParamsForDay.ratePct, anchorKey, targetWindowDays) : null;
+        const calibrationKcal = dayTrendCorrection && !dayTrendCorrection.insufficient ? dayTrendCorrection.correctionKcal : 0;
         const baseTarget = demand + goalAdjustmentKcal + calibrationKcal;
         const fuelTier = classifyTrainingTier(durationMin);
         const tomorrowKey = toLocalISODate(daysAgo(i - 1));
@@ -1162,16 +1205,16 @@
           const macroFloorKcalDisplay = carbTargetGDisplay * 4 + (proteinTargetG || 0) * 4 + fatTargetGDisplay * 9;
           targetDisplay = Math.max(carbDrivenTarget, macroFloorKcalDisplay);
         }
-        const isFutureOrToday = key >= toLocalISODate(/* @__PURE__ */ new Date());
+        const isFutureOrToday = key >= todayKey;
         let floorExcessKcal = preloading && !raceLoading && target > carbDrivenTarget ? target - carbDrivenTarget : 0;
         let carbRepaymentKcal = raceLoading ? 0 : borrowedKcal;
         if (!raceLoading && preloading && !isFutureOrToday && carbTargetG) {
-          const actualCarbsG = (_e = nutritionEntry == null ? void 0 : nutritionEntry.carbs) != null ? _e : 0;
+          const actualCarbsG = (_f = nutritionEntry == null ? void 0 : nutritionEntry.carbs) != null ? _f : 0;
           const attainment = Math.min(1, Math.max(0, actualCarbsG / carbTargetG));
           carbRepaymentKcal *= attainment;
         }
         if (!raceLoading && preloading && !isFutureOrToday && fatTargetG) {
-          const actualFatG = (_f = nutritionEntry == null ? void 0 : nutritionEntry.fat) != null ? _f : 0;
+          const actualFatG = (_g = nutritionEntry == null ? void 0 : nutritionEntry.fat) != null ? _g : 0;
           const fatAttainment = Math.min(1, Math.max(0, actualFatG / fatTargetG));
           floorExcessKcal *= fatAttainment;
         }
@@ -1188,6 +1231,7 @@
         const trainingMissing = !stravaSynced && intervalsActs.length === 0 && source !== "planned";
         const nutritionMissing = intake === null;
         const weightMissing = weightLog[key] === void 0;
+        if (i > rangeDays - 1) continue;
         days.push({
           date: key,
           label: d.toLocaleDateString(void 0, { month: "short", day: "numeric" }),
@@ -1202,10 +1246,10 @@
           gap,
           tsb,
           source,
-          weight: (_g = weightLog[key]) != null ? _g : null,
-          protein: (_h = nutritionEntry == null ? void 0 : nutritionEntry.protein) != null ? _h : null,
-          carbs: (_i = nutritionEntry == null ? void 0 : nutritionEntry.carbs) != null ? _i : null,
-          fat: (_j = nutritionEntry == null ? void 0 : nutritionEntry.fat) != null ? _j : null,
+          weight: (_h = weightLog[key]) != null ? _h : null,
+          protein: (_i = nutritionEntry == null ? void 0 : nutritionEntry.protein) != null ? _i : null,
+          carbs: (_j = nutritionEntry == null ? void 0 : nutritionEntry.carbs) != null ? _j : null,
+          fat: (_k = nutritionEntry == null ? void 0 : nutritionEntry.fat) != null ? _k : null,
           nutritionSource,
           activityCount: stravaActs.length || intervalsActs.length || scheduledSessions.length,
           trainingMissing: trainingMissing && !isFutureOrToday,
@@ -1228,7 +1272,7 @@
         });
       }
       return days;
-    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, goalParams, trendCorrection, matchedKcalRates]);
+    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, targetWindowDays, matchedKcalRates]);
     const summary = useMemo(() => {
       const withIntake = dailyRows.filter((d) => d.intake !== null);
       const withGap = dailyRows.filter((d) => d.gap !== null);
@@ -1628,7 +1672,17 @@
         format: (v) => `${v}%/week`,
         onCommit: (v) => setProfile((p) => recordGoalHistory(p, { [rateKey]: v }))
       }
-    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Safe range ", range.min, "\u2013", range.max, "%/week. Faster ", profile.goal === "build" ? "gains skew toward fat" : "loss risks muscle and performance", ".")), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.trendCalibration, onChange: (e) => setProfile((p) => ({ ...p, trendCalibration: e.target.checked })) }), "Auto-calibrate the target from your logged weight trend"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 6, marginLeft: 24, lineHeight: 1.5 } }, "Compares your actual weight trend (needs ~10+ days logged) against the ", goalParams.label.toLowerCase(), " rate above, and nudges the daily target toward what your real data says you need \u2014 rather than trusting the formula alone."), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries logged so far, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`));
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Safe range ", range.min, "\u2013", range.max, "%/week. Faster ", profile.goal === "build" ? "gains skew toward fat" : "loss risks muscle and performance", ".")), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 18, fontSize: 12.5, cursor: "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: profile.trendCalibration, onChange: (e) => setProfile((p) => ({ ...p, trendCalibration: e.target.checked })) }), "Auto-calibrate the target from your logged weight trend"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 6, marginLeft: 24, lineHeight: 1.5 } }, "Compares your actual weight trend (needs ~10+ days logged) against the ", goalParams.label.toLowerCase(), " rate above, and nudges the daily target toward what your real data says you need \u2014 rather than trusting the formula alone."), /* @__PURE__ */ React.createElement(Field, { label: `Target window \u2014 ${getTargetWindowDays(profile)} days` }, /* @__PURE__ */ React.createElement(
+      ConfirmRange,
+      {
+        min: TARGET_WINDOW_MIN_DAYS,
+        max: TARGET_WINDOW_MAX_DAYS,
+        step: "1",
+        value: getTargetWindowDays(profile),
+        format: (v) => `${v} days`,
+        onCommit: (v) => setProfile((p) => ({ ...p, targetWindowDays: parseInt(v, 10) }))
+      }
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Each day's target is computed from the weigh-ins in the fixed window of days just before it (trend calibration and the maintenance weight baseline), so a past day's target never moves as new data arrives or as the dashboard range scrolls. Longer = steadier but slower to react.")), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries in the last ${getTargetWindowDays(profile)} days, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`));
   }
   function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync, onFetch, fetching, fetchError, rangeDays, setRangeDays, lastFetched, importError, importNotice, units }) {
     const [dragOver, setDragOver] = useState(false);

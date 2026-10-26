@@ -145,10 +145,18 @@ history and just persist as entered.
 - **Goal**: maintain / build / lose (`profile.goal`), adjustable rate
   (`profile.buildRatePct` default 0.25%/wk, `profile.loseRatePct` default 0.5%/wk), converted
   to kcal via the ~7700 kcal/kg tissue approximation.
-- **Trend calibration** (`profile.trendCalibration`, default on): linear regression over the
-  last ~21 days of `weightLog` vs. the goal's target rate; the gap becomes a daily kcal
-  correction, clamped to ±400 kcal, applied once ≥8 data points spanning ≥10 days exist.
-  `computeTrendCorrection()`.
+- **Trend calibration** (`profile.trendCalibration`, default on): linear regression over
+  `weightLog` vs. the goal's target rate; the gap becomes a daily kcal correction, clamped to
+  ±400 kcal, applied once ≥8 data points spanning ≥10 days exist. `computeTrendCorrection()`.
+- **Fixed per-day target window** (`profile.targetWindowDays`, default 21, 14–60, tunable in
+  the Goal card): each day's target only looks at the weigh-ins in the N days *before* that
+  day (`targetAnchorKey()` — future days anchor at tomorrow, i.e. everything logged through
+  today), never "the last N days from now". That window drives the day's trend correction
+  (using that day's own goal) and, for maintain, the BMR weight (window average). Days with
+  no weigh-in use the last weigh-in on or before them, not `profile.weightKg`. The pre-load
+  carry-forward loop starts N days before the first visible row (warm-up rows are dropped),
+  so the oldest visible day still gets its repayment. Net effect: a past day's target never
+  moves as new data arrives or as the visible range (`rangeDays`) scrolls forward.
 - **Fueling targets**:
   - Carbs: IOC/Burke tier (rest/moderate/endurance/extreme, by session duration), blended
     within the tier's g/kg range by today's training intensity.

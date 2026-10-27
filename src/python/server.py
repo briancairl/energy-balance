@@ -34,6 +34,21 @@ default) connect cleanly instead of erroring on a plain-HTTP server. See the
 
 This uses only the Python standard library — nothing to pip install.
 
+IronMan mode (optional, profile.ironmanMode — toggled in Setup -> Goal):
+  ironman_calibrate.py fits the athlete's own session costs (kcal/h by
+  discipline and zone, from Strava calories with activity-kcal-overrides
+  applied) and an effective NEAT multiplier + activity-kcal scale (Kalman
+  filter over the weigh-ins, regularized toward the current profile). The
+  result lives in the `ironman-calibration` store key.
+    POST /api/ironman/calibrate   re-fit now and save (via update_store)
+    GET  /api/ironman/projection  weekly calibrated kcal/carb demand for every
+                                  week of the plan files in
+                                  configs/schedule_sources/ (read-only;
+                                  ?from=&to= week-start bounds)
+  CLI: python3 src/python/ironman_calibrate.py --store secrets/app_store.json
+       [--plan configs/schedule_sources/<plan>.json] [--out out.json]
+  Tests: python3 -m unittest discover -s src/python -p 'test_*.py'
+
 Setup:
   1. Register an app at https://www.strava.com/settings/api
      - Authorization Callback Domain: localhost
@@ -97,6 +112,7 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import schedule_sync
+import ironman_calibrate
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -570,6 +586,43 @@ def schedule_sources_sync_loop(poll_seconds=30):
                 update_store(mark_bad)
 
 
+def load_schedule_source_plans():
+    """Every schedule_sources/*.json file in "plan" shape ({meta, weeks}),
+    oldest-modified first, so ironman_calibrate.project_plan lets the newest
+    file win for any week two files both cover. "entries"-shape files carry
+    no week structure and are skipped. Read-only — never touches the store."""
+    plans = []
+    for path, tag in schedule_sync.discover_schedule_sources(SCHEDULE_SOURCES_DIR):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            mtime = os.path.getmtime(path)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[ironman] skipping {path}: {e}")
+            continue
+        if isinstance(data, dict) and isinstance(data.get("weeks"), list):
+            plans.append((mtime, tag, data))
+    plans.sort(key=lambda t: t[0])
+    return [(tag, data) for _, tag, data in plans]
+
+
+def run_ironman_calibration():
+    """Re-fits IronMan-mode parameters from the current store and saves them
+    under `ironman-calibration`. The (slow-ish, ~1s) fit runs on a snapshot
+    OUTSIDE the store lock; only the final single-key write goes through
+    update_store, so a concurrent nutrition/weight save is never blocked on
+    it or clobbered by it."""
+    snapshot = load_store()
+    plans = [p for _, p in load_schedule_source_plans()]
+    calibration = ironman_calibrate.run_calibration(snapshot, plans)
+
+    def mutate(s):
+        s["ironman-calibration"] = calibration
+        return s
+    update_store(mutate)
+    return calibration
+
+
 def ensure_auth_config():
     """Guarantees a username/password exist — generating and saving one on
     first run if config.json doesn't have them — so the server never runs
@@ -806,6 +859,44 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "missing key"}, 400)
             store = load_store()
             return self._send_json({"key": key, "value": store.get(key)})
+
+        # IronMan mode's whole-plan forward projection. Reads the plan files
+        # in schedule_sources/ directly (schedule_sync only imports 8 weeks of
+        # sessions into training-schedule, which is far short of a full IM
+        # build). Read-only: uses the saved `ironman-calibration` if there is
+        # one, else fits on the fly without saving it.
+        #   ?from=YYYY-MM-DD&to=YYYY-MM-DD  (week-start bounds; default: this
+        #   week's Monday .. end of plan)
+        if path == "/api/ironman/projection":
+            store = load_store()
+            plans = load_schedule_source_plans()
+            if not plans:
+                return self._send_json({"weeks": [], "sources": [], "error": "no plan files in schedule_sources/"})
+            calibration = store.get("ironman-calibration")
+            saved = bool(calibration)
+            if not calibration:
+                calibration = ironman_calibrate.run_calibration(store, [p for _, p in plans])
+            today = datetime.now().date()
+            start = qs.get("from", [None])[0] or (today - timedelta(days=today.weekday())).isoformat()
+            end = qs.get("to", [None])[0]
+            if (start and not DATE_RE.match(start)) or (end and not DATE_RE.match(end)):
+                return self._send_json({"error": "from/to must be YYYY-MM-DD"}, 400)
+            plan_dicts = [p for _, p in plans]
+            athlete = ironman_calibrate.athlete_inputs(store, plan_dicts)
+            weeks = ironman_calibrate.project_plan(plan_dicts, calibration, athlete, start, end)
+            races = []
+            for _, p in plans:
+                for r in (p.get("meta") or {}).get("races", []):
+                    if r.get("date") and r["date"] >= start and r not in races:
+                        races.append({"date": r["date"], "name": r.get("name"), "id": r.get("id")})
+            return self._send_json({
+                "weeks": weeks,
+                "races": sorted(races, key=lambda r: r["date"]),
+                "sources": [tag for tag, _ in plans],
+                "calibrationSaved": saved,
+                "calibrationFittedAt": calibration.get("fittedAt"),
+                "weightKg": athlete["weightKg"],
+            })
 
         if path == "/api/intervals/status":
             cfg = get_intervals_config()
@@ -1216,6 +1307,15 @@ class Handler(BaseHTTPRequestHandler):
                 "summary": summary,
                 "schedule": result["training-schedule"],
             })
+
+        # Re-fits IronMan-mode calibration on demand (Setup -> Goal ->
+        # "Recalibrate"). Writes `ironman-calibration` via update_store.
+        if path == "/api/ironman/calibrate":
+            try:
+                calibration = run_ironman_calibration()
+            except Exception as e:
+                return self._send_json({"error": f"calibration failed: {e}"}, 500)
+            return self._send_json({"ok": True, "calibration": calibration})
 
         if path == "/api/weight/day":
             date = qs.get("date", [None])[0]

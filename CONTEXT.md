@@ -33,6 +33,8 @@ index.html    Served as-is from the project root
 | `index.html` | Thin shell: loads React/ReactDOM/Recharts/PapaParse from CDN as globals, then `/app.js`. |
 | `configs/config.json` | Secrets and settings. **Not delivered/committed** — copy from `configs/config.example.json`. |
 | `configs/config.example.json` | Template with every recognized config field. |
+| `src/python/ironman_calibrate.py` | IronMan-mode calibration (stdlib only): session-cost fit, energy-balance fit, empirical intake-vs-load relation, whole-plan projection. CLI + imported by `server.py`. |
+| `src/python/test_*.py` | Unit tests (synthetic fixtures only): `python3 -m unittest discover -s src/python -p 'test_*.py'`. |
 | `src/python/repair_store.py` | One-off recovery tool for a corrupted `secrets/app_store.json` (see Concurrency below). Keep around. |
 | `assets/favicon.ico`, `assets/icon-*.png`, `assets/apple-touch-icon.png`, `assets/logo-header.png`, `configs/manifest.json`, `assets/logo-master.svg` | App icon set + PWA manifest. `logo-master.svg` is the editable source if the mark ever needs to change. |
 
@@ -197,6 +199,67 @@ history and just persist as entered.
   a swap. See `getTaperState` / `getCarbLoadState` / `getEffectiveSessionsForDate` in
   `app-source.jsx`.
 
+## IronMan mode (`profile.ironmanMode`, Setup → Goal)
+
+A layer on top of the core model, for an athlete whose real failure mode is under-fueling a
+long-course build. **Off = byte-for-byte the old behavior.** Verified by rendering every tab
+against `main`'s compiled app.js with the same store: identical DOM apart from the toggle
+itself, and identical requests. Every IronMan branch in `dailyRows` is gated on
+`imCalibrationReady(profile, imCal)`, and the calibration/overrides are only fetched while the mode is on.
+
+**Calibration** (`ironman_calibrate.py` → store key `ironman-calibration`, written via
+`update_store` by `POST /api/ironman/calibrate`. The fit itself runs on a snapshot *outside*
+the lock, and only the single-key write is locked):
+- *Session cost*: kcal per moving hour by discipline (Swim, Run, Ride + VirtualRide, Strength) and
+  zone, from Strava `calories` (`activity-kcal-overrides` win; ride calories that disagree with
+  `kilojoules` × the athlete's own median ratio by >20–25% are re-derived from kJ). Intensity
+  proxy: avg power ÷ FTP for rides (FTP = intervals.icu eFTP → plan `meta.athlete.estFTP` → 285), suffer
+  score per hour for runs/swims (no distance in the cache, so no pace). Weighted linear fit, evaluated at the
+  average intensity of a session *labelled* with that zone (`ZONE_REF` — a "Z4" session's average
+  includes warm-up, so it is far below threshold). The result is compared against the `ZONES` MET table.
+- *Energy balance*: 1-D Kalman filter on tissue weight, `w += (intake − E)/7700`,
+  `E = neat·BMR(w) + k·sessionKcal`, weigh-ins as measurements (variance inflated the morning after
+  a >2,000 kcal day or a big carb swing, to absorb glycogen/water). `neat`, `k` come from a grid posterior
+  (innovation likelihood + Gaussian prior centred on the current profile: neatFactor
+  (+0.05 if the fatigue buffer is on), 1 + 0.08·epocSensitivity). `neat` is therefore an
+  *effective* NEAT that absorbs the fatigue buffer, and `k` absorbs EPOC. The total expenditure is
+  well identified; the split between them leans on the prior (reported as `shrinkage` / `corrNeatScale`).
+- *Empirical*: weekly intake, corrected by the smoothed weight slope, vs hours / device kcal / CTL (OLS).
+  CTL for the first 42 days of intervals history is skipped (it's seeded at 0).
+
+**In `dailyRows`** (mode on + calibration present):
+- Strava kcal respects `activity-kcal-overrides`. Planned sessions use the calibrated zone rate
+  (a `sourceActivity` still wins). Demand = `neat·BMR + k·sessionKcal`: the EPOC column shows
+  `(k−1)·sessionKcal`, and the fatigue buffer is 0 because both are inside the fitted parameters.
+- **Training-day floor**: on any day with session kcal, `carbDrivenTarget = max(…, demand)`. The goal
+  deficit, trend correction or a pre-load repayment can't take Target below calibrated maintenance + session.
+  The rolloverCapped bookkeeping sees the same floor, so an unrealized repayment still rolls forward.
+- **Carbs** = max(IOC/Burke tier value, day-load periodization on session kcal:
+  `IM_CARB_LOAD_ANCHORS`, ~5–7 g/kg easy → 8–10 moderate-long → 10–12 big). On pre-load/race-load
+  days that becomes the floor under the bump, so borrow/repay and carb-load still only fund the
+  bump *above* the day's own carbs. Protein is unchanged (`proteinGPerKg`).
+- Rows gain `imCarbGPerKg`, `imFloorKcal`, `imFloorApplied`, `imSessionFuel` (planned Ride/Run
+  ≥75 min: the session's `fuel` wins field by field, otherwise defaults by duration/zone capped by
+  `profile.imGutCarbGPerH`, default 90 g/h), and `imKeySessions` (`key`, Z4+, or ≥120 min → recovery prompt
+  of 1.0–1.2 g/kg carb + 0.3 g/kg protein).
+- `ironmanStatus` memo: 7-day intake vs calibrated demand (warn below −300 kcal/d), forward
+  Kalman weight trend (`imWeightTrend`, warn when falling faster than 0.3%/wk), and today's remaining
+  kcal/carbs/protein. Shown in `IronmanPanel` on the Dashboard.
+
+**Whole-plan projection**: `GET /api/ironman/projection` reads every plan-shaped
+`configs/schedule_sources/*.json` directly. The newest file (by mtime) wins for any week two files
+both cover. It is needed because `training-schedule` only ever holds ~8 weeks. The endpoint returns per-week mean
+demand/target/carbs/fat and the peak day, uses each session's `zone` when present (else
+`classify_zone`), and excludes race-titled sessions from the averages. It is read-only and fits on the
+fly if no calibration is saved yet. Rendered by `IronmanProjection`.
+
+**Plan import additions** (`schedule_sync.py`): a session's own `zone` (int 1–5) wins over
+`classify_zone`. An optional `fuel` ({carbGPerH, fluidMlPerH, sodiumMgPerH}) and `key: true` are carried
+onto the single-session entry. Plan races are reconciled with existing race entries: a race whose name
+matches an existing entry's `notes` (case-insensitive) on a different date *moves* that entry (id,
+taperDays, carbLoadDays kept) instead of adding a duplicate. An entry already sitting on another of
+the plan's race dates is never moved.
+
 ## Server concurrency (fixed after a real corruption incident — don't regress this)
 
 `app_store.json` writes MUST go through `update_store(mutate_fn)`, which holds a single lock
@@ -251,7 +314,9 @@ looking for the longest valid-JSON prefix) — keep it around.
   against COROS's own numbers instead (see Setup's Model Tuning slider).
 - Terra API (third-party health-data aggregator) investigated for MacrosFirst/COROS access —
   ruled out, business pricing ($399+/mo), not viable for personal use.
-- No committed automated test suite. Testing during development was thorough but ad hoc:
+- Only a small committed test suite (`src/python/test_*.py`: calibration math on synthetic
+  fixtures, schedule_sync zone/fuel/race reconciliation). The frontend has none.
+- Previously: no committed automated test suite. Testing during development was thorough but ad hoc:
   pure-function unit tests, a real concurrency stress test, and Playwright browser tests
   (including one against a dependency-free standalone harness, since this sandbox has no
   outbound network access to load Recharts/React from CDN for a full render test) — all run

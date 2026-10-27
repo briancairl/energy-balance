@@ -119,6 +119,27 @@ def classify_zone(disc, title, detail):
     return 2
 
 
+def session_zone(s):
+    """The plan's own per-session `zone` (int 1-5) wins when present; older
+    plan files without one fall back to the title/detail keyword heuristic."""
+    z = s.get("zone")
+    if isinstance(z, int) and not isinstance(z, bool) and 1 <= z <= 5:
+        return z
+    return classify_zone(s["disc"], s["title"], s.get("detail", ""))
+
+
+_FUEL_KEYS = ("carbGPerH", "fluidMlPerH", "sodiumMgPerH")
+
+
+def clean_fuel(fuel):
+    """Keeps only the known numeric fuel fields; None if nothing usable."""
+    if not isinstance(fuel, dict):
+        return None
+    out = {k: fuel[k] for k in _FUEL_KEYS
+           if isinstance(fuel.get(k), (int, float)) and not isinstance(fuel.get(k), bool) and fuel[k] >= 0}
+    return out or None
+
+
 def short_note(title):
     # "Swim — Technique" -> "Technique", "Bike — Long w/ Climbing" -> "Long w/ Climbing"
     if "—" in title:
@@ -163,6 +184,7 @@ def sync_plan_into_store(store, plan, source_tag, weeks_ahead=8):
     window_end = today + dt.timedelta(weeks=weeks_ahead)
 
     existing_race_dates = {e["raceDate"] for e in schedule if e.get("kind") == "race"}
+    plan_race_dates = {r.get("date") for r in plan.get("meta", {}).get("races", [])}
 
     # Only this source's *single* (window-refreshed) entries get dropped and
     # regenerated each sync. Race entries this source already added are left
@@ -181,10 +203,34 @@ def sync_plan_into_store(store, plan, source_tag, weeks_ahead=8):
             e["endDate"] = new_end
 
     new_entries = []
+    moved_log = []
 
     # --- races (whole calendar, not window-limited) ---
     for race in plan.get("meta", {}).get("races", []):
         if race["date"] in existing_race_dates:
+            continue
+        # A race whose date was corrected in the plan after it was first
+        # imported (or hand-entered): races are never rebuilt, so without
+        # this the old entry would keep driving taper/carb-load math on the
+        # wrong date AND a duplicate would be added on the new one. Match by
+        # name (case-insensitive notes == plan race name) and move the
+        # existing entry instead — keeping its id, taperDays, carbLoadDays
+        # and anything else hand-tuned on it. An entry already sitting on
+        # another of this plan's race dates is never stolen.
+        name = (race.get("name") or "").strip().lower()
+        match = None
+        if name:
+            for e in kept:
+                if (e.get("kind") == "race" and (e.get("notes") or "").strip().lower() == name
+                        and e.get("raceDate") != race["date"] and e.get("raceDate") not in plan_race_dates):
+                    match = e
+                    break
+        if match is not None:
+            old_date = match.get("raceDate")
+            match["raceDate"] = race["date"]
+            existing_race_dates.discard(old_date)
+            existing_race_dates.add(race["date"])
+            moved_log.append((match.get("id"), match.get("notes"), old_date, race["date"]))
             continue
         taper_days, zone = RACE_TUNING.get(race["id"], (7, 3))
         new_entries.append({
@@ -225,22 +271,33 @@ def sync_plan_into_store(store, plan, source_tag, weeks_ahead=8):
             if covered_by_existing(session_date, kept):
                 n_skipped_conflict += 1
                 continue
-            new_entries.append({
+            entry = {
                 "id": gen_id(len(new_entries) + 1000),
                 "kind": "single",
                 "activityType": activity_type,
-                "zone": classify_zone(disc, s["title"], s.get("detail", "")),
+                "zone": session_zone(s),
                 "durationMin": s["mins"],
                 "date": session_date.isoformat(),
                 "notes": short_note(s["title"]),
                 "source": source_tag,
-            })
+            }
+            # Optional plan extras, carried through for IronMan mode's
+            # in-session fueling / recovery prompts (ignored otherwise).
+            fuel = clean_fuel(s.get("fuel"))
+            if fuel:
+                entry["fuel"] = fuel
+            if s.get("key") is True:
+                entry["key"] = True
+            new_entries.append(entry)
             n_sessions += 1
 
     final_schedule = kept + new_entries
 
     lines = [f"[{source_tag}] window: {window_start} .. {window_end} ({weeks_ahead} weeks)",
              f"[{source_tag}] kept {len(kept)} existing entries (not from this source)."]
+    for eid, label, old_date, new_date in moved_log:
+        lines.append(f"[{source_tag}]   moved race entry {eid!r} ({label!r}) {old_date} -> {new_date} "
+                     f"to match the plan (kept its id/taper/carb-load settings)")
     for eid, label, new_end in capped_log:
         lines.append(f"[{source_tag}]   capped open-ended entry {eid!r} ({label!r}) -> endDate {new_end}")
     n_races_added = sum(1 for e in new_entries if e.get("kind") == "race")

@@ -895,6 +895,133 @@ function formatWeightGoalMessage(status, units) {
     : `Averaging ${avg} ${u} (7-day) — ${pct}% ${status.direction} your ${target} ${u} target weight.`;
 }
 
+// ---------- IronMan mode (profile.ironmanMode) ----------
+// Everything in this block is only ever consulted when profile.ironmanMode is
+// on AND a fitted `ironman-calibration` store key exists (written by
+// src/python/ironman_calibrate.py — via POST /api/ironman/calibrate or the
+// CLI). With the mode off, dailyRows takes exactly the code paths it always
+// has; none of these helpers is called.
+//
+// The calibration replaces two generic pieces of the demand model with the
+// athlete's own fitted numbers:
+//   - per-session cost: kcal/hour by discipline and zone, fitted from his own
+//     device calories (replaces the MET table for planned sessions);
+//   - an EFFECTIVE NEAT multiplier and activity-kcal scale fitted against his
+//     weight trend: demand = neat × BMR + scale × sessionKcal. The scale
+//     absorbs EPOC and the effective NEAT absorbs the fatigue buffer, so in
+//     IronMan mode those two separate heuristics are not added on top (the
+//     EPOC column shows the scale's share instead).
+const IM_DISC = { Ride: "Ride", Run: "Run", Swim: "Swim", Strength: "Strength" };
+// Day-load carb anchors (session kcal -> g/kg/day), mirrored from
+// ironman_calibrate.CARB_LOAD_ANCHORS: ~5–7 g/kg easy, 8–10 moderate-long,
+// 10–12 big days. Piecewise-linear so there's no cliff between bands.
+const IM_CARB_LOAD_ANCHORS = [[0, 5.0], [600, 6.0], [1200, 7.5], [2000, 9.0], [2800, 10.5], [4000, 12.0]];
+const IM_UNDERFUEL_KCAL = 300;          // 7-day intake this far below calibrated demand -> warning
+const IM_WEIGHT_DROP_PCT_PER_WEEK = 0.3; // smoothed trend falling faster than this -> warning
+const IM_FUEL_MIN_SESSION_MIN = 75;      // in-session fueling shown for planned sessions this long or longer
+const IM_DEFAULT_GUT_CARB_G_PER_H = 90;  // profile.imGutCarbGPerH default — long-ride ceiling when the plan gives none
+
+function imCalibrationReady(profile, cal) {
+  return !!(profile.ironmanMode && cal && cal.energyBalance && cal.sessionCost
+    && parseFloat(cal.energyBalance.neat) > 0 && parseFloat(cal.energyBalance.activityScale) > 0);
+}
+function imInterp(anchors, x) {
+  if (x <= anchors[0][0]) return anchors[0][1];
+  for (let i = 1; i < anchors.length; i++) {
+    const [x0, y0] = anchors[i - 1], [x1, y1] = anchors[i];
+    if (x <= x1) return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+  }
+  return anchors[anchors.length - 1][1];
+}
+function imCarbGPerKgForLoad(sessionKcal) {
+  return imInterp(IM_CARB_LOAD_ANCHORS, Math.max(0, sessionKcal || 0));
+}
+// Calibrated (unscaled) kcal for one planned session, or null when the
+// discipline has no calibrated rate (Row/Other/race entries) — the caller
+// then falls back to the ordinary estimatePlannedKcal.
+function imPlannedSessionKcal(cal, session, durationMin) {
+  const src = session.sourceActivity;
+  if (src && src.durationMin > 0 && src.kcal > 0) return (src.kcal / src.durationMin) * durationMin; // explicit user choice still wins
+  const disc = IM_DISC[session.activityType];
+  const d = disc && cal.sessionCost[disc];
+  if (!d) return null;
+  const z = Math.min(5, Math.max(1, parseInt(session.zone, 10) || 2));
+  const rate = parseFloat((d.kcalPerHourByZone || {})[z]);
+  return rate > 0 ? rate * (durationMin / 60) : null;
+}
+// Strava calories with the athlete's manual activity-kcal-overrides applied
+// (IronMan mode only — the ordinary model has never consulted that key).
+function imStravaKcal(act, kcalOverrides) {
+  const ov = kcalOverrides && kcalOverrides[`strava-${act.id}`];
+  if (typeof ov === "number" && ov >= 0) return ov;
+  return (typeof act.calories === "number" && act.calories > 0)
+    ? act.calories
+    : (typeof act.kilojoules === "number" ? act.kilojoules / 4.184 / 0.24 : 0);
+}
+// In-session fueling for a planned session >= IM_FUEL_MIN_SESSION_MIN. The
+// plan's own `fuel` (carried through by schedule_sync) wins field by field;
+// otherwise defaults by duration/intensity, capped by how much the athlete's
+// gut is currently trained to take on long rides (profile.imGutCarbGPerH).
+function imSessionFuel(session, durationMin, gutCarbGPerH) {
+  if (!(durationMin >= IM_FUEL_MIN_SESSION_MIN)) return null;
+  const t = session.activityType;
+  if (t !== "Ride" && t !== "Run") return null; // swims/strength: fuel before/after, not during
+  const z = parseInt(session.zone, 10) || 2;
+  const gut = Math.min(120, Math.max(40, parseFloat(gutCarbGPerH) || IM_DEFAULT_GUT_CARB_G_PER_H));
+  let carb;
+  if (t === "Ride") carb = durationMin >= 180 ? gut : durationMin >= 120 ? Math.min(gut, 75) : 60;
+  else carb = durationMin >= 120 ? Math.min(gut, 75) : 60;
+  if (z >= 4 && durationMin < 120) carb = Math.min(carb, 60);
+  const fluid = Math.min(1000, 500 + (z >= 3 ? 150 : 0) + (durationMin >= 180 ? 150 : 0) + (t === "Run" ? 100 : 0));
+  const sodium = Math.min(1000, 500 + (durationMin >= 150 ? 200 : 0) + (z >= 3 ? 100 : 0) + (durationMin >= 240 ? 200 : 0));
+  const planFuel = session.fuel || {};
+  const pick = (k, v) => (typeof planFuel[k] === "number" ? planFuel[k] : v);
+  const out = {
+    carbGPerH: pick("carbGPerH", carb), fluidMlPerH: pick("fluidMlPerH", fluid), sodiumMgPerH: pick("sodiumMgPerH", sodium),
+    fromPlan: typeof planFuel.carbGPerH === "number",
+  };
+  const hours = durationMin / 60;
+  return { ...out, totalCarbG: out.carbGPerH * hours, totalFluidMl: out.fluidMlPerH * hours, totalSodiumMg: out.sodiumMgPerH * hours };
+}
+function imIsKeySession(session) {
+  return session.key === true || (parseInt(session.zone, 10) || 0) >= 4 || session.durationMin >= 120;
+}
+// Forward-only local-linear Kalman filter over the weigh-ins (level kg,
+// slope kg/day) — same model as ironman_calibrate.weight_trend minus the
+// hindsight smoother, since the dashboard wants "as of the latest weigh-in".
+// Daily steps, so sparse logging just widens the uncertainty.
+function imWeightTrend(weightLog) {
+  const keys = Object.keys(weightLog).filter((k) => typeof weightLog[k] === "number").sort();
+  if (keys.length < 5) return null;
+  const R = 0.45 * 0.45, Ql = 0.02 * 0.02, Qs = 0.002 * 0.002;
+  let x0 = weightLog[keys[0]], x1 = 0;
+  let p00 = 1, p01 = 0, p11 = 0.01;
+  const n = daysBetweenKeys(keys[0], keys[keys.length - 1]);
+  for (let i = 0; i <= n; i++) {
+    const key = shiftDateKey(keys[0], i);
+    if (i > 0) {
+      x0 = x0 + x1;
+      const n00 = p00 + 2 * p01 + p11 + Ql, n01 = p01 + p11, n11 = p11 + Qs;
+      p00 = n00; p01 = n01; p11 = n11;
+    }
+    const z = weightLog[key];
+    if (typeof z === "number") {
+      const S = p00 + R, k0 = p00 / S, k1 = p01 / S, y = z - x0;
+      x0 += k0 * y; x1 += k1 * y;
+      const n00 = (1 - k0) * p00, n01 = (1 - k0) * p01, n11 = p11 - k1 * p01;
+      p00 = n00; p01 = n01; p11 = n11;
+    }
+  }
+  return { date: keys[keys.length - 1], levelKg: x0, slopeKgPerWeek: x1 * 7, slopeSdKgPerWeek: Math.sqrt(Math.max(0, p11)) * 7,
+    pctPerWeek: (x1 * 7 / x0) * 100 };
+}
+async function apiIronmanCalibrate() {
+  const res = await fetchWithRetry("/api/ironman/calibrate", { method: "POST" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Calibration failed (${res.status}).`);
+  return data.calibration;
+}
+
 // ---------- tiny inline icon set (no icon library needed) ----------
 function Icon({ path, size = 14, color = "currentColor" }) {
   return (
@@ -1013,6 +1140,16 @@ function App() {
   const [macrosfirstFetching, setMacrosfirstFetching] = useState(false);
   const [macrosfirstError, setMacrosfirstError] = useState(null);
 
+  // IronMan mode: fitted calibration (store key `ironman-calibration`) and
+  // the athlete's manual per-activity kcal corrections. Only fetched while
+  // the mode is on, so with it off the app's requests are exactly as before.
+  const [imCal, setImCal] = useState(null);
+  const [kcalOverrides, setKcalOverrides] = useState({});
+  const [imCalibrating, setImCalibrating] = useState(false);
+  const [imCalError, setImCalError] = useState(null);
+  const [imProjection, setImProjection] = useState(null);
+  const [imProjectionError, setImProjectionError] = useState(null);
+
   useEffect(() => {
     (async () => {
       const [p, n, w, sched, matchOv, cached, stravaCached, mfLastSync] = await Promise.all([
@@ -1070,6 +1207,43 @@ function App() {
   }, []);
 
   useEffect(() => { if (loaded) storageSet("profile", profile); }, [profile, loaded]);
+
+  useEffect(() => {
+    if (!loaded || !profile.ironmanMode) return;
+    let cancelled = false;
+    Promise.all([storageGet("ironman-calibration", null), storageGet("activity-kcal-overrides", {})])
+      .then(([cal, ov]) => { if (!cancelled) { setImCal(cal); setKcalOverrides(ov || {}); } });
+    return () => { cancelled = true; };
+  }, [loaded, profile.ironmanMode]);
+
+  // Whole-plan weekly projection, read straight from the plan files in
+  // configs/schedule_sources/ (training-schedule only ever holds ~8 weeks).
+  useEffect(() => {
+    if (!loaded || !profile.ironmanMode) return;
+    let cancelled = false;
+    setImProjectionError(null);
+    fetchWithRetry("/api/ironman/projection")
+      .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+      .then(({ ok, d }) => {
+        if (cancelled) return;
+        if (!ok || d.error) setImProjectionError(d.error || "Projection request failed.");
+        setImProjection(d);
+      })
+      .catch((e) => { if (!cancelled) setImProjectionError(e.message || "Could not reach /api/ironman/projection."); });
+    return () => { cancelled = true; };
+  }, [loaded, profile.ironmanMode, imCal]);
+
+  async function recalibrateIronman() {
+    setImCalibrating(true);
+    setImCalError(null);
+    try {
+      setImCal(await apiIronmanCalibrate());
+    } catch (e) {
+      setImCalError(e.message || "Calibration failed.");
+    } finally {
+      setImCalibrating(false);
+    }
+  }
 
   const [importError, setImportError] = useState(null);
   const [importNotice, setImportNotice] = useState(null);
@@ -1428,6 +1602,11 @@ function App() {
     const todayKey = toLocalISODate(new Date());
     const sortedWeightKeys = Object.keys(weightLog).sort();
     const days = [];
+    // IronMan mode is a layer on top: when `im` is false every branch below
+    // that mentions it is skipped and the day is computed exactly as before.
+    const im = imCalibrationReady(profile, imCal);
+    const imNeat = im ? parseFloat(imCal.energyBalance.neat) : null;
+    const imScale = im ? parseFloat(imCal.energyBalance.activityScale) : null;
     let carryRepaymentKcal = 0; // debt owed to the CURRENT day by the previous day's pre-load borrowing
     // The pre-load carry-forward starts targetWindowDays before the first
     // visible day (those warm-up rows are computed, then dropped), so the
@@ -1462,7 +1641,7 @@ function App() {
       if (stravaActs.length) {
         source = "strava";
         for (const a of stravaActs) {
-          const kcal = (typeof a.calories === "number" && a.calories > 0)
+          const kcal = im ? imStravaKcal(a, kcalOverrides) : (typeof a.calories === "number" && a.calories > 0)
             ? a.calories
             : (typeof a.kilojoules === "number" ? a.kilojoules / 4.184 / 0.24 : 0);
           exerciseKcal += kcal;
@@ -1486,7 +1665,8 @@ function App() {
         for (const s of scheduledSessions) {
           const baseIF = s.sourceActivity ? s.sourceActivity.intensityFactor : ZONES[s.zone - 1].if;
           const effIF = s.taperIntensityFactor ? baseIF * s.taperIntensityFactor : baseIF; // tapered sessions carry a reduced effective intensity
-          const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay, matchedKcalRates); // s.durationMin is already taper-adjusted
+          const imKcal = im ? imPlannedSessionKcal(imCal, s, s.durationMin) : null;
+          const kcal = imKcal ?? estimatePlannedKcal(s, s.durationMin, weightForDay, matchedKcalRates); // s.durationMin is already taper-adjusted
           exerciseKcal += kcal;
           epocKcal += kcal * epocFactorFor(effIF) * profile.epocSensitivity;
           durationSec += s.durationMin * 60;
@@ -1531,10 +1711,19 @@ function App() {
       const ctl = w?.ctl ?? null;
       const atl = w?.atl ?? null;
       const tsb = ctl !== null && atl !== null ? ctl - atl : null;
-      const fatigueBuffer = profile.fatigueBuffer && tsb !== null && tsb < -10 ? dayBmr * 0.05 : 0;
-      const baseline = profile.neatMode === "offset"
+      let fatigueBuffer = profile.fatigueBuffer && tsb !== null && tsb < -10 ? dayBmr * 0.05 : 0;
+      let baseline = profile.neatMode === "offset"
         ? dayBmr + (parseFloat(profile.neatOffset) || 0)
         : dayBmr * (parseFloat(profile.neatFactor) || 1.15);
+      if (im) {
+        // Calibrated: demand = neat × BMR + scale × session kcal. The fitted
+        // effective NEAT already absorbs the fatigue buffer and the activity
+        // scale absorbs EPOC, so the generic versions are swapped out rather
+        // than stacked on top (the EPOC column carries the scale's share).
+        baseline = dayBmr * imNeat;
+        epocKcal = exerciseKcal * (imScale - 1);
+        fatigueBuffer = 0;
+      }
       const demand = baseline + exerciseKcal + epocKcal + fatigueBuffer;
       const nutritionEntry = effectiveNutritionEntry(nutrition[key]);
       const nutritionSource = nutritionEntry ? (normalizeNutritionEntry(nutrition[key]).macrosfirst ? "macrosfirst" : "manual") : null;
@@ -1579,7 +1768,13 @@ function App() {
       const effectiveTier = raceLoading ? FUEL_TIERS[FUEL_TIERS.length - 1] : (preloading ? preloadTier : fuelTier);
       const blend = intensityBlend(avgIF);
       const effectiveBlend = raceLoading ? 1 : blend;
-      const normalCarbTargetG = weightForDay ? weightForDay * (fuelTier.carbLo + (fuelTier.carbHi - fuelTier.carbLo) * blend) : null;
+      // IronMan mode: the day's own carbs are the higher of the IOC/Burke
+      // tier value and a day-load periodization on calibrated session kcal
+      // (~5–7 g/kg easy, 8–10 moderate-long, 10–12 big days) — whichever is
+      // higher, since under-fueling is the failure mode this mode guards.
+      const iocCarbGPerKg = fuelTier.carbLo + (fuelTier.carbHi - fuelTier.carbLo) * blend;
+      const imCarbGPerKg = im ? Math.max(iocCarbGPerKg, imCarbGPerKgForLoad(exerciseKcal + epocKcal)) : null;
+      const normalCarbTargetG = weightForDay ? weightForDay * (im ? imCarbGPerKg : iocCarbGPerKg) : null;
       // Sports-science consensus tops classic carb loading out around 10-12
       // g/kg/day — beyond that, extra intake shows no further glycogen
       // benefit and raises GI-distress risk. This cap only clips the
@@ -1589,6 +1784,10 @@ function App() {
       const preloadCapGPerKg = parseFloat(profile.maxPreloadCarbGPerKg) || 12;
       let effectiveCarbGPerKg = effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * effectiveBlend;
       if (preloading || raceLoading) effectiveCarbGPerKg = Math.min(effectiveCarbGPerKg, preloadCapGPerKg);
+      // A pre-load/race-load day never drops below the day's own (IronMan)
+      // carbs; an ordinary day just uses them. The borrow/repay below then
+      // only ever funds the bump ABOVE that, exactly as it already did.
+      if (im) effectiveCarbGPerKg = (preloading || raceLoading) ? Math.max(imCarbGPerKg, effectiveCarbGPerKg) : imCarbGPerKg;
       const carbTargetG = weightForDay ? weightForDay * effectiveCarbGPerKg : null;
       const extraCarbKcal = ((preloading || raceLoading) && carbTargetG !== null && normalCarbTargetG !== null && carbTargetG > normalCarbTargetG)
         ? (carbTargetG - normalCarbTargetG) * 4 : 0;
@@ -1602,7 +1801,14 @@ function App() {
       // today's own share from tomorrow. carryRepaymentKcal itself isn't
       // finalized until after the fat floor below is known — see there.
       const repaidKcal = carryRepaymentKcal; // capture before we overwrite it below
-      const carbDrivenTarget = baseTarget - repaidKcal + borrowedKcal;
+      // IronMan under-fueling floor: on a training day Target never drops
+      // below calibrated maintenance + that day's session cost (= calibrated
+      // demand), whatever the goal, trend correction or pre-load repayment
+      // would otherwise subtract. A repayment the floor swallows is handled
+      // by the chosen debt strategy exactly like one the macro floor swallows.
+      const imFloorKcal = im && exerciseKcal > 0 ? demand : 0;
+      const carbDrivenTargetRaw = baseTarget - repaidKcal + borrowedKcal;
+      const carbDrivenTarget = im ? Math.max(carbDrivenTargetRaw, imFloorKcal) : carbDrivenTargetRaw;
 
       // Protein scales off goal weight (where the athlete's headed), not the
       // day's fluctuating logged weight — unlike carbs/fat, which track
@@ -1716,7 +1922,8 @@ function App() {
         // hypothetical target if repaidKcal had been 0) — only the
         // unrealized remainder rolls forward; capped so an unfundable setup
         // can't compound debt indefinitely (see ROLLOVER_DEBT_CAP_KCAL).
-        const targetWithoutRepay = weightForDay ? Math.max(baseTarget + borrowedKcal, macroFloorKcal) : (baseTarget + borrowedKcal);
+        const targetWithoutRepayBase = weightForDay ? Math.max(baseTarget + borrowedKcal, macroFloorKcal) : (baseTarget + borrowedKcal);
+        const targetWithoutRepay = im ? Math.max(targetWithoutRepayBase, imFloorKcal) : targetWithoutRepayBase;
         const realizedRepayment = targetWithoutRepay - target;
         const unrealizedRepayment = Math.max(0, repaidKcal - realizedRepayment);
         carryRepaymentKcal = Math.min(newDebtToday + unrealizedRepayment, ROLLOVER_DEBT_CAP_KCAL);
@@ -1756,10 +1963,45 @@ function App() {
         durationMin, fuelTier, carbTargetG: carbTargetGDisplay, proteinTargetG, fatTargetG: fatTargetGDisplay, isFutureOrToday,
         scheduledSessions, preloading, preloadSession, borrowedKcal, repaidKcal,
         taper, raceLoading, race: taper?.race || carbLoad?.race || raceToday || null,
+        ...(im ? {
+          imMode: true, imCarbGPerKg, imFloorKcal,
+          imFloorApplied: imFloorKcal > 0 && carbDrivenTargetRaw < imFloorKcal,
+          imSessionFuel: (source === "planned" ? scheduledSessions : [])
+            .map((s) => ({ session: s, fuel: imSessionFuel(s, s.durationMin, profile.imGutCarbGPerH) }))
+            .filter((x) => x.fuel),
+          imKeySessions: scheduledSessions.filter(imIsKeySession),
+        } : null),
       });
     }
     return days;
-  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, targetWindowDays, matchedKcalRates]);
+  }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, targetWindowDays, matchedKcalRates, imCal, kcalOverrides]);
+
+  // IronMan mode's under-fueling guard: 7-day rolling intake vs calibrated
+  // demand, the Kalman-smoothed weight trend, and what's still to eat today.
+  const ironmanStatus = useMemo(() => {
+    if (!imCalibrationReady(profile, imCal)) return null;
+    const todayKey = toLocalISODate(new Date());
+    const past = dailyRows.filter((r) => r.date < todayKey && r.intake !== null).slice(-7);
+    const avgIntake = past.length ? past.reduce((s, r) => s + r.intake, 0) / past.length : null;
+    const avgDemand = past.length ? past.reduce((s, r) => s + r.demand, 0) / past.length : null;
+    const rollingGap = avgIntake !== null ? avgIntake - avgDemand : null;
+    const trend = imWeightTrend(weightLog);
+    const today = dailyRows.find((r) => r.date === todayKey) || null;
+    const upcoming = dailyRows.filter((r) => r.date >= todayKey);
+    const recentKey = dailyRows.filter((r) => r.date <= todayKey && r.date >= shiftDateKey(todayKey, -1) && r.imKeySessions && r.imKeySessions.length);
+    return {
+      nDays: past.length, avgIntake, avgDemand, rollingGap,
+      underfueled: rollingGap !== null && past.length >= 4 && rollingGap < -IM_UNDERFUEL_KCAL,
+      trend,
+      weightFalling: !!(trend && trend.pctPerWeek < -IM_WEIGHT_DROP_PCT_PER_WEEK),
+      today,
+      remainingKcal: today ? today.target - (today.intake || 0) : null,
+      remainingCarbG: today && today.carbTargetG !== null ? today.carbTargetG - (today.carbs || 0) : null,
+      remainingProteinG: today && today.proteinTargetG !== null ? today.proteinTargetG - (today.protein || 0) : null,
+      upcoming, recentKey,
+      weightKg: parseFloat(profile.weightKg) || null,
+    };
+  }, [dailyRows, weightLog, profile, imCal]);
 
 
   const summary = useMemo(() => {
@@ -1893,7 +2135,8 @@ function App() {
             stravaLastFetched={stravaLastFetched} stravaSyncedCount={stravaData.syncedDates.length}
             intervalsStatus={intervalsStatus} intervalsSyncedCount={intervalsData.syncedDates.length}
             goalParams={goalParams} trendCorrection={trendCorrection}
-            weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus} />
+            weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus}
+            imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={recalibrateIronman} />
         )}
         {tab === "import" && (
           <ImportTab onFile={handleCSVFile} csvPreview={csvPreview} colMap={colMap} setColMap={setColMap}
@@ -1917,7 +2160,10 @@ function App() {
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
             goalParams={goalParams} trendCorrection={trendCorrection} trendCalibration={profile.trendCalibration}
             proteinGPerKg={profile.proteinGPerKg} weightGoalStatus={weightGoalStatus}
-            targetWeightKg={parseFloat(profile.targetWeightKg) || null} units={units} />
+            targetWeightKg={parseFloat(profile.targetWeightKg) || null} units={units}
+            ironmanStatus={ironmanStatus} imProjection={profile.ironmanMode ? imProjection : null}
+            imProjectionError={profile.ironmanMode ? imProjectionError : null}
+            imMissingCalibration={!!profile.ironmanMode && !imCalibrationReady(profile, imCal)} />
         )}
       </div>
     </div>
@@ -1958,7 +2204,7 @@ function ConfirmRange({ value, onCommit, format = (v) => v, ...rangeProps }) {
   );
 }
 
-function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
+function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate }) {
   const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
   const units = profile.units || "metric";
   const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
@@ -2145,7 +2391,8 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
       </div>
 
       <GoalCard profile={profile} setProfile={setProfile} goalParams={goalParams} trendCorrection={trendCorrection}
-        weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus} />
+        weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus}
+        imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={onRecalibrate} />
 
       <div style={{ display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start" }}>
         <Icon path={ICONS.info} size={14} color={dim} />
@@ -2176,7 +2423,7 @@ function recordGoalHistory(p, overrides) {
   return { ...p, ...overrides, goalHistory: filtered };
 }
 
-function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
+function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate }) {
   const setGoal = (goal) => setProfile((p) => recordGoalHistory(p, { goal }));
   const range = profile.goal === "build" ? GOAL_DEFAULTS.build : profile.goal === "lose" ? GOAL_DEFAULTS.lose : null;
   const rateKey = profile.goal === "build" ? "buildRatePct" : "loseRatePct";
@@ -2252,11 +2499,63 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
           so a past day's target never moves as new data arrives or as the dashboard range scrolls. Longer = steadier but slower to react.
         </div>
       </Field>
+      <IronmanModeSettings profile={profile} setProfile={setProfile} imCal={imCal}
+        imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={onRecalibrate} />
       {trendCorrection && (
         <div style={{ marginTop: 12, fontFamily: mono, fontSize: 12, color: dim }}>
           {trendCorrection.insufficient
             ? `Gathering data — ${trendCorrection.n} weight entries in the last ${getTargetWindowDays(profile)} days, need ~8+ spanning 10+ days.`
             : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target → correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Setup -> Goal: the IronMan-mode toggle plus a readout of what the fitted
+// calibration says, and a button to re-fit it from the latest data.
+function IronmanModeSettings({ profile, setProfile, imCal, imCalibrating, imCalError, onRecalibrate }) {
+  const on = !!profile.ironmanMode;
+  const eb = imCal && imCal.energyBalance;
+  const sc = imCal && imCal.sessionCost;
+  const gut = parseFloat(profile.imGutCarbGPerH) || IM_DEFAULT_GUT_CARB_G_PER_H;
+  return (
+    <div style={{ marginTop: 18, paddingTop: 16, borderTop: `1px solid ${line}` }}>
+      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, cursor: "pointer", fontWeight: 600 }}>
+        <input type="checkbox" checked={on} onChange={(e) => setProfile((p) => ({ ...p, ironmanMode: e.target.checked }))} />
+        IronMan mode
+      </label>
+      <div style={{ fontSize: 11, color: dim, marginTop: 6, marginLeft: 24, lineHeight: 1.5 }}>
+        Uses your own calibrated session costs and NEAT (fitted from your Strava calories and weight trend) instead of the
+        generic MET/NEAT numbers, never lets a training day's target drop below calibrated demand, periodizes carbs by day
+        load, and shows in-session fueling, a recovery prompt, an under-fueling warning and a whole-plan projection.
+      </div>
+      {on && (
+        <div style={{ marginLeft: 24, marginTop: 10 }}>
+          {eb && !eb.insufficient ? (
+            <div style={{ fontFamily: mono, fontSize: 11.5, color: dim, lineHeight: 1.7 }}>
+              <div>Effective NEAT <b style={{ color: paper }}>{fmt(eb.neat, 2)}×</b> BMR (±{fmt(eb.neatSd, 2)}) · activity scale <b style={{ color: paper }}>{fmt(eb.activityScale, 2)}×</b> (±{fmt(eb.activityScaleSd, 2)})</div>
+              <div>Fitted maintenance over the window: <b style={{ color: paper }}>{fmt(eb.meanDailyExpenditure)} ± {fmt(eb.meanDailyExpenditureSd)}</b> kcal/day</div>
+              {sc && ["Ride", "Run", "Swim"].map((d) => sc[d] && (
+                <div key={d}>{d} kcal/h Z1–Z5: {[1, 2, 3, 4, 5].map((z) => fmt(sc[d].kcalPerHourByZone[z])).join(" / ")}</div>
+              ))}
+              <div>Fitted {imCal.fittedOn || (imCal.fittedAt || "").slice(0, 10)} · weigh-ins {imCal.dataWindow?.weighIns?.join(" → ") || "—"}</div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 11.5, color: amber }}>No calibration yet — targets stay on the standard model until one is fitted.</div>
+          )}
+          <button className="btn-ghost" onClick={onRecalibrate} disabled={imCalibrating} style={{ marginTop: 10, padding: "6px 12px", fontSize: 12 }}>
+            {imCalibrating ? "Calibrating…" : eb ? "Recalibrate from latest data" : "Calibrate now"}
+          </button>
+          {imCalError && <div style={{ marginTop: 6, fontSize: 11.5, color: coral }}>{imCalError}</div>}
+          <Field label={`Long-ride gut ceiling — ${gut} g carb/h`}>
+            <ConfirmRange min="40" max="120" step="5" value={gut} format={(v) => `${v} g/h`}
+              onCommit={(v) => setProfile((p) => ({ ...p, imGutCarbGPerH: v }))} />
+            <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
+              What your gut is currently trained to absorb on rides ≥3h; used only when a planned session has no <code>fuel</code> of its
+              own. Build toward 90–110 g/h over the block (glucose:fructose mixes), practising in training first.
+            </div>
+          </Field>
         </div>
       )}
     </div>
@@ -3569,7 +3868,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
 }
 
 
-function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units }) {
+function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units, ironmanStatus, imProjection, imProjectionError, imMissingCalibration }) {
   const wUnit = weightUnitLabel(units);
   const [visibleMacros, setVisibleMacros] = useState({ carbs: false, protein: false, fat: false });
   const [visibleWeightSeries, setVisibleWeightSeries] = useState({ actual: true, rollingAvg: true, target: true });
@@ -3633,6 +3932,11 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
           </div>
         </div>
       )}
+
+      {imMissingCalibration && (
+        <Banner kind="warning">IronMan mode is on but no calibration has been fitted yet — Setup → Goal → <b>Calibrate now</b>. Until then targets use the standard model.</Banner>
+      )}
+      {ironmanStatus && <IronmanPanel status={ironmanStatus} units={units} />}
 
       {goalParams.sign !== 0 && (
         <div style={{ display: "flex", gap: 8, background: "rgba(79,209,217,0.08)", border: `1px solid ${cyan}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" }}>
@@ -3737,6 +4041,8 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
         </div>
       </div>
 
+      {(imProjection || imProjectionError) && <IronmanProjection projection={imProjection} error={imProjectionError} />}
+
       {hasWeight && (
         <div className="card" style={{ padding: "20px 20px 8px" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12, padding: "0 4px" }}>
@@ -3824,6 +4130,133 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
         </table>
         </div>
       </div>
+    </div>
+  );
+}
+
+// IronMan mode's dashboard block: under-fueling warnings, "behind today",
+// in-session fueling for upcoming planned sessions, and a recovery prompt
+// after key sessions.
+function IronmanPanel({ status, units }) {
+  const { today, trend, weightKg } = status;
+  const wUnit = weightUnitLabel(units);
+  const fuelDays = status.upcoming.filter((r) => r.imSessionFuel && r.imSessionFuel.length);
+  const recover = status.recentKey;
+  const behind = status.remainingKcal;
+  return (
+    <div className="card" style={{ padding: 20, borderColor: status.underfueled || status.weightFalling ? coral : line }}>
+      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, display: "flex", alignItems: "center", gap: 7 }}>
+        <Icon path={ICONS.flame} size={15} color={gold} /> IronMan mode
+      </div>
+      {(status.underfueled || status.weightFalling) && (
+        <div style={{ display: "grid", gap: 8, marginBottom: 14 }}>
+          {status.underfueled && (
+            <Banner kind="error">
+              <b>Under-fueling:</b> last {status.nDays} days averaged {fmt(status.avgIntake)} kcal vs {fmt(status.avgDemand)} calibrated
+              demand — <b>{fmt(-status.rollingGap)} kcal/day short</b>. Sustained, this is what costs sleep and recovery; close the gap
+              before adding training.
+            </Banner>
+          )}
+          {status.weightFalling && (
+            <Banner kind="error">
+              <b>Weight trending down</b> {fmt(Math.abs(status.trend.pctPerWeek), 2)}%/wk ({fmt(kgToDisplay(status.trend.slopeKgPerWeek, units), 2)} {wUnit}/wk,
+              smoothed) — faster than the {IM_WEIGHT_DROP_PCT_PER_WEEK}%/wk guard during the build.
+            </Banner>
+          )}
+        </div>
+      )}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14 }}>
+        <StatCard label="Still to eat today" value={behind !== null ? `${fmt(Math.max(0, behind))} kcal` : "—"} color={behind !== null && behind > 0 ? amber : mint} />
+        <StatCard label="Carbs / protein left" value={status.remainingCarbG !== null ? `${fmt(Math.max(0, status.remainingCarbG))} / ${fmt(Math.max(0, status.remainingProteinG || 0))} g` : "—"} color={mint} />
+        <StatCard label="7-day vs demand" value={status.rollingGap !== null ? `${status.rollingGap >= 0 ? "+" : ""}${fmt(status.rollingGap)} kcal/d` : "—"} color={status.underfueled ? coral : status.rollingGap !== null && status.rollingGap < 0 ? amber : mint} />
+        <StatCard label="Weight trend" value={trend ? `${trend.slopeKgPerWeek >= 0 ? "+" : ""}${fmt(kgToDisplay(trend.slopeKgPerWeek, units), 2)} ${wUnit}/wk` : "—"} color={status.weightFalling ? coral : dim} />
+      </div>
+      {today && (
+        <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>
+          Today: target {fmt(today.target)} kcal · carbs {fmt(today.carbTargetG)} g ({fmt(today.imCarbGPerKg, 1)} g/kg day-load){today.imFloorApplied ? " · training-day floor applied" : ""}
+        </div>
+      )}
+      {recover.length > 0 && weightKg && (
+        <div style={{ marginTop: 14, fontSize: 12.5, lineHeight: 1.6 }}>
+          <b>Recovery</b> after {recover.map((r) => r.imKeySessions.map((s) => s.notes || s.activityType).join(", ")).join("; ")}:
+          within ~1h aim for <b>{fmt(weightKg * 1.0)}–{fmt(weightKg * 1.2)} g carb</b> + <b>~{fmt(weightKg * 0.3)} g protein</b> (1.0–1.2 g/kg + 0.3 g/kg).
+        </div>
+      )}
+      {fuelDays.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 6 }}>In-session fueling (planned ≥{IM_FUEL_MIN_SESSION_MIN} min)</div>
+          <table className="data">
+            <thead><tr><th>Day</th><th>Session</th><th>Carb g/h</th><th>Fluid ml/h</th><th>Sodium mg/h</th><th>Total carb</th></tr></thead>
+            <tbody>
+              {fuelDays.flatMap((r) => r.imSessionFuel.map(({ session, fuel }, i) => (
+                <tr key={`${r.date}-${i}`}>
+                  <td>{r.label}</td>
+                  <td style={{ textAlign: "left" }}>{session.activityType} {fmt(session.durationMin)}′ Z{session.zone}{session.notes ? ` — ${session.notes}` : ""}</td>
+                  <td>{fmt(fuel.carbGPerH)}{fuel.fromPlan ? "" : "*"}</td>
+                  <td>{fmt(fuel.fluidMlPerH)}</td>
+                  <td>{fmt(fuel.sodiumMgPerH)}</td>
+                  <td>{fmt(fuel.totalCarbG)} g</td>
+                </tr>
+              )))}
+            </tbody>
+          </table>
+          <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>* default by duration/intensity (no <code>fuel</code> on the planned session). Fluid/sodium: adjust to heat and sweat rate.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Whole-plan weekly projection (GET /api/ironman/projection): calibrated
+// kcal and carb demand per plan week through race day.
+function IronmanProjection({ projection, error }) {
+  const weeks = (projection && projection.weeks) || [];
+  if (!weeks.length) {
+    return <div className="card" style={{ padding: 20, fontSize: 12.5, color: dim }}>Plan projection: {error || "no plan weeks found in schedule_sources/."}</div>;
+  }
+  const data = weeks.map((w) => ({ ...w, label: w.weekStart.slice(5) }));
+  const width = Math.max(data.length * 34, 600);
+  const raceSet = new Set((projection.races || []).map((r) => r.date));
+  return (
+    <div className="card" style={{ padding: "20px 20px 12px" }}>
+      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 4, padding: "0 4px" }}>Plan projection — calibrated demand per week</div>
+      <div style={{ fontSize: 11.5, color: dim, marginBottom: 12, padding: "0 4px" }}>
+        Mean kcal/day (bars) and carbs g/kg/day (line) for each plan week, from {projection.sources?.join(", ")}. Race days are left out of
+        the averages. Weekly figures use today's weight ({fmt(projection.weightKg, 1)} kg).
+      </div>
+      <div style={{ overflowX: "auto", overflowY: "hidden", maxWidth: "100%" }}>
+        <ComposedChart width={width} height={240} data={data} margin={{ top: 4, right: 12, left: -6, bottom: 0 }}>
+          <CartesianGrid stroke={line} vertical={false} />
+          <XAxis dataKey="label" tick={{ fill: dim, fontSize: 10, fontFamily: mono }} axisLine={{ stroke: line }} tickLine={false} interval={1} />
+          <YAxis yAxisId="kcal" tick={{ fill: dim, fontSize: 11, fontFamily: mono }} axisLine={false} tickLine={false} />
+          <YAxis yAxisId="gkg" orientation="right" domain={[0, 12]} tick={{ fill: dim, fontSize: 11, fontFamily: mono }} axisLine={false} tickLine={false} />
+          <Tooltip content={<CustomTooltip />} />
+          <Bar yAxisId="kcal" dataKey="targetKcalPerDay" name="Target kcal/day" fill={panel2} stroke={cyan} strokeWidth={1} radius={[2, 2, 0, 0]} />
+          <Line yAxisId="gkg" type="monotone" dataKey="carbGPerKg" name="Carbs g/kg/day" stroke={mint} strokeWidth={2} dot={false} />
+          <ReferenceLine yAxisId="kcal" y={6500} stroke={coral} strokeDasharray="4 3" />
+        </ComposedChart>
+      </div>
+      <div style={{ maxHeight: 320, overflow: "auto", marginTop: 12 }}>
+        <table className="data">
+          <thead><tr><th>Week</th><th>Phase</th><th>Hours</th><th>Demand kcal/d</th><th>Target kcal/d</th><th>Peak day</th><th>Carbs g/d</th><th>g/kg</th><th>Fat g/d</th></tr></thead>
+          <tbody>
+            {weeks.map((w) => (
+              <tr key={w.weekStart}>
+                <td>{w.weekStart}{w.raceDays && w.raceDays.length ? ` 🏁` : ""}</td>
+                <td style={{ color: dim }}>{w.phase}</td>
+                <td>{fmt(w.plannedHours, 1)}</td>
+                <td style={{ color: dim }}>{fmt(w.demandKcalPerDay)}</td>
+                <td style={{ color: cyan, fontWeight: 600 }}>{fmt(w.targetKcalPerDay)}</td>
+                <td style={{ color: w.peakDayDemandKcal > 6500 ? coral : dim }}>{fmt(w.peakDayDemandKcal)}</td>
+                <td>{fmt(w.carbGPerDay)}</td>
+                <td>{fmt(w.carbGPerKg, 1)}</td>
+                <td style={{ color: dim }}>{fmt(w.fatGPerDay)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {raceSet.size > 0 && <div style={{ fontSize: 11, color: dim, marginTop: 6 }}>Races: {(projection.races || []).map((r) => `${r.name} (${r.date})`).join(" · ")}</div>}
     </div>
   );
 }

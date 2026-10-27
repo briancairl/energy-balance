@@ -637,6 +637,108 @@
     const pct = fmt(status.pct, 1);
     return status.suggestMaintain ? `Averaging ${avg} ${u} (7-day) \u2014 ${pct}% ${status.direction} your ${target} ${u} target. Consider switching to Maintain.` : `Averaging ${avg} ${u} (7-day) \u2014 ${pct}% ${status.direction} your ${target} ${u} target weight.`;
   }
+  const IM_DISC = { Ride: "Ride", Run: "Run", Swim: "Swim", Strength: "Strength" };
+  const IM_CARB_LOAD_ANCHORS = [[0, 5], [600, 6], [1200, 7.5], [2e3, 9], [2800, 10.5], [4e3, 12]];
+  const IM_UNDERFUEL_KCAL = 300;
+  const IM_WEIGHT_DROP_PCT_PER_WEEK = 0.3;
+  const IM_FUEL_MIN_SESSION_MIN = 75;
+  const IM_DEFAULT_GUT_CARB_G_PER_H = 90;
+  function imCalibrationReady(profile, cal) {
+    return !!(profile.ironmanMode && cal && cal.energyBalance && cal.sessionCost && parseFloat(cal.energyBalance.neat) > 0 && parseFloat(cal.energyBalance.activityScale) > 0);
+  }
+  function imInterp(anchors, x) {
+    if (x <= anchors[0][0]) return anchors[0][1];
+    for (let i = 1; i < anchors.length; i++) {
+      const [x0, y0] = anchors[i - 1], [x1, y1] = anchors[i];
+      if (x <= x1) return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+    }
+    return anchors[anchors.length - 1][1];
+  }
+  function imCarbGPerKgForLoad(sessionKcal) {
+    return imInterp(IM_CARB_LOAD_ANCHORS, Math.max(0, sessionKcal || 0));
+  }
+  function imPlannedSessionKcal(cal, session, durationMin) {
+    const src = session.sourceActivity;
+    if (src && src.durationMin > 0 && src.kcal > 0) return src.kcal / src.durationMin * durationMin;
+    const disc = IM_DISC[session.activityType];
+    const d = disc && cal.sessionCost[disc];
+    if (!d) return null;
+    const z = Math.min(5, Math.max(1, parseInt(session.zone, 10) || 2));
+    const rate = parseFloat((d.kcalPerHourByZone || {})[z]);
+    return rate > 0 ? rate * (durationMin / 60) : null;
+  }
+  function imStravaKcal(act, kcalOverrides) {
+    const ov = kcalOverrides && kcalOverrides[`strava-${act.id}`];
+    if (typeof ov === "number" && ov >= 0) return ov;
+    return typeof act.calories === "number" && act.calories > 0 ? act.calories : typeof act.kilojoules === "number" ? act.kilojoules / 4.184 / 0.24 : 0;
+  }
+  function imSessionFuel(session, durationMin, gutCarbGPerH) {
+    if (!(durationMin >= IM_FUEL_MIN_SESSION_MIN)) return null;
+    const t = session.activityType;
+    if (t !== "Ride" && t !== "Run") return null;
+    const z = parseInt(session.zone, 10) || 2;
+    const gut = Math.min(120, Math.max(40, parseFloat(gutCarbGPerH) || IM_DEFAULT_GUT_CARB_G_PER_H));
+    let carb;
+    if (t === "Ride") carb = durationMin >= 180 ? gut : durationMin >= 120 ? Math.min(gut, 75) : 60;
+    else carb = durationMin >= 120 ? Math.min(gut, 75) : 60;
+    if (z >= 4 && durationMin < 120) carb = Math.min(carb, 60);
+    const fluid = Math.min(1e3, 500 + (z >= 3 ? 150 : 0) + (durationMin >= 180 ? 150 : 0) + (t === "Run" ? 100 : 0));
+    const sodium = Math.min(1e3, 500 + (durationMin >= 150 ? 200 : 0) + (z >= 3 ? 100 : 0) + (durationMin >= 240 ? 200 : 0));
+    const planFuel = session.fuel || {};
+    const pick = (k, v) => typeof planFuel[k] === "number" ? planFuel[k] : v;
+    const out = {
+      carbGPerH: pick("carbGPerH", carb),
+      fluidMlPerH: pick("fluidMlPerH", fluid),
+      sodiumMgPerH: pick("sodiumMgPerH", sodium),
+      fromPlan: typeof planFuel.carbGPerH === "number"
+    };
+    const hours = durationMin / 60;
+    return { ...out, totalCarbG: out.carbGPerH * hours, totalFluidMl: out.fluidMlPerH * hours, totalSodiumMg: out.sodiumMgPerH * hours };
+  }
+  function imIsKeySession(session) {
+    return session.key === true || (parseInt(session.zone, 10) || 0) >= 4 || session.durationMin >= 120;
+  }
+  function imWeightTrend(weightLog) {
+    const keys = Object.keys(weightLog).filter((k) => typeof weightLog[k] === "number").sort();
+    if (keys.length < 5) return null;
+    const R = 0.45 * 0.45, Ql = 0.02 * 0.02, Qs = 2e-3 * 2e-3;
+    let x0 = weightLog[keys[0]], x1 = 0;
+    let p00 = 1, p01 = 0, p11 = 0.01;
+    const n = daysBetweenKeys(keys[0], keys[keys.length - 1]);
+    for (let i = 0; i <= n; i++) {
+      const key = shiftDateKey(keys[0], i);
+      if (i > 0) {
+        x0 = x0 + x1;
+        const n00 = p00 + 2 * p01 + p11 + Ql, n01 = p01 + p11, n11 = p11 + Qs;
+        p00 = n00;
+        p01 = n01;
+        p11 = n11;
+      }
+      const z = weightLog[key];
+      if (typeof z === "number") {
+        const S = p00 + R, k0 = p00 / S, k1 = p01 / S, y = z - x0;
+        x0 += k0 * y;
+        x1 += k1 * y;
+        const n00 = (1 - k0) * p00, n01 = (1 - k0) * p01, n11 = p11 - k1 * p01;
+        p00 = n00;
+        p01 = n01;
+        p11 = n11;
+      }
+    }
+    return {
+      date: keys[keys.length - 1],
+      levelKg: x0,
+      slopeKgPerWeek: x1 * 7,
+      slopeSdKgPerWeek: Math.sqrt(Math.max(0, p11)) * 7,
+      pctPerWeek: x1 * 7 / x0 * 100
+    };
+  }
+  async function apiIronmanCalibrate() {
+    const res = await fetchWithRetry("/api/ironman/calibrate", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Calibration failed (${res.status}).`);
+    return data.calibration;
+  }
   function Icon({ path, size = 14, color = "currentColor" }) {
     return /* @__PURE__ */ React.createElement(
       "svg",
@@ -748,6 +850,12 @@
     const [macrosfirstLastAutoSync, setMacrosfirstLastAutoSync] = useState(null);
     const [macrosfirstFetching, setMacrosfirstFetching] = useState(false);
     const [macrosfirstError, setMacrosfirstError] = useState(null);
+    const [imCal, setImCal] = useState(null);
+    const [kcalOverrides, setKcalOverrides] = useState({});
+    const [imCalibrating, setImCalibrating] = useState(false);
+    const [imCalError, setImCalError] = useState(null);
+    const [imProjection, setImProjection] = useState(null);
+    const [imProjectionError, setImProjectionError] = useState(null);
     useEffect(() => {
       (async () => {
         const [p, n, w, sched, matchOv, cached, stravaCached, mfLastSync] = await Promise.all([
@@ -796,6 +904,45 @@
     useEffect(() => {
       if (loaded) storageSet("profile", profile);
     }, [profile, loaded]);
+    useEffect(() => {
+      if (!loaded || !profile.ironmanMode) return;
+      let cancelled = false;
+      Promise.all([storageGet("ironman-calibration", null), storageGet("activity-kcal-overrides", {})]).then(([cal, ov]) => {
+        if (!cancelled) {
+          setImCal(cal);
+          setKcalOverrides(ov || {});
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, [loaded, profile.ironmanMode]);
+    useEffect(() => {
+      if (!loaded || !profile.ironmanMode) return;
+      let cancelled = false;
+      setImProjectionError(null);
+      fetchWithRetry("/api/ironman/projection").then((r) => r.json().then((d) => ({ ok: r.ok, d }))).then(({ ok, d }) => {
+        if (cancelled) return;
+        if (!ok || d.error) setImProjectionError(d.error || "Projection request failed.");
+        setImProjection(d);
+      }).catch((e) => {
+        if (!cancelled) setImProjectionError(e.message || "Could not reach /api/ironman/projection.");
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, [loaded, profile.ironmanMode, imCal]);
+    async function recalibrateIronman() {
+      setImCalibrating(true);
+      setImCalError(null);
+      try {
+        setImCal(await apiIronmanCalibrate());
+      } catch (e) {
+        setImCalError(e.message || "Calibration failed.");
+      } finally {
+        setImCalibrating(false);
+      }
+    }
     const [importError, setImportError] = useState(null);
     const [importNotice, setImportNotice] = useState(null);
     const saveSchedule = useCallback((next) => {
@@ -1086,6 +1233,9 @@
       const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
       const sortedWeightKeys = Object.keys(weightLog).sort();
       const days = [];
+      const im = imCalibrationReady(profile, imCal);
+      const imNeat = im ? parseFloat(imCal.energyBalance.neat) : null;
+      const imScale = im ? parseFloat(imCal.energyBalance.activityScale) : null;
       let carryRepaymentKcal = 0;
       for (let i = rangeDays - 1 + targetWindowDays; i >= -FORWARD_DAYS; i--) {
         const d = daysAgo(i);
@@ -1104,7 +1254,7 @@
         if (stravaActs.length) {
           source = "strava";
           for (const a of stravaActs) {
-            const kcal = typeof a.calories === "number" && a.calories > 0 ? a.calories : typeof a.kilojoules === "number" ? a.kilojoules / 4.184 / 0.24 : 0;
+            const kcal = im ? imStravaKcal(a, kcalOverrides) : typeof a.calories === "number" && a.calories > 0 ? a.calories : typeof a.kilojoules === "number" ? a.kilojoules / 4.184 / 0.24 : 0;
             exerciseKcal += kcal;
             const IF = stravaIntensityFactor(a);
             epocKcal += kcal * epocFactorFor(IF) * profile.epocSensitivity;
@@ -1126,7 +1276,8 @@
           for (const s of scheduledSessions) {
             const baseIF = s.sourceActivity ? s.sourceActivity.intensityFactor : ZONES[s.zone - 1].if;
             const effIF = s.taperIntensityFactor ? baseIF * s.taperIntensityFactor : baseIF;
-            const kcal = estimatePlannedKcal(s, s.durationMin, weightForDay, matchedKcalRates);
+            const imKcal = im ? imPlannedSessionKcal(imCal, s, s.durationMin) : null;
+            const kcal = imKcal != null ? imKcal : estimatePlannedKcal(s, s.durationMin, weightForDay, matchedKcalRates);
             exerciseKcal += kcal;
             epocKcal += kcal * epocFactorFor(effIF) * profile.epocSensitivity;
             durationSec += s.durationMin * 60;
@@ -1154,8 +1305,13 @@
         const ctl = (_c = w == null ? void 0 : w.ctl) != null ? _c : null;
         const atl = (_d = w == null ? void 0 : w.atl) != null ? _d : null;
         const tsb = ctl !== null && atl !== null ? ctl - atl : null;
-        const fatigueBuffer = profile.fatigueBuffer && tsb !== null && tsb < -10 ? dayBmr * 0.05 : 0;
-        const baseline = profile.neatMode === "offset" ? dayBmr + (parseFloat(profile.neatOffset) || 0) : dayBmr * (parseFloat(profile.neatFactor) || 1.15);
+        let fatigueBuffer = profile.fatigueBuffer && tsb !== null && tsb < -10 ? dayBmr * 0.05 : 0;
+        let baseline = profile.neatMode === "offset" ? dayBmr + (parseFloat(profile.neatOffset) || 0) : dayBmr * (parseFloat(profile.neatFactor) || 1.15);
+        if (im) {
+          baseline = dayBmr * imNeat;
+          epocKcal = exerciseKcal * (imScale - 1);
+          fatigueBuffer = 0;
+        }
         const demand = baseline + exerciseKcal + epocKcal + fatigueBuffer;
         const nutritionEntry = effectiveNutritionEntry(nutrition[key]);
         const nutritionSource = nutritionEntry ? normalizeNutritionEntry(nutrition[key]).macrosfirst ? "macrosfirst" : "manual" : null;
@@ -1174,16 +1330,21 @@
         const effectiveTier = raceLoading ? FUEL_TIERS[FUEL_TIERS.length - 1] : preloading ? preloadTier : fuelTier;
         const blend = intensityBlend(avgIF);
         const effectiveBlend = raceLoading ? 1 : blend;
-        const normalCarbTargetG = weightForDay ? weightForDay * (fuelTier.carbLo + (fuelTier.carbHi - fuelTier.carbLo) * blend) : null;
+        const iocCarbGPerKg = fuelTier.carbLo + (fuelTier.carbHi - fuelTier.carbLo) * blend;
+        const imCarbGPerKg = im ? Math.max(iocCarbGPerKg, imCarbGPerKgForLoad(exerciseKcal + epocKcal)) : null;
+        const normalCarbTargetG = weightForDay ? weightForDay * (im ? imCarbGPerKg : iocCarbGPerKg) : null;
         const preloadCapGPerKg = parseFloat(profile.maxPreloadCarbGPerKg) || 12;
         let effectiveCarbGPerKg = effectiveTier.carbLo + (effectiveTier.carbHi - effectiveTier.carbLo) * effectiveBlend;
         if (preloading || raceLoading) effectiveCarbGPerKg = Math.min(effectiveCarbGPerKg, preloadCapGPerKg);
+        if (im) effectiveCarbGPerKg = preloading || raceLoading ? Math.max(imCarbGPerKg, effectiveCarbGPerKg) : imCarbGPerKg;
         const carbTargetG = weightForDay ? weightForDay * effectiveCarbGPerKg : null;
         const extraCarbKcal = (preloading || raceLoading) && carbTargetG !== null && normalCarbTargetG !== null && carbTargetG > normalCarbTargetG ? (carbTargetG - normalCarbTargetG) * 4 : 0;
         const borrowRatio = Math.min(1, Math.max(0, parseFloat(profile.preloadBorrowRatio)));
         const borrowedKcal = raceLoading ? extraCarbKcal : extraCarbKcal * (isNaN(borrowRatio) ? 1 : borrowRatio);
         const repaidKcal = carryRepaymentKcal;
-        const carbDrivenTarget = baseTarget - repaidKcal + borrowedKcal;
+        const imFloorKcal = im && exerciseKcal > 0 ? demand : 0;
+        const carbDrivenTargetRaw = baseTarget - repaidKcal + borrowedKcal;
+        const carbDrivenTarget = im ? Math.max(carbDrivenTargetRaw, imFloorKcal) : carbDrivenTargetRaw;
         const proteinWeightKg = parseFloat(profile.targetWeightKg) || weightForDay;
         const proteinTargetG = proteinWeightKg ? proteinWeightKg * (parseFloat(profile.proteinGPerKg) || 1) : null;
         const carbLoadFatFloorPct = parseFloat(profile.carbLoadFatFloorPct);
@@ -1220,7 +1381,8 @@
         }
         const newDebtToday = carbRepaymentKcal + (raceLoading ? 0 : floorExcessKcal);
         if (debtStrategy === "rolloverCapped") {
-          const targetWithoutRepay = weightForDay ? Math.max(baseTarget + borrowedKcal, macroFloorKcal) : baseTarget + borrowedKcal;
+          const targetWithoutRepayBase = weightForDay ? Math.max(baseTarget + borrowedKcal, macroFloorKcal) : baseTarget + borrowedKcal;
+          const targetWithoutRepay = im ? Math.max(targetWithoutRepayBase, imFloorKcal) : targetWithoutRepayBase;
           const realizedRepayment = targetWithoutRepay - target;
           const unrealizedRepayment = Math.max(0, repaidKcal - realizedRepayment);
           carryRepaymentKcal = Math.min(newDebtToday + unrealizedRepayment, ROLLOVER_DEBT_CAP_KCAL);
@@ -1268,11 +1430,47 @@
           repaidKcal,
           taper,
           raceLoading,
-          race: (taper == null ? void 0 : taper.race) || (carbLoad == null ? void 0 : carbLoad.race) || raceToday || null
+          race: (taper == null ? void 0 : taper.race) || (carbLoad == null ? void 0 : carbLoad.race) || raceToday || null,
+          ...im ? {
+            imMode: true,
+            imCarbGPerKg,
+            imFloorKcal,
+            imFloorApplied: imFloorKcal > 0 && carbDrivenTargetRaw < imFloorKcal,
+            imSessionFuel: (source === "planned" ? scheduledSessions : []).map((s) => ({ session: s, fuel: imSessionFuel(s, s.durationMin, profile.imGutCarbGPerH) })).filter((x) => x.fuel),
+            imKeySessions: scheduledSessions.filter(imIsKeySession)
+          } : null
         });
       }
       return days;
-    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, targetWindowDays, matchedKcalRates]);
+    }, [intervalsData, stravaData, nutrition, weightLog, schedule, bmr, profile, rangeDays, targetWindowDays, matchedKcalRates, imCal, kcalOverrides]);
+    const ironmanStatus = useMemo(() => {
+      if (!imCalibrationReady(profile, imCal)) return null;
+      const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
+      const past = dailyRows.filter((r) => r.date < todayKey && r.intake !== null).slice(-7);
+      const avgIntake = past.length ? past.reduce((s, r) => s + r.intake, 0) / past.length : null;
+      const avgDemand = past.length ? past.reduce((s, r) => s + r.demand, 0) / past.length : null;
+      const rollingGap = avgIntake !== null ? avgIntake - avgDemand : null;
+      const trend = imWeightTrend(weightLog);
+      const today = dailyRows.find((r) => r.date === todayKey) || null;
+      const upcoming = dailyRows.filter((r) => r.date >= todayKey);
+      const recentKey = dailyRows.filter((r) => r.date <= todayKey && r.date >= shiftDateKey(todayKey, -1) && r.imKeySessions && r.imKeySessions.length);
+      return {
+        nDays: past.length,
+        avgIntake,
+        avgDemand,
+        rollingGap,
+        underfueled: rollingGap !== null && past.length >= 4 && rollingGap < -IM_UNDERFUEL_KCAL,
+        trend,
+        weightFalling: !!(trend && trend.pctPerWeek < -IM_WEIGHT_DROP_PCT_PER_WEEK),
+        today,
+        remainingKcal: today ? today.target - (today.intake || 0) : null,
+        remainingCarbG: today && today.carbTargetG !== null ? today.carbTargetG - (today.carbs || 0) : null,
+        remainingProteinG: today && today.proteinTargetG !== null ? today.proteinTargetG - (today.protein || 0) : null,
+        upcoming,
+        recentKey,
+        weightKg: parseFloat(profile.weightKg) || null
+      };
+    }, [dailyRows, weightLog, profile, imCal]);
     const summary = useMemo(() => {
       const withIntake = dailyRows.filter((d) => d.intake !== null);
       const withGap = dailyRows.filter((d) => d.gap !== null);
@@ -1390,7 +1588,11 @@
         goalParams,
         trendCorrection,
         weightTrendAvg,
-        weightGoalStatus
+        weightGoalStatus,
+        imCal,
+        imCalibrating,
+        imCalError,
+        onRecalibrate: recalibrateIronman
       }
     ), tab === "import" && /* @__PURE__ */ React.createElement(
       ImportTab,
@@ -1453,7 +1655,11 @@
         proteinGPerKg: profile.proteinGPerKg,
         weightGoalStatus,
         targetWeightKg: parseFloat(profile.targetWeightKg) || null,
-        units
+        units,
+        ironmanStatus,
+        imProjection: profile.ironmanMode ? imProjection : null,
+        imProjectionError: profile.ironmanMode ? imProjectionError : null,
+        imMissingCalibration: !!profile.ironmanMode && !imCalibrationReady(profile, imCal)
       }
     )));
   }
@@ -1494,7 +1700,7 @@
       "Apply"
     ), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: () => setDraft(null), style: { padding: "4px 10px", fontSize: 12 } }, "Cancel")));
   }
-  function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
+  function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate }) {
     var _a, _b, _c;
     const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
     const units = profile.units || "metric";
@@ -1623,7 +1829,11 @@
         goalParams,
         trendCorrection,
         weightTrendAvg,
-        weightGoalStatus
+        weightGoalStatus,
+        imCal,
+        imCalibrating,
+        imCalError,
+        onRecalibrate
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.info, size: 14, color: dim }), /* @__PURE__ */ React.createElement("div", null, "BMR uses the Mifflin-St Jeor equation. The training and recovery adjustments beyond that are heuristics commonly used in endurance-coaching practice, not a single peer-reviewed formula \u2014 tune the sliders above to match how your coach or experience calibrates it.")));
   }
@@ -1638,7 +1848,7 @@
     filtered.push({ date: today, goal: next.goal, buildRatePct: next.buildRatePct, loseRatePct: next.loseRatePct });
     return { ...p, ...overrides, goalHistory: filtered };
   }
-  function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus }) {
+  function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate }) {
     const setGoal = (goal) => setProfile((p) => recordGoalHistory(p, { goal }));
     const range = profile.goal === "build" ? GOAL_DEFAULTS.build : profile.goal === "lose" ? GOAL_DEFAULTS.lose : null;
     const rateKey = profile.goal === "build" ? "buildRatePct" : "loseRatePct";
@@ -1682,7 +1892,35 @@
         format: (v) => `${v} days`,
         onCommit: (v) => setProfile((p) => ({ ...p, targetWindowDays: parseInt(v, 10) }))
       }
-    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Each day's target is computed from the weigh-ins in the fixed window of days just before it (trend calibration and the maintenance weight baseline), so a past day's target never moves as new data arrives or as the dashboard range scrolls. Longer = steadier but slower to react.")), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries in the last ${getTargetWindowDays(profile)} days, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`));
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Each day's target is computed from the weigh-ins in the fixed window of days just before it (trend calibration and the maintenance weight baseline), so a past day's target never moves as new data arrives or as the dashboard range scrolls. Longer = steadier but slower to react.")), /* @__PURE__ */ React.createElement(
+      IronmanModeSettings,
+      {
+        profile,
+        setProfile,
+        imCal,
+        imCalibrating,
+        imCalError,
+        onRecalibrate
+      }
+    ), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries in the last ${getTargetWindowDays(profile)} days, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`));
+  }
+  function IronmanModeSettings({ profile, setProfile, imCal, imCalibrating, imCalError, onRecalibrate }) {
+    var _a, _b;
+    const on = !!profile.ironmanMode;
+    const eb = imCal && imCal.energyBalance;
+    const sc = imCal && imCal.sessionCost;
+    const gut = parseFloat(profile.imGutCarbGPerH) || IM_DEFAULT_GUT_CARB_G_PER_H;
+    return /* @__PURE__ */ React.createElement("div", { style: { marginTop: 18, paddingTop: 16, borderTop: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, cursor: "pointer", fontWeight: 600 } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: on, onChange: (e) => setProfile((p) => ({ ...p, ironmanMode: e.target.checked })) }), "IronMan mode"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 6, marginLeft: 24, lineHeight: 1.5 } }, "Uses your own calibrated session costs and NEAT (fitted from your Strava calories and weight trend) instead of the generic MET/NEAT numbers, never lets a training day's target drop below calibrated demand, periodizes carbs by day load, and shows in-session fueling, a recovery prompt, an under-fueling warning and a whole-plan projection."), on && /* @__PURE__ */ React.createElement("div", { style: { marginLeft: 24, marginTop: 10 } }, eb && !eb.insufficient ? /* @__PURE__ */ React.createElement("div", { style: { fontFamily: mono, fontSize: 11.5, color: dim, lineHeight: 1.7 } }, /* @__PURE__ */ React.createElement("div", null, "Effective NEAT ", /* @__PURE__ */ React.createElement("b", { style: { color: paper } }, fmt(eb.neat, 2), "\xD7"), " BMR (\xB1", fmt(eb.neatSd, 2), ") \xB7 activity scale ", /* @__PURE__ */ React.createElement("b", { style: { color: paper } }, fmt(eb.activityScale, 2), "\xD7"), " (\xB1", fmt(eb.activityScaleSd, 2), ")"), /* @__PURE__ */ React.createElement("div", null, "Fitted maintenance over the window: ", /* @__PURE__ */ React.createElement("b", { style: { color: paper } }, fmt(eb.meanDailyExpenditure), " \xB1 ", fmt(eb.meanDailyExpenditureSd)), " kcal/day"), sc && ["Ride", "Run", "Swim"].map((d) => sc[d] && /* @__PURE__ */ React.createElement("div", { key: d }, d, " kcal/h Z1\u2013Z5: ", [1, 2, 3, 4, 5].map((z) => fmt(sc[d].kcalPerHourByZone[z])).join(" / "))), /* @__PURE__ */ React.createElement("div", null, "Fitted ", imCal.fittedOn || (imCal.fittedAt || "").slice(0, 10), " \xB7 weigh-ins ", ((_b = (_a = imCal.dataWindow) == null ? void 0 : _a.weighIns) == null ? void 0 : _b.join(" \u2192 ")) || "\u2014")) : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: amber } }, "No calibration yet \u2014 targets stay on the standard model until one is fitted."), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: onRecalibrate, disabled: imCalibrating, style: { marginTop: 10, padding: "6px 12px", fontSize: 12 } }, imCalibrating ? "Calibrating\u2026" : eb ? "Recalibrate from latest data" : "Calibrate now"), imCalError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 6, fontSize: 11.5, color: coral } }, imCalError), /* @__PURE__ */ React.createElement(Field, { label: `Long-ride gut ceiling \u2014 ${gut} g carb/h` }, /* @__PURE__ */ React.createElement(
+      ConfirmRange,
+      {
+        min: "40",
+        max: "120",
+        step: "5",
+        value: gut,
+        format: (v) => `${v} g/h`,
+        onCommit: (v) => setProfile((p) => ({ ...p, imGutCarbGPerH: v }))
+      }
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "What your gut is currently trained to absorb on rides \u22653h; used only when a planned session has no ", /* @__PURE__ */ React.createElement("code", null, "fuel"), " of its own. Build toward 90\u2013110 g/h over the block (glucose:fructose mixes), practising in training first."))));
   }
   function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync, onFetch, fetching, fetchError, rangeDays, setRangeDays, lastFetched, importError, importNotice, units }) {
     const [dragOver, setDragOver] = useState(false);
@@ -2531,7 +2769,7 @@
       if (confirm("Delete this scheduled session?")) onDelete(s.id);
     }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))));
   }
-  function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units }) {
+  function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units, ironmanStatus, imProjection, imProjectionError, imMissingCalibration }) {
     const wUnit = weightUnitLabel(units);
     const [visibleMacros, setVisibleMacros] = useState({ carbs: false, protein: false, fat: false });
     const [visibleWeightSeries, setVisibleWeightSeries] = useState({ actual: true, rollingAvg: true, target: true });
@@ -2579,7 +2817,7 @@
       // viewport, since "auto" tracks size to their content's min-content
       // width. That silently broke the page's centering only while Dashboard
       // was open, since it's the only tab with fixed-width content this wide.
-      /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" } }, (summary.trainingMissingDays > 0 || summary.nutritionMissingDays > 0) && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: "rgba(232,163,61,0.1)", border: `1px solid ${amber}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 16, color: amber }), /* @__PURE__ */ React.createElement("div", null, summary.trainingMissingDays > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, summary.trainingMissingDays), " day", summary.trainingMissingDays === 1 ? "" : "s", " with no training data synced yet (demand is a floor, not the full picture)."), summary.nutritionMissingDays > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, summary.nutritionMissingDays), " day", summary.nutritionMissingDays === 1 ? "" : "s", " with no nutrition logged."))), goalParams.sign !== 0 && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: "rgba(79,209,217,0.08)", border: `1px solid ${cyan}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 16, color: cyan }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, goalParams.label), " at ", goalParams.ratePct, "%/week.", trendCalibration && trendCorrection && !trendCorrection.insufficient && /* @__PURE__ */ React.createElement(React.Fragment, null, " Trend calibration is live: ", trendCorrection.correctionKcal >= 0 ? "+" : "", fmt(trendCorrection.correctionKcal), " kcal/day applied based on your actual ", fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2), " ", wUnit, "/wk trend."), trendCalibration && trendCorrection && trendCorrection.insufficient && /* @__PURE__ */ React.createElement(React.Fragment, null, " Log weight for ~10+ days to enable trend-based calibration (", trendCorrection.n, " logged so far)."))), weightGoalStatus && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: SEVERITY_BG[weightGoalStatus.severity], border: `1px solid ${SEVERITY_COLOR[weightGoalStatus.severity]}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 16, color: SEVERITY_COLOR[weightGoalStatus.severity] }), /* @__PURE__ */ React.createElement("div", null, formatWeightGoalMessage(weightGoalStatus, units))), !summary.noIntake && /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14 } }, /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. daily target", value: `${fmt(summary.avgTarget)} kcal`, color: cyan }), /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. daily intake", value: `${fmt(summary.avgIntake)} kcal`, color: paper }), /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. gap", value: `${summary.avgGap >= 0 ? "+" : ""}${fmt(summary.avgGap)} kcal`, color: summary.avgGap < -200 ? coral : summary.avgGap > 200 ? amber : mint }), /* @__PURE__ */ React.createElement(StatCard, { label: "Off-target days", value: `${summary.deficitDays} / ${summary.trackedDays}`, color: summary.deficitDays > summary.trackedDays / 3 ? coral : dim })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 16px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12, padding: "0 4px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, position: "relative" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14 } }, "Target vs. intake"), /* @__PURE__ */ React.createElement(
+      /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr)" } }, (summary.trainingMissingDays > 0 || summary.nutritionMissingDays > 0) && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: "rgba(232,163,61,0.1)", border: `1px solid ${amber}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 16, color: amber }), /* @__PURE__ */ React.createElement("div", null, summary.trainingMissingDays > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, summary.trainingMissingDays), " day", summary.trainingMissingDays === 1 ? "" : "s", " with no training data synced yet (demand is a floor, not the full picture)."), summary.nutritionMissingDays > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, summary.nutritionMissingDays), " day", summary.nutritionMissingDays === 1 ? "" : "s", " with no nutrition logged."))), imMissingCalibration && /* @__PURE__ */ React.createElement(Banner, { kind: "warning" }, "IronMan mode is on but no calibration has been fitted yet \u2014 Setup \u2192 Goal \u2192 ", /* @__PURE__ */ React.createElement("b", null, "Calibrate now"), ". Until then targets use the standard model."), ironmanStatus && /* @__PURE__ */ React.createElement(IronmanPanel, { status: ironmanStatus, units }), goalParams.sign !== 0 && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: "rgba(79,209,217,0.08)", border: `1px solid ${cyan}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 16, color: cyan }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, goalParams.label), " at ", goalParams.ratePct, "%/week.", trendCalibration && trendCorrection && !trendCorrection.insufficient && /* @__PURE__ */ React.createElement(React.Fragment, null, " Trend calibration is live: ", trendCorrection.correctionKcal >= 0 ? "+" : "", fmt(trendCorrection.correctionKcal), " kcal/day applied based on your actual ", fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2), " ", wUnit, "/wk trend."), trendCalibration && trendCorrection && trendCorrection.insufficient && /* @__PURE__ */ React.createElement(React.Fragment, null, " Log weight for ~10+ days to enable trend-based calibration (", trendCorrection.n, " logged so far)."))), weightGoalStatus && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, background: SEVERITY_BG[weightGoalStatus.severity], border: `1px solid ${SEVERITY_COLOR[weightGoalStatus.severity]}`, borderRadius: 6, padding: "12px 16px", fontSize: 12.5, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 16, color: SEVERITY_COLOR[weightGoalStatus.severity] }), /* @__PURE__ */ React.createElement("div", null, formatWeightGoalMessage(weightGoalStatus, units))), !summary.noIntake && /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14 } }, /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. daily target", value: `${fmt(summary.avgTarget)} kcal`, color: cyan }), /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. daily intake", value: `${fmt(summary.avgIntake)} kcal`, color: paper }), /* @__PURE__ */ React.createElement(StatCard, { label: "Avg. gap", value: `${summary.avgGap >= 0 ? "+" : ""}${fmt(summary.avgGap)} kcal`, color: summary.avgGap < -200 ? coral : summary.avgGap > 200 ? amber : mint }), /* @__PURE__ */ React.createElement(StatCard, { label: "Off-target days", value: `${summary.deficitDays} / ${summary.trackedDays}`, color: summary.deficitDays > summary.trackedDays / 3 ? coral : dim })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 16px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12, padding: "0 4px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, position: "relative" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14 } }, "Target vs. intake"), /* @__PURE__ */ React.createElement(
         "button",
         {
           onClick: () => setShowInfoPopout((v) => !v),
@@ -2602,7 +2840,7 @@
           style: showFuelingRef ? { padding: "5px 11px", borderRadius: 20, fontWeight: 700, fontSize: 11.5, cursor: "pointer", border: "none", background: amber, color: ink } : { padding: "5px 11px", borderRadius: 20, fontWeight: 600, fontSize: 11.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }
         },
         "Fueling ref"
-      ))), /* @__PURE__ */ React.createElement("div", { ref: registerChartScroll, onScroll: syncChartScroll, style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement("div", { style: { width: chartWidth, margin: "0 auto" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width: chartWidth, height: 280, data: rows, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "kcal", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), (visibleMacros.carbs || visibleMacros.protein || visibleMacros.fat) && /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "grams", orientation: "right", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false, label: { value: "grams", angle: 90, position: "insideRight", fill: dim, fontSize: 10 } }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { yAxisId: "kcal", dataKey: "demand", name: "Modeled TDEE (kcal)", fill: panel2, stroke: line, strokeWidth: 1, radius: [2, 2, 0, 0] }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "kcal", type: "monotone", dataKey: "target", name: "Target (kcal)", stroke: cyan, strokeWidth: 2, dot: false, strokeDasharray: goalParams.sign !== 0 ? "5 3" : void 0, connectNulls: true }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "kcal", type: "monotone", dataKey: "intake", name: "Intake (kcal)", stroke: amber, strokeWidth: 2.2, dot: { r: 2.5, fill: amber }, connectNulls: true }), visibleMacros.carbs && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "carbs", name: "Carbs actual (g)", stroke: mint, strokeWidth: 2, dot: { r: 2, fill: mint }, connectNulls: true }), visibleMacros.carbs && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "carbTargetG", name: "Carbs target (g)", stroke: mint, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }), visibleMacros.protein && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "protein", name: "Protein actual (g)", stroke: lavender, strokeWidth: 2, dot: { r: 2, fill: lavender }, connectNulls: true }), visibleMacros.protein && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "proteinTargetG", name: "Protein target (g)", stroke: lavender, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }), visibleMacros.fat && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "fat", name: "Fat actual (g)", stroke: gold, strokeWidth: 2, dot: { r: 2, fill: gold }, connectNulls: true }), visibleMacros.fat && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "fatTargetG", name: "Fat target (g)", stroke: gold, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true })))), showFuelingRef && /* @__PURE__ */ React.createElement(FuelingReferencePanel, { fuelingByTier })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 8px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" } }, "Daily gap (intake \u2212 target)"), /* @__PURE__ */ React.createElement("div", { ref: registerChartScroll, onScroll: syncChartScroll, style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement("div", { style: { width: chartWidth, margin: "0 auto" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width: chartWidth, height: 200, data: rows, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), /* @__PURE__ */ React.createElement(ReferenceLine, { y: 0, stroke: dim }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "gap", name: "Gap (kcal)", radius: [2, 2, 2, 2] }, rows.map((r, i) => /* @__PURE__ */ React.createElement(Cell, { key: i, fill: r.gap === null ? line : r.gap < -200 ? coral : r.gap > 200 ? amber : mint }))))))), hasWeight && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 8px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12, padding: "0 4px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14 } }, "Body weight"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } }, [["actual", "Actual", dim], ["rollingAvg", "7-day avg", cyan], ...targetWeightKg !== null ? [["target", "Target", gold]] : []].map(([key, label, color]) => /* @__PURE__ */ React.createElement(
+      ))), /* @__PURE__ */ React.createElement("div", { ref: registerChartScroll, onScroll: syncChartScroll, style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement("div", { style: { width: chartWidth, margin: "0 auto" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width: chartWidth, height: 280, data: rows, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "kcal", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), (visibleMacros.carbs || visibleMacros.protein || visibleMacros.fat) && /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "grams", orientation: "right", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false, label: { value: "grams", angle: 90, position: "insideRight", fill: dim, fontSize: 10 } }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { yAxisId: "kcal", dataKey: "demand", name: "Modeled TDEE (kcal)", fill: panel2, stroke: line, strokeWidth: 1, radius: [2, 2, 0, 0] }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "kcal", type: "monotone", dataKey: "target", name: "Target (kcal)", stroke: cyan, strokeWidth: 2, dot: false, strokeDasharray: goalParams.sign !== 0 ? "5 3" : void 0, connectNulls: true }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "kcal", type: "monotone", dataKey: "intake", name: "Intake (kcal)", stroke: amber, strokeWidth: 2.2, dot: { r: 2.5, fill: amber }, connectNulls: true }), visibleMacros.carbs && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "carbs", name: "Carbs actual (g)", stroke: mint, strokeWidth: 2, dot: { r: 2, fill: mint }, connectNulls: true }), visibleMacros.carbs && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "carbTargetG", name: "Carbs target (g)", stroke: mint, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }), visibleMacros.protein && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "protein", name: "Protein actual (g)", stroke: lavender, strokeWidth: 2, dot: { r: 2, fill: lavender }, connectNulls: true }), visibleMacros.protein && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "proteinTargetG", name: "Protein target (g)", stroke: lavender, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true }), visibleMacros.fat && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "fat", name: "Fat actual (g)", stroke: gold, strokeWidth: 2, dot: { r: 2, fill: gold }, connectNulls: true }), visibleMacros.fat && /* @__PURE__ */ React.createElement(Line, { yAxisId: "grams", type: "monotone", dataKey: "fatTargetG", name: "Fat target (g)", stroke: gold, strokeWidth: 1.5, strokeDasharray: "4 3", dot: false, connectNulls: true })))), showFuelingRef && /* @__PURE__ */ React.createElement(FuelingReferencePanel, { fuelingByTier })), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 8px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, padding: "0 4px" } }, "Daily gap (intake \u2212 target)"), /* @__PURE__ */ React.createElement("div", { ref: registerChartScroll, onScroll: syncChartScroll, style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement("div", { style: { width: chartWidth, margin: "0 auto" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width: chartWidth, height: 200, data: rows, margin: { top: 4, right: 12, left: -14, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), /* @__PURE__ */ React.createElement(ReferenceLine, { y: 0, stroke: dim }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "gap", name: "Gap (kcal)", radius: [2, 2, 2, 2] }, rows.map((r, i) => /* @__PURE__ */ React.createElement(Cell, { key: i, fill: r.gap === null ? line : r.gap < -200 ? coral : r.gap > 200 ? amber : mint }))))))), (imProjection || imProjectionError) && /* @__PURE__ */ React.createElement(IronmanProjection, { projection: imProjection, error: imProjectionError }), hasWeight && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 8px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12, padding: "0 4px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14 } }, "Body weight"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } }, [["actual", "Actual", dim], ["rollingAvg", "7-day avg", cyan], ...targetWeightKg !== null ? [["target", "Target", gold]] : []].map(([key, label, color]) => /* @__PURE__ */ React.createElement(
         "button",
         {
           key,
@@ -2633,6 +2871,25 @@
         ), r.preloading && !r.raceLoading && /* @__PURE__ */ React.createElement("span", { title: `Pre-loading carbs for tomorrow's ${((_a = r.preloadSession) == null ? void 0 : _a.activityType) || "session"}${r.borrowedKcal > 5 ? ` \u2014 borrowing ${fmt(r.borrowedKcal)} kcal from tomorrow's target` : ""}` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber })), r.repaidKcal > 5 && /* @__PURE__ */ React.createElement("span", { title: `Repaying ${fmt(r.repaidKcal)} kcal borrowed by yesterday's pre-load` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: dim })), r.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${r.taper.race.notes || r.taper.race.activityType + " race"} in ${r.taper.daysToRace}d \u2014 training scaled to ~${Math.round(r.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender })), r.raceLoading && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${((_b = r.race) == null ? void 0 : _b.notes) || ((_c = r.race) == null ? void 0 : _c.activityType) + " race"} in ${r.race ? daysBetween(r.date, r.race.raceDate) : "?"}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold })))), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.weight !== null ? `${fmt(kgToDisplay(r.weight, units), 1)}${wUnit}` : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(r.bmr)), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(r.baseline)), /* @__PURE__ */ React.createElement("td", null, r.exerciseKcal ? fmt(r.exerciseKcal) : r.trainingMissing ? /* @__PURE__ */ React.createElement("span", { style: { color: coral } }, "?") : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.epocKcal ? fmt(r.epocKcal) : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.fatigueBuffer ? fmt(r.fatigueBuffer) : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(r.demand)), /* @__PURE__ */ React.createElement("td", { style: { color: cyan, fontWeight: 600 } }, fmt(r.target)), /* @__PURE__ */ React.createElement("td", { style: { color: amber } }, r.intake !== null ? fmt(r.intake) : r.nutritionMissing ? /* @__PURE__ */ React.createElement("span", { style: { color: coral } }, "?") : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: r.gap === null ? dim : r.gap < -200 ? coral : r.gap > 200 ? amber : mint, fontWeight: 600 } }, r.gap !== null ? `${r.gap >= 0 ? "+" : ""}${fmt(r.gap)}` : "\u2014"), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, r.tsb !== null ? fmt(r.tsb, 1) : "\u2014"), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(MacroCell, { actual: r.carbs, target: r.carbTargetG })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(MacroCell, { actual: r.protein, target: r.proteinTargetG })), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(MacroCell, { actual: r.fat, target: r.fatTargetG })));
       }))))))
     );
+  }
+  function IronmanPanel({ status, units }) {
+    const { today, trend, weightKg } = status;
+    const wUnit = weightUnitLabel(units);
+    const fuelDays = status.upcoming.filter((r) => r.imSessionFuel && r.imSessionFuel.length);
+    const recover = status.recentKey;
+    const behind = status.remainingKcal;
+    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 20, borderColor: status.underfueled || status.weightFalling ? coral : line } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 15, color: gold }), " IronMan mode"), (status.underfueled || status.weightFalling) && /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, marginBottom: 14 } }, status.underfueled && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, /* @__PURE__ */ React.createElement("b", null, "Under-fueling:"), " last ", status.nDays, " days averaged ", fmt(status.avgIntake), " kcal vs ", fmt(status.avgDemand), " calibrated demand \u2014 ", /* @__PURE__ */ React.createElement("b", null, fmt(-status.rollingGap), " kcal/day short"), ". Sustained, this is what costs sleep and recovery; close the gap before adding training."), status.weightFalling && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, /* @__PURE__ */ React.createElement("b", null, "Weight trending down"), " ", fmt(Math.abs(status.trend.pctPerWeek), 2), "%/wk (", fmt(kgToDisplay(status.trend.slopeKgPerWeek, units), 2), " ", wUnit, "/wk, smoothed) \u2014 faster than the ", IM_WEIGHT_DROP_PCT_PER_WEEK, "%/wk guard during the build.")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14 } }, /* @__PURE__ */ React.createElement(StatCard, { label: "Still to eat today", value: behind !== null ? `${fmt(Math.max(0, behind))} kcal` : "\u2014", color: behind !== null && behind > 0 ? amber : mint }), /* @__PURE__ */ React.createElement(StatCard, { label: "Carbs / protein left", value: status.remainingCarbG !== null ? `${fmt(Math.max(0, status.remainingCarbG))} / ${fmt(Math.max(0, status.remainingProteinG || 0))} g` : "\u2014", color: mint }), /* @__PURE__ */ React.createElement(StatCard, { label: "7-day vs demand", value: status.rollingGap !== null ? `${status.rollingGap >= 0 ? "+" : ""}${fmt(status.rollingGap)} kcal/d` : "\u2014", color: status.underfueled ? coral : status.rollingGap !== null && status.rollingGap < 0 ? amber : mint }), /* @__PURE__ */ React.createElement(StatCard, { label: "Weight trend", value: trend ? `${trend.slopeKgPerWeek >= 0 ? "+" : ""}${fmt(kgToDisplay(trend.slopeKgPerWeek, units), 2)} ${wUnit}/wk` : "\u2014", color: status.weightFalling ? coral : dim })), today && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "Today: target ", fmt(today.target), " kcal \xB7 carbs ", fmt(today.carbTargetG), " g (", fmt(today.imCarbGPerKg, 1), " g/kg day-load)", today.imFloorApplied ? " \xB7 training-day floor applied" : ""), recover.length > 0 && weightKg && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, fontSize: 12.5, lineHeight: 1.6 } }, /* @__PURE__ */ React.createElement("b", null, "Recovery"), " after ", recover.map((r) => r.imKeySessions.map((s) => s.notes || s.activityType).join(", ")).join("; "), ": within ~1h aim for ", /* @__PURE__ */ React.createElement("b", null, fmt(weightKg * 1), "\u2013", fmt(weightKg * 1.2), " g carb"), " + ", /* @__PURE__ */ React.createElement("b", null, "~", fmt(weightKg * 0.3), " g protein"), " (1.0\u20131.2 g/kg + 0.3 g/kg)."), fuelDays.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, fontWeight: 600, marginBottom: 6 } }, "In-session fueling (planned \u2265", IM_FUEL_MIN_SESSION_MIN, " min)"), /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Day"), /* @__PURE__ */ React.createElement("th", null, "Session"), /* @__PURE__ */ React.createElement("th", null, "Carb g/h"), /* @__PURE__ */ React.createElement("th", null, "Fluid ml/h"), /* @__PURE__ */ React.createElement("th", null, "Sodium mg/h"), /* @__PURE__ */ React.createElement("th", null, "Total carb"))), /* @__PURE__ */ React.createElement("tbody", null, fuelDays.flatMap((r) => r.imSessionFuel.map(({ session, fuel }, i) => /* @__PURE__ */ React.createElement("tr", { key: `${r.date}-${i}` }, /* @__PURE__ */ React.createElement("td", null, r.label), /* @__PURE__ */ React.createElement("td", { style: { textAlign: "left" } }, session.activityType, " ", fmt(session.durationMin), "\u2032 Z", session.zone, session.notes ? ` \u2014 ${session.notes}` : ""), /* @__PURE__ */ React.createElement("td", null, fmt(fuel.carbGPerH), fuel.fromPlan ? "" : "*"), /* @__PURE__ */ React.createElement("td", null, fmt(fuel.fluidMlPerH)), /* @__PURE__ */ React.createElement("td", null, fmt(fuel.sodiumMgPerH)), /* @__PURE__ */ React.createElement("td", null, fmt(fuel.totalCarbG), " g")))))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "* default by duration/intensity (no ", /* @__PURE__ */ React.createElement("code", null, "fuel"), " on the planned session). Fluid/sodium: adjust to heat and sweat rate.")));
+  }
+  function IronmanProjection({ projection, error }) {
+    var _a;
+    const weeks = projection && projection.weeks || [];
+    if (!weeks.length) {
+      return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 20, fontSize: 12.5, color: dim } }, "Plan projection: ", error || "no plan weeks found in schedule_sources/.");
+    }
+    const data = weeks.map((w) => ({ ...w, label: w.weekStart.slice(5) }));
+    const width = Math.max(data.length * 34, 600);
+    const raceSet = new Set((projection.races || []).map((r) => r.date));
+    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "20px 20px 12px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 4, padding: "0 4px" } }, "Plan projection \u2014 calibrated demand per week"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: dim, marginBottom: 12, padding: "0 4px" } }, "Mean kcal/day (bars) and carbs g/kg/day (line) for each plan week, from ", (_a = projection.sources) == null ? void 0 : _a.join(", "), ". Race days are left out of the averages. Weekly figures use today's weight (", fmt(projection.weightKg, 1), " kg)."), /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto", overflowY: "hidden", maxWidth: "100%" } }, /* @__PURE__ */ React.createElement(ComposedChart, { width, height: 240, data, margin: { top: 4, right: 12, left: -6, bottom: 0 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: line, vertical: false }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "label", tick: { fill: dim, fontSize: 10, fontFamily: mono }, axisLine: { stroke: line }, tickLine: false, interval: 1 }), /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "kcal", tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), /* @__PURE__ */ React.createElement(YAxis, { yAxisId: "gkg", orientation: "right", domain: [0, 12], tick: { fill: dim, fontSize: 11, fontFamily: mono }, axisLine: false, tickLine: false }), /* @__PURE__ */ React.createElement(Tooltip, { content: /* @__PURE__ */ React.createElement(CustomTooltip, null) }), /* @__PURE__ */ React.createElement(Bar, { yAxisId: "kcal", dataKey: "targetKcalPerDay", name: "Target kcal/day", fill: panel2, stroke: cyan, strokeWidth: 1, radius: [2, 2, 0, 0] }), /* @__PURE__ */ React.createElement(Line, { yAxisId: "gkg", type: "monotone", dataKey: "carbGPerKg", name: "Carbs g/kg/day", stroke: mint, strokeWidth: 2, dot: false }), /* @__PURE__ */ React.createElement(ReferenceLine, { yAxisId: "kcal", y: 6500, stroke: coral, strokeDasharray: "4 3" }))), /* @__PURE__ */ React.createElement("div", { style: { maxHeight: 320, overflow: "auto", marginTop: 12 } }, /* @__PURE__ */ React.createElement("table", { className: "data" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Week"), /* @__PURE__ */ React.createElement("th", null, "Phase"), /* @__PURE__ */ React.createElement("th", null, "Hours"), /* @__PURE__ */ React.createElement("th", null, "Demand kcal/d"), /* @__PURE__ */ React.createElement("th", null, "Target kcal/d"), /* @__PURE__ */ React.createElement("th", null, "Peak day"), /* @__PURE__ */ React.createElement("th", null, "Carbs g/d"), /* @__PURE__ */ React.createElement("th", null, "g/kg"), /* @__PURE__ */ React.createElement("th", null, "Fat g/d"))), /* @__PURE__ */ React.createElement("tbody", null, weeks.map((w) => /* @__PURE__ */ React.createElement("tr", { key: w.weekStart }, /* @__PURE__ */ React.createElement("td", null, w.weekStart, w.raceDays && w.raceDays.length ? ` \u{1F3C1}` : ""), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, w.phase), /* @__PURE__ */ React.createElement("td", null, fmt(w.plannedHours, 1)), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(w.demandKcalPerDay)), /* @__PURE__ */ React.createElement("td", { style: { color: cyan, fontWeight: 600 } }, fmt(w.targetKcalPerDay)), /* @__PURE__ */ React.createElement("td", { style: { color: w.peakDayDemandKcal > 6500 ? coral : dim } }, fmt(w.peakDayDemandKcal)), /* @__PURE__ */ React.createElement("td", null, fmt(w.carbGPerDay)), /* @__PURE__ */ React.createElement("td", null, fmt(w.carbGPerKg, 1)), /* @__PURE__ */ React.createElement("td", { style: { color: dim } }, fmt(w.fatGPerDay))))))), raceSet.size > 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 6 } }, "Races: ", (projection.races || []).map((r) => `${r.name} (${r.date})`).join(" \xB7 ")));
   }
   function MacroCell({ actual, target }) {
     if (target === null) return /* @__PURE__ */ React.createElement("span", { style: { color: dim } }, "\u2014");

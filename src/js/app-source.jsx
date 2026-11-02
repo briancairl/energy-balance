@@ -925,6 +925,25 @@ function imCalibrationReady(profile, cal) {
   return !!(profile.ironmanMode && cal && cal.energyBalance && cal.sessionCost
     && parseFloat(cal.energyBalance.neat) > 0 && parseFloat(cal.energyBalance.activityScale) > 0);
 }
+// Why a goal switch can look like it does nothing in IronMan mode: on a
+// training day goal adjustment + trend correction that nets below zero is
+// swallowed by the training-day floor (Target = calibrated demand), so
+// maintain/build/lose all show the same number there. Summarizes the
+// upcoming rows (today onward) for the Goal card and the Dashboard panel.
+function imGoalFloorSummary(rows) {
+  const training = rows.filter((r) => r.imMode && r.imFloorKcal > 0);
+  const floored = training.filter((r) => r.imFloorApplied);
+  if (!floored.length) return null;
+  const first = floored[0];
+  return {
+    trainingDays: training.length, flooredDays: floored.length,
+    restDays: rows.filter((r) => r.imMode && !(r.imFloorKcal > 0)).length,
+    goalKcal: first.imGoalKcal, trendKcal: first.imTrendKcal, goalSign: first.imGoalSign,
+    netKcal: first.imGoalKcal + first.imTrendKcal,
+    repaidKcal: first.repaidKcal || 0,
+    date: first.date, label: first.label,
+  };
+}
 function imInterp(anchors, x) {
   if (x <= anchors[0][0]) return anchors[0][1];
   for (let i = 1; i < anchors.length; i++) {
@@ -1737,9 +1756,10 @@ function App() {
       // Each day's correction comes from its own fixed window (and its own
       // goal), not today's — so a past day's target doesn't drift as new
       // weigh-ins land.
-      const dayTrendCorrection = profile.trendCalibration
-        ? computeTrendCorrection(weightLog, goalParamsForDay.sign, goalParamsForDay.ratePct, anchorKey, targetWindowDays)
-        : null;
+      // Always computed (it's also the dashboard's actual-rate plot); only
+      // fed into the target when trend calibration is on.
+      const dayTrend = computeTrendCorrection(weightLog, goalParamsForDay.sign, goalParamsForDay.ratePct, anchorKey, targetWindowDays);
+      const dayTrendCorrection = profile.trendCalibration ? dayTrend : null;
       const calibrationKcal = (dayTrendCorrection && !dayTrendCorrection.insufficient) ? dayTrendCorrection.correctionKcal : 0;
       const baseTarget = demand + goalAdjustmentKcal + calibrationKcal;
 
@@ -1963,7 +1983,14 @@ function App() {
         durationMin, fuelTier, carbTargetG: carbTargetGDisplay, proteinTargetG, fatTargetG: fatTargetGDisplay, isFutureOrToday,
         scheduledSessions, preloading, preloadSession, borrowedKcal, repaidKcal,
         taper, raceLoading, race: taper?.race || carbLoad?.race || raceToday || null,
+        // Weight-change rate over this day's fixed target window (same
+        // regression the trend correction uses), and the goal's rate.
+        actualRateKgWk: dayTrend.insufficient ? null : dayTrend.actualWeeklyRateKg,
+        goalRateKgWk: dayTrend.insufficient
+          ? (weightForDay ? goalParamsForDay.sign * (goalParamsForDay.ratePct / 100) * weightForDay : null)
+          : dayTrend.targetWeeklyRateKg,
         ...(im ? {
+          imGoalKcal: goalAdjustmentKcal, imTrendKcal: calibrationKcal, imGoalSign: goalParamsForDay.sign,
           imMode: true, imCarbGPerKg, imFloorKcal,
           imFloorApplied: imFloorKcal > 0 && carbDrivenTargetRaw < imFloorKcal,
           imSessionFuel: (source === "planned" ? scheduledSessions : [])
@@ -2000,6 +2027,7 @@ function App() {
       remainingProteinG: today && today.proteinTargetG !== null ? today.proteinTargetG - (today.protein || 0) : null,
       upcoming, recentKey,
       weightKg: parseFloat(profile.weightKg) || null,
+      goalFloor: imGoalFloorSummary(upcoming),
     };
   }, [dailyRows, weightLog, profile, imCal]);
 
@@ -2136,7 +2164,8 @@ function App() {
             intervalsStatus={intervalsStatus} intervalsSyncedCount={intervalsData.syncedDates.length}
             goalParams={goalParams} trendCorrection={trendCorrection}
             weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus}
-            imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={recalibrateIronman} />
+            imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={recalibrateIronman}
+            imGoalFloor={ironmanStatus ? ironmanStatus.goalFloor : null} />
         )}
         {tab === "import" && (
           <ImportTab onFile={handleCSVFile} csvPreview={csvPreview} colMap={colMap} setColMap={setColMap}
@@ -2160,7 +2189,7 @@ function App() {
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
             goalParams={goalParams} trendCorrection={trendCorrection} trendCalibration={profile.trendCalibration}
             proteinGPerKg={profile.proteinGPerKg} weightGoalStatus={weightGoalStatus}
-            targetWeightKg={parseFloat(profile.targetWeightKg) || null} units={units}
+            targetWeightKg={parseFloat(profile.targetWeightKg) || null} units={units} targetWindowDays={targetWindowDays}
             ironmanStatus={ironmanStatus} imProjection={profile.ironmanMode ? imProjection : null}
             imProjectionError={profile.ironmanMode ? imProjectionError : null}
             imMissingCalibration={!!profile.ironmanMode && !imCalibrationReady(profile, imCal)} />
@@ -2204,7 +2233,7 @@ function ConfirmRange({ value, onCommit, format = (v) => v, ...rangeProps }) {
   );
 }
 
-function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate }) {
+function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor }) {
   const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
   const units = profile.units || "metric";
   const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
@@ -2391,7 +2420,7 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
       </div>
 
       <GoalCard profile={profile} setProfile={setProfile} goalParams={goalParams} trendCorrection={trendCorrection}
-        weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus}
+        weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus} imGoalFloor={imGoalFloor}
         imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={onRecalibrate} />
 
       <div style={{ display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start" }}>
@@ -2423,7 +2452,7 @@ function recordGoalHistory(p, overrides) {
   return { ...p, ...overrides, goalHistory: filtered };
 }
 
-function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate }) {
+function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor }) {
   const setGoal = (goal) => setProfile((p) => recordGoalHistory(p, { goal }));
   const range = profile.goal === "build" ? GOAL_DEFAULTS.build : profile.goal === "lose" ? GOAL_DEFAULTS.lose : null;
   const rateKey = profile.goal === "build" ? "buildRatePct" : "loseRatePct";
@@ -2508,7 +2537,31 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
             : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target → correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`}
         </div>
       )}
+      {imGoalFloor && <ImGoalFloorNote info={imGoalFloor} goalLabel={goalParams.label} />}
     </div>
+  );
+}
+
+// Explains, in the Goal card, why switching maintain/build/lose leaves a
+// training day's Target unchanged in IronMan mode (see imGoalFloorSummary).
+function ImGoalFloorNote({ info, goalLabel }) {
+  const signed = (v) => `${v >= 0 ? "+" : "−"}${fmt(Math.abs(v))}`;
+  const allTraining = info.flooredDays === info.trainingDays;
+  return (
+    <Banner kind="warning">
+      <b>Goal masked on {info.flooredDays} of {info.trainingDays} upcoming training day{info.trainingDays === 1 ? "" : "s"}.</b>{" "}
+      On {info.label}, {goalLabel.toLowerCase()} adds {signed(info.goalKcal)} kcal and trend calibration {signed(info.trendKcal)} kcal
+      {info.repaidKcal > 0 ? `, and a pre-load repayment takes ${fmt(info.repaidKcal)} kcal` : ""} — net {signed(info.netKcal - info.repaidKcal)} kcal,
+      which would put Target below calibrated demand, so IronMan mode's training-day floor pins it to demand instead.
+      {info.goalSign >= 0 && info.trendKcal < 0
+        ? " You're already gaining faster than this goal's rate, so the trend correction cancels the surplus; switching maintain ↔ build won't change those days."
+        : info.goalSign < 0
+        ? " A deficit only lands on rest days in IronMan mode."
+        : ""}
+      {" "}{info.restDays > 0
+        ? `Rest days (${info.restDays} upcoming) still follow the goal.`
+        : allTraining ? "With no upcoming rest days, the goal currently has no visible effect." : ""}
+    </Banner>
   );
 }
 
@@ -3868,7 +3921,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
 }
 
 
-function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units, ironmanStatus, imProjection, imProjectionError, imMissingCalibration }) {
+function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units, targetWindowDays, ironmanStatus, imProjection, imProjectionError, imMissingCalibration }) {
   const wUnit = weightUnitLabel(units);
   const [visibleMacros, setVisibleMacros] = useState({ carbs: false, protein: false, fat: false });
   const [visibleWeightSeries, setVisibleWeightSeries] = useState({ actual: true, rollingAvg: true, target: true });
@@ -3904,6 +3957,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
   // targetWeight is carried as a flat per-row value (rather than a plain
   // ReferenceLine) so it participates in the axis's auto domain and shows up
   // in the tooltip alongside actual/trend, the same as any other series.
+  const todayKeyForRate = toLocalISODate(new Date());
   const rowsWithTrend = rows.map((r, i) => {
     const window = rows.slice(Math.max(0, i - 6), i + 1).filter((x) => x.weight !== null);
     const trend = window.length ? window.reduce((s, x) => s + x.weight, 0) / window.length : null;
@@ -3912,8 +3966,18 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
       weight: r.weight !== null ? kgToDisplay(r.weight, units) : null,
       weightTrend: trend !== null ? kgToDisplay(trend, units) : null,
       targetWeight: targetWeightKg !== null ? kgToDisplay(targetWeightKg, units) : null,
+      // Future days all share today's window, so the actual rate stops at today
+      // (the goal rate carries on through the forward days).
+      actualRate: !r.isFutureOrToday || r.date === todayKeyForRate ? (r.actualRateKgWk !== null && r.actualRateKgWk !== undefined ? kgToDisplay(r.actualRateKgWk, units) : null) : null,
+      goalRate: r.goalRateKgWk !== null && r.goalRateKgWk !== undefined ? kgToDisplay(r.goalRateKgWk, units) : null,
     };
   });
+  const hasRate = rowsWithTrend.some((r) => r.actualRate !== null);
+  const rateToday = [...rowsWithTrend].reverse().find((r) => r.actualRate !== null) || null;
+  const currentRate = rateToday ? {
+    actual: rateToday.actualRate, goal: rateToday.goalRate ?? 0,
+    pct: rateToday.weightTrend ? (rateToday.actualRate / rateToday.weightTrend) * 100 : null,
+  } : null;
   return (
     // gridTemplateColumns is pinned to minmax(0, 1fr) rather than left as the
     // default "auto" — a card containing a chart pinned to a fixed pixel
@@ -4074,6 +4138,37 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
         </div>
       )}
 
+      {hasRate && (
+        <div className="card" style={{ padding: "20px 20px 8px" }}>
+          <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12, padding: "0 4px" }}>
+            <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14 }}>Weight-change rate</div>
+            {currentRate && (
+              <div style={{ fontFamily: mono, fontSize: 12, color: dim }}>
+                now <b style={{ color: currentRate.actual >= 0 ? mint : coral }}>{currentRate.actual >= 0 ? "+" : ""}{fmt(currentRate.actual, 2)} {wUnit}/wk</b>
+                {currentRate.pct !== null ? ` (${currentRate.pct >= 0 ? "+" : ""}${fmt(currentRate.pct, 2)}%/wk)` : ""}
+                {" "}vs goal {currentRate.goal >= 0 ? "+" : ""}{fmt(currentRate.goal, 2)} {wUnit}/wk
+              </div>
+            )}
+          </div>
+          <div style={{ fontSize: 11, color: dim, margin: "0 4px 10px", lineHeight: 1.5 }}>
+            Linear fit over each day's {targetWindowDays}-day weigh-in window (the same one trend calibration uses).
+          </div>
+          <div ref={registerChartScroll} onScroll={syncChartScroll} style={{ overflowX: "auto", overflowY: "hidden", maxWidth: "100%" }}>
+            <div style={{ width: chartWidth, margin: "0 auto" }}>
+            <ComposedChart width={chartWidth} height={180} data={rowsWithTrend} margin={{ top: 4, right: 12, left: 0, bottom: 0 }}>
+              <CartesianGrid stroke={line} vertical={false} />
+              <XAxis dataKey="label" tick={{ fill: dim, fontSize: 11, fontFamily: mono }} axisLine={{ stroke: line }} tickLine={false} />
+              <YAxis tick={{ fill: dim, fontSize: 11, fontFamily: mono }} axisLine={false} tickLine={false} width={44} tickFormatter={(v) => fmt(v, 2)} />
+              <Tooltip content={<CustomTooltip />} />
+              <ReferenceLine y={0} stroke={dim} />
+              <Line type="monotone" dataKey="actualRate" name={`Actual (${wUnit}/wk)`} stroke={cyan} strokeWidth={2.2} dot={false} connectNulls />
+              <Line type="stepAfter" dataKey="goalRate" name={`Goal (${wUnit}/wk)`} stroke={gold} strokeWidth={2} strokeDasharray="6 3" dot={false} connectNulls />
+            </ComposedChart>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="card" style={{ padding: 20 }}>
         <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 12 }}>Daily breakdown</div>
         <div style={{ maxHeight: 480, overflow: "auto" }}>
@@ -4173,7 +4268,9 @@ function IronmanPanel({ status, units }) {
       </div>
       {today && (
         <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>
-          Today: target {fmt(today.target)} kcal · carbs {fmt(today.carbTargetG)} g ({fmt(today.imCarbGPerKg, 1)} g/kg day-load){today.imFloorApplied ? " · training-day floor applied" : ""}
+          Today: target {fmt(today.target)} kcal · carbs {fmt(today.carbTargetG)} g ({fmt(today.imCarbGPerKg, 1)} g/kg day-load){today.imFloorApplied
+            ? ` · training-day floor applied (goal ${today.imGoalKcal >= 0 ? "+" : "−"}${fmt(Math.abs(today.imGoalKcal))} + trend ${today.imTrendKcal >= 0 ? "+" : "−"}${fmt(Math.abs(today.imTrendKcal))} kcal would land below demand, so the goal doesn't change today)`
+            : ""}
         </div>
       )}
       {recover.length > 0 && weightKg && (
@@ -4336,6 +4433,7 @@ function FuelingReferencePanel({ fuelingByTier }) {
   );
 }
 
+const RATE_SERIES_KEYS = new Set(["actualRate", "goalRate"]);
 function CustomTooltip({ active, payload, label }) {
   if (!active || !payload || !payload.length) return null;
   // The gap chart already plots "gap" as its own Bar (it'll show up in
@@ -4350,7 +4448,7 @@ function CustomTooltip({ active, payload, label }) {
       <div style={{ color: dim, marginBottom: 6 }}>{label}</div>
       {payload.map((p, i) => (
         <div key={i} style={{ color: p.color, display: "flex", justifyContent: "space-between", gap: 16 }}>
-          <span>{p.name}</span><span>{fmt(p.value)}</span>
+          <span>{p.name}</span><span>{fmt(p.value, RATE_SERIES_KEYS.has(p.dataKey) ? 2 : 0)}</span>
         </div>
       ))}
       {!hasGapSeries && row && row.gap !== null && row.gap !== undefined && (

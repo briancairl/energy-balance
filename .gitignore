@@ -12,3 +12,6 @@ configs/config.json
 configs/*.key
 configs/*.crt
 configs/schedule_sources/
+
+# In-app update state (update.sh)
+caches/update_*.json

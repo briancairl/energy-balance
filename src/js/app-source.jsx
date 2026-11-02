@@ -2423,10 +2423,106 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
         weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus} imGoalFloor={imGoalFloor}
         imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={onRecalibrate} />
 
+      <UpdateCard />
+
       <div style={{ display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start" }}>
         <Icon path={ICONS.info} size={14} color={dim} />
         <div>BMR uses the Mifflin-St Jeor equation. The training and recovery adjustments beyond that are heuristics commonly used in endurance-coaching practice, not a single peer-reviewed formula — tune the sliders above to match how your coach or experience calibrates it.</div>
       </div>
+    </div>
+  );
+}
+
+// "Update" button: asks the host to pull origin/main and re-run docker
+// compose if main moved since the last update. The server only drops a
+// request file (POST /api/update); a host-side systemd watcher installed by
+// install.sh runs update.sh and reports back via /api/update/status. The
+// server restarts mid-update, so polling tolerates failed requests and the
+// page reloads once a new version has been deployed.
+const UPDATE_STALE_MS = 2 * 60 * 1000;
+function UpdateCard() {
+  const [info, setInfo] = useState(null);
+  const [requesting, setRequesting] = useState(false);
+  const [error, setError] = useState(null);
+  const [requestedAt, setRequestedAt] = useState(null);
+
+  async function poll() {
+    try {
+      const res = await fetch("/api/update/status");
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      setInfo(data);
+      return data;
+    } catch {
+      return null; // server likely restarting mid-update
+    }
+  }
+  useEffect(() => { poll(); }, []);
+
+  const state = info?.status?.state;
+  const statusTime = info?.status?.time ? Date.parse(info.status.time) : 0;
+  // Our request is still in flight until the host has picked it up and
+  // written a status at or after the time we asked.
+  const waitingOnHost = requestedAt && (info?.pending || statusTime < requestedAt);
+  const busy = requesting || waitingOnHost || state === "running";
+
+  useEffect(() => {
+    if (!busy) return;
+    const id = setInterval(async () => {
+      const data = await poll();
+      const st = data?.status;
+      if (st?.state === "updated" && requestedAt && Date.parse(st.time) >= requestedAt) {
+        window.location.reload();
+      }
+    }, 3000);
+    return () => clearInterval(id);
+  }, [busy, requestedAt]);
+
+  async function requestUpdate() {
+    setRequesting(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/update", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Update request failed (${res.status}).`);
+      // Second resolution on the host's timestamps — round down so a status
+      // written in the same second still counts as a response.
+      setRequestedAt(Math.floor(Date.parse(data.requested_at) / 1000) * 1000);
+      await poll();
+    } catch (e) {
+      setError(e.message || "Could not reach the local server.");
+    } finally {
+      setRequesting(false);
+    }
+  }
+
+  const stale = waitingOnHost && info?.pending && Date.now() - requestedAt > UPDATE_STALE_MS;
+  const st = info?.status;
+  return (
+    <div className="card" style={{ padding: 22 }}>
+      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
+        <Icon path={ICONS.refresh} size={16} color={cyan} /> App update
+      </div>
+      <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+        Pulls the latest <code>origin/main</code> and rebuilds/restarts the Docker container — only if main has
+        moved since the last update. Runs on the host via the watcher <code>install.sh</code> sets up (or run
+        <code> ./update.sh</code> there by hand). The app is briefly unavailable while it restarts.
+      </div>
+      <button className="btn-primary" onClick={requestUpdate} disabled={busy}>
+        <Icon path={ICONS.refresh} size={13} color={ink} /> {busy ? "Updating…" : "Update"}
+      </button>
+      {stale ? (
+        <Banner kind="warning">
+          No response from the host yet. The update watcher only exists on systemd hosts after running
+          <code> ./install.sh</code> — otherwise run <code>./update.sh</code> on the host.
+        </Banner>
+      ) : st && (
+        <Banner kind={st.state === "error" ? "error" : st.state === "running" ? "info" : "success"}>
+          {st.message}
+          {st.time && <span style={{ color: dim, fontFamily: mono, fontSize: 11.5 }}> · {new Date(st.time).toLocaleString()}</span>}
+        </Banner>
+      )}
+      {error && <Banner kind="error">{error}</Banner>}
     </div>
   );
 }

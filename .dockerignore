@@ -11,3 +11,4 @@ configs/config.json
 caches/*cache.json
 configs/*.key
 configs/*.crt
+caches/update_*.json

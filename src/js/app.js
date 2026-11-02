@@ -1865,7 +1865,62 @@
         imCalError,
         onRecalibrate
       }
-    ), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.info, size: 14, color: dim }), /* @__PURE__ */ React.createElement("div", null, "BMR uses the Mifflin-St Jeor equation. The training and recovery adjustments beyond that are heuristics commonly used in endurance-coaching practice, not a single peer-reviewed formula \u2014 tune the sliders above to match how your coach or experience calibrates it.")));
+    ), /* @__PURE__ */ React.createElement(UpdateCard, null), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.info, size: 14, color: dim }), /* @__PURE__ */ React.createElement("div", null, "BMR uses the Mifflin-St Jeor equation. The training and recovery adjustments beyond that are heuristics commonly used in endurance-coaching practice, not a single peer-reviewed formula \u2014 tune the sliders above to match how your coach or experience calibrates it.")));
+  }
+  const UPDATE_STALE_MS = 2 * 60 * 1e3;
+  function UpdateCard() {
+    var _a, _b;
+    const [info, setInfo] = useState(null);
+    const [requesting, setRequesting] = useState(false);
+    const [error, setError] = useState(null);
+    const [requestedAt, setRequestedAt] = useState(null);
+    async function poll() {
+      try {
+        const res = await fetch("/api/update/status");
+        if (!res.ok) throw new Error();
+        const data = await res.json();
+        setInfo(data);
+        return data;
+      } catch {
+        return null;
+      }
+    }
+    useEffect(() => {
+      poll();
+    }, []);
+    const state = (_a = info == null ? void 0 : info.status) == null ? void 0 : _a.state;
+    const statusTime = ((_b = info == null ? void 0 : info.status) == null ? void 0 : _b.time) ? Date.parse(info.status.time) : 0;
+    const waitingOnHost = requestedAt && ((info == null ? void 0 : info.pending) || statusTime < requestedAt);
+    const busy = requesting || waitingOnHost || state === "running";
+    useEffect(() => {
+      if (!busy) return;
+      const id = setInterval(async () => {
+        const data = await poll();
+        const st2 = data == null ? void 0 : data.status;
+        if ((st2 == null ? void 0 : st2.state) === "updated" && requestedAt && Date.parse(st2.time) >= requestedAt) {
+          window.location.reload();
+        }
+      }, 3e3);
+      return () => clearInterval(id);
+    }, [busy, requestedAt]);
+    async function requestUpdate() {
+      setRequesting(true);
+      setError(null);
+      try {
+        const res = await fetch("/api/update", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `Update request failed (${res.status}).`);
+        setRequestedAt(Math.floor(Date.parse(data.requested_at) / 1e3) * 1e3);
+        await poll();
+      } catch (e) {
+        setError(e.message || "Could not reach the local server.");
+      } finally {
+        setRequesting(false);
+      }
+    }
+    const stale = waitingOnHost && (info == null ? void 0 : info.pending) && Date.now() - requestedAt > UPDATE_STALE_MS;
+    const st = info == null ? void 0 : info.status;
+    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 16, color: cyan }), " App update"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Pulls the latest ", /* @__PURE__ */ React.createElement("code", null, "origin/main"), " and rebuilds/restarts the Docker container \u2014 only if main has moved since the last update. Runs on the host via the watcher ", /* @__PURE__ */ React.createElement("code", null, "install.sh"), " sets up (or run", /* @__PURE__ */ React.createElement("code", null, " ./update.sh"), " there by hand). The app is briefly unavailable while it restarts."), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: requestUpdate, disabled: busy }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), " ", busy ? "Updating\u2026" : "Update"), stale ? /* @__PURE__ */ React.createElement(Banner, { kind: "warning" }, "No response from the host yet. The update watcher only exists on systemd hosts after running", /* @__PURE__ */ React.createElement("code", null, " ./install.sh"), " \u2014 otherwise run ", /* @__PURE__ */ React.createElement("code", null, "./update.sh"), " on the host.") : st && /* @__PURE__ */ React.createElement(Banner, { kind: st.state === "error" ? "error" : st.state === "running" ? "info" : "success" }, st.message, st.time && /* @__PURE__ */ React.createElement("span", { style: { color: dim, fontFamily: mono, fontSize: 11.5 } }, " \xB7 ", new Date(st.time).toLocaleString())), error && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, error));
   }
   function recordGoalHistory(p, overrides) {
     const today = toLocalISODate(/* @__PURE__ */ new Date());

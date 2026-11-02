@@ -150,6 +150,9 @@ history and just persist as entered.
 - **Trend calibration** (`profile.trendCalibration`, default on): linear regression over
   `weightLog` vs. the goal's target rate; the gap becomes a daily kcal correction, clamped to
   ±400 kcal, applied once ≥8 data points spanning ≥10 days exist. `computeTrendCorrection()`.
+- **Weight-change rate plot** (Dashboard, under Body weight): each row's `actualRateKgWk` (the same
+  window regression as the trend correction, computed even when trend calibration is off) vs `goalRateKgWk`
+  (that day's goal rate). The actual line stops at today; the goal line runs through the forward days.
 - **Fixed per-day target window** (`profile.targetWindowDays`, default 21, 14–60, tunable in
   the Goal card): each day's target only looks at the weigh-ins in the N days *before* that
   day (`targetAnchorKey()` — future days anchor at tomorrow, i.e. everything logged through
@@ -234,6 +237,11 @@ the lock, and only the single-key write is locked):
 - **Training-day floor**: on any day with session kcal, `carbDrivenTarget = max(…, demand)`. The goal
   deficit, trend correction or a pre-load repayment can't take Target below calibrated maintenance + session.
   The rolloverCapped bookkeeping sees the same floor, so an unrealized repayment still rolls forward.
+  Consequence: if goal adjustment + trend correction nets negative (e.g. already gaining faster than the
+  build rate, so the correction cancels the surplus), maintain/build/lose all show calibrated demand on
+  training days. That's intended; `imGoalFloorSummary` (on `ironmanStatus.goalFloor`) explains it in the
+  Goal card (`ImGoalFloorNote`) and on the IronMan panel's "Today:" line (rows carry `imGoalKcal` /
+  `imTrendKcal`).
 - **Carbs** = max(IOC/Burke tier value, day-load periodization on session kcal:
   `IM_CARB_LOAD_ANCHORS`, ~5–7 g/kg easy → 8–10 moderate-long → 10–12 big). On pre-load/race-load
   days that becomes the floor under the bump, so borrow/repay and carb-load still only fund the

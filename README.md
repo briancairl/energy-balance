@@ -32,6 +32,18 @@ current checkout and recreates the container only if the image changed; your
 `configs/`, `secrets/` and `caches/` are untouched. Without systemd it falls
 back to the compose file's `restart: unless-stopped` policy.
 
+### Updating from the app
+
+Setup → **App update** → **Update** pulls the latest `origin/main` and re-runs
+`docker compose up -d --build`, but only if `main` has moved since the last
+update (the checkout must be on `main`). The server can't rebuild the
+container it runs in, so the button just drops `caches/update_request.json`;
+on systemd hosts `install.sh` also installs `energy-balance-update.path`,
+which watches for that file and runs `./update.sh` on the host. Progress and
+the result show up in the card (from `caches/update_status.json`); logs are in
+`journalctl -u energy-balance-update`. Without systemd, run `./update.sh` on
+the host yourself (`--force` rebuilds even if main hasn't moved).
+
 ## Project layout
 
 ```

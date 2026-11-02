@@ -22,6 +22,11 @@ set -euo pipefail
 
 SERVICE_NAME="energy-balance"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+# The in-app "Update" button drops caches/update_request.json; this .path
+# unit notices it and starts the oneshot service, which runs ./update.sh on
+# the host (the server can't rebuild the container it's running in).
+UPDATE_PATH_UNIT="/etc/systemd/system/${SERVICE_NAME}-update.path"
+UPDATE_SERVICE_UNIT="/etc/systemd/system/${SERVICE_NAME}-update.service"
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log()  { printf '==> %s\n' "$*"; }
@@ -82,6 +87,12 @@ compose() { (cd "$APP_DIR" && "${DOCKER_PREFIX[@]}" "${COMPOSE[@]}" "$@"); }
 
 # --- Uninstall ----------------------------------------------------------------
 if [ "$UNINSTALL" -eq 1 ]; then
+  if has_systemd && [ -f "$UPDATE_PATH_UNIT" ]; then
+    log "Disabling and removing the update watcher"
+    as_root systemctl disable --now "${SERVICE_NAME}-update.path" || true
+    as_root rm -f "$UPDATE_PATH_UNIT" "$UPDATE_SERVICE_UNIT"
+    as_root systemctl daemon-reload
+  fi
   if has_systemd && [ -f "$UNIT_PATH" ]; then
     log "Disabling and removing ${UNIT_PATH}"
     as_root systemctl disable --now "${SERVICE_NAME}.service" || true
@@ -125,6 +136,14 @@ compose up -d --remove-orphans
 # Drop dangling layers left behind by the previous image.
 "${DOCKER_PREFIX[@]}" docker image prune -f >/dev/null || true
 
+# Record what's now deployed, so the in-app Update button (./update.sh) only
+# rebuilds once origin/main moves past this.
+if [ -d "$APP_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+  mkdir -p "$APP_DIR/caches"
+  printf '{"deployed_sha": "%s"}\n' "$(git -C "$APP_DIR" rev-parse HEAD)" \
+    | as_root tee "$APP_DIR/caches/update_state.json" >/dev/null || true
+fi
+
 # --- Start on boot --------------------------------------------------------------
 if has_systemd; then
   # Make sure the Docker daemon itself comes up at boot.
@@ -164,9 +183,47 @@ WantedBy=multi-user.target
   # Mark the unit active without re-running it (the container is already up).
   as_root systemctl start "${SERVICE_NAME}.service"
   log "Enabled ${SERVICE_NAME}.service — the server will start on boot"
+
+  # --- In-app Update button watcher ---------------------------------------
+  # Runs as root so it can always reach the Docker daemon; update.sh drops to
+  # the checkout's owner for the git steps.
+  UPDATE_SERVICE_CONTENT="[Unit]
+Description=energy-balance: pull origin/main and rebuild if it moved
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+ExecStart=${APP_DIR}/update.sh
+TimeoutStartSec=0
+"
+  UPDATE_PATH_CONTENT="[Unit]
+Description=energy-balance: watch for in-app update requests
+
+[Path]
+PathExists=${APP_DIR}/caches/update_request.json
+Unit=${SERVICE_NAME}-update.service
+
+[Install]
+WantedBy=multi-user.target
+"
+  UPDATE_CHANGED=0
+  for pair in "${UPDATE_SERVICE_UNIT}|${UPDATE_SERVICE_CONTENT}" "${UPDATE_PATH_UNIT}|${UPDATE_PATH_CONTENT}"; do
+    upath="${pair%%|*}"; ucontent="${pair#*|}"
+    if [ ! -f "$upath" ] || [ "$(cat "$upath")" != "$(printf '%s' "$ucontent")" ]; then
+      log "Writing ${upath}"
+      printf '%s' "$ucontent" | as_root tee "$upath" >/dev/null
+      UPDATE_CHANGED=1
+    fi
+  done
+  [ "$UPDATE_CHANGED" -eq 1 ] && as_root systemctl daemon-reload
+  as_root systemctl enable --now "${SERVICE_NAME}-update.path" >/dev/null
+  log "Enabled ${SERVICE_NAME}-update.path — the app's Update button is live"
 else
   warn "systemd not detected; relying on docker-compose.yml's 'restart: unless-stopped'."
   warn "Make sure the Docker daemon is configured to start at boot on this host."
+  warn "The in-app Update button needs systemd; without it, run ./update.sh by hand."
 fi
 
 log "Done. The app is at http://localhost:8081/"

@@ -130,6 +130,13 @@ STORE_PATH = os.path.join(SECRETS_DIR, "app_store.json")
 SCHEDULE_SOURCES_DIR = os.path.join(CONFIGS_DIR, "schedule_sources")
 TLS_CERT_PATH = os.path.join(CONFIGS_DIR, "tailscale.crt")
 TLS_KEY_PATH = os.path.join(CONFIGS_DIR, "tailscale.key")
+# In-app updates: POST /api/update drops UPDATE_REQUEST_PATH; on the host,
+# energy-balance-update.path (installed by install.sh) sees it and runs
+# update.sh, which pulls origin/main and re-runs docker compose if main moved,
+# reporting progress in UPDATE_STATUS_PATH. The server can't do the rebuild
+# itself — it runs inside the container being rebuilt.
+UPDATE_REQUEST_PATH = os.path.join(CACHES_DIR, "update_request.json")
+UPDATE_STATUS_PATH = os.path.join(CACHES_DIR, "update_status.json")
 
 STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
@@ -843,6 +850,14 @@ class Handler(BaseHTTPRequestHandler):
                 os.remove(TOKENS_PATH)
             return self._send_json({"ok": True})
 
+        if path == "/api/update/status":
+            request = load_json(UPDATE_REQUEST_PATH) if os.path.exists(UPDATE_REQUEST_PATH) else None
+            return self._send_json({
+                "pending": request is not None,
+                "requested_at": (request or {}).get("requested_at"),
+                "status": load_json(UPDATE_STATUS_PATH),
+            })
+
         if path == "/api/strava/cache/status":
             cache = load_cache()
             dates = list(cache.get("by_date", {}).keys())
@@ -1092,6 +1107,11 @@ class Handler(BaseHTTPRequestHandler):
                 return s
             update_store(mutate)
             return self._send_json({"ok": True, "key": key})
+
+        if path == "/api/update":
+            requested_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            save_json(UPDATE_REQUEST_PATH, {"requested_at": requested_at})
+            return self._send_json({"ok": True, "requested_at": requested_at})
 
         # ---- Per-date merge endpoints for nutrition-log / weight-log ----
         # Unlike the generic /api/store above (which trusts the client's whole

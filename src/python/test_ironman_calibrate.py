@@ -166,6 +166,80 @@ class Projection(unittest.TestCase):
         self.assertAlmostEqual(wk["demandKcalPerDay"], expect, delta=1)
         self.assertEqual(len(wk["raceDays"]), 1)
 
+    def _load_fixture(self):
+        costs = {d: {"kcalPerHourByZone": {z: 600 + 100 * z for z in range(1, 6)}} for d in ic.DISCIPLINES}
+        cal = {"sessionCost": costs, "energyBalance": {"neat": 1.3, "activityScale": 1.0}}
+        ath = {"weightKg": 75.0, "sex": "male", "heightCm": 188.0, "age": 34, "goal": "maintain",
+               "buildRatePct": 0.2, "loseRatePct": 0.5, "proteinGPerKg": 2.0, "targetWeightKg": None}
+        # Race on Monday 2027-01-11: with the default 3-day window the load
+        # days (Fri-Sun) all sit in the PREVIOUS plan week.
+        plan = {"weeks": [
+            {"weekStart": "2027-01-04", "phase": "taper", "sessions": [
+                {"day": "Sat", "disc": "run", "title": "Shakeout", "detail": "", "mins": 30, "zone": 1},
+            ]},
+            {"weekStart": "2027-01-11", "phase": "race", "sessions": [
+                {"day": "Mon", "disc": "run", "title": "RACE — Thing", "detail": "", "mins": 600, "zone": 3},
+            ]},
+        ]}
+        return cal, ath, plan
+
+    def test_carb_load_days_priced_like_the_app(self):
+        cal, ath, plan = self._load_fixture()
+        wk = ic.project_plan([plan], cal, ath)[0]
+        self.assertEqual([d["date"] for d in wk["carbLoadDays"]], ["2027-01-08", "2027-01-09", "2027-01-10"])
+        self.assertEqual([d["daysToRace"] for d in wk["carbLoadDays"]], [3, 2, 1])
+        self.assertTrue(all(d["carbGPerKg"] == 12.0 for d in wk["carbLoadDays"]))
+        self.assertEqual(wk["peakDayCarbGPerKg"], 12.0)
+        # Week mean by hand: Mon-Thu rest days (5 g/kg day-load floor), Fri/Sun
+        # rest + load, Sat 30-min Z1 shakeout (700 kcal/h) + load.
+        w, prot = 75.0, 150.0
+        base = 1.3 * ic.calc_bmr("male", 75, 188, 34)
+
+        def day(t, g, fat_pct):
+            fat = max(t * fat_pct / 100 / 9, (t - g * w * 4 - prot * 4) / 9)
+            return max(t, g * w * 4 + prot * 4 + fat * 9), fat
+        rest_t, _ = day(base, 5.0, 20)
+        sat_g0 = ic.day_carb_g_per_kg([("Run", 1, 30)], cal["sessionCost"], 1.0)[0]
+        load_rest_t, _ = day(base + (12 - 5.0) * w * 4, 12, 10)
+        load_sat_t, _ = day(base + 350 + (12 - sat_g0) * w * 4, 12, 10)
+        expect_t = (4 * rest_t + 2 * load_rest_t + load_sat_t) / 7
+        self.assertAlmostEqual(wk["targetKcalPerDay"], expect_t, delta=1)
+        self.assertAlmostEqual(wk["carbGPerKg"], (4 * 5.0 + 3 * 12) / 7, delta=0.01)
+        # The load surplus isn't paid back: demand is untouched.
+        self.assertAlmostEqual(wk["demandKcalPerDay"], base + 350 / 7, delta=1)
+
+    def test_store_race_entry_sets_window_and_can_turn_it_off(self):
+        cal, ath, plan = self._load_fixture()
+        ath_off = dict(ath, races=[{"raceDate": "2027-01-11", "durationMin": 600, "carbLoadDays": 0}])
+        self.assertEqual(ic.project_plan([plan], cal, ath_off)[0]["carbLoadDays"], [])
+        ath_one = dict(ath, races=[{"raceDate": "2027-01-11", "durationMin": 600, "carbLoadDays": 1}])
+        self.assertEqual([d["date"] for d in ic.project_plan([plan], cal, ath_one)[0]["carbLoadDays"]], ["2027-01-10"])
+        ath_cap = dict(ath, maxPreloadCarbGPerKg=10.0)
+        self.assertTrue(all(d["carbGPerKg"] == 10.0 for d in ic.project_plan([plan], cal, ath_cap)[0]["carbLoadDays"]))
+
+    def test_short_race_and_nearest_race_rule(self):
+        cal, ath, plan = self._load_fixture()
+        # A 60-min race doesn't qualify for loading...
+        short = dict(ath, races=[{"raceDate": "2027-01-11", "durationMin": 60, "carbLoadDays": 3}])
+        self.assertEqual(ic.project_plan([plan], cal, short)[0]["carbLoadDays"], [])
+        # ...and, as in the app, only the nearest upcoming race counts.
+        self.assertIsNone(ic.carb_load_state(
+            [{"raceDate": "2027-01-09", "durationMin": 60, "carbLoadDays": 3},
+             {"raceDate": "2027-01-11", "durationMin": 600, "carbLoadDays": 3}], "2027-01-08"))
+        self.assertEqual(ic.carb_load_state(
+            [{"raceDate": "2027-01-11", "durationMin": 600, "carbLoadDays": 3}], "2027-01-08"), 3)
+
+    def test_race_inputs_from_store(self):
+        store = {"training-schedule": [
+            {"kind": "race", "raceDate": "2027-07-18", "durationMin": 720, "carbLoadDays": 2},
+            {"kind": "race", "raceDate": "2027-06-01", "durationMin": 300},
+            {"kind": "single", "date": "2027-06-02", "durationMin": 60},
+        ]}
+        self.assertEqual(ic.race_inputs(store), [
+            {"raceDate": "2027-07-18", "durationMin": 720, "carbLoadDays": 2},
+            {"raceDate": "2027-06-01", "durationMin": 300, "carbLoadDays": 3},
+        ])
+
     def test_carb_anchor_monotone(self):
         vals = [ic.carb_g_per_kg_for_load(x) for x in range(0, 5000, 250)]
         self.assertTrue(all(a <= b for a, b in zip(vals, vals[1:])))

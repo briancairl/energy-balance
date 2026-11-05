@@ -260,6 +260,14 @@ both cover. It is needed because `training-schedule` only ever holds ~8 weeks. T
 demand/target/carbs/fat and the peak day, uses each session's `zone` when present (else
 `classify_zone`), and excludes race-titled sessions from the averages. It is read-only and fits on the
 fly if no calibration is saved yet. Rendered by `IronmanProjection`.
+Carb-load days are priced the way `dailyRows` prices them (`carb_load_state` mirrors `getCarbLoadState`:
+nearest upcoming race only, ≥`CARB_LOAD_MIN_DURATION`, per-race `carbLoadDays`). Carbs go to
+min(12, `maxPreloadCarbGPerKg`) and never below the day-load value. The extra carb kcal is added to Target
+and never paid back, and fat keeps only `carbLoadFatFloorPct`. Races come from the store's
+`training-schedule` race entries (`race_inputs`, via `athlete_inputs`), so the athlete's own
+`carbLoadDays` apply. A plan "RACE…" session with no matching entry uses the default window. The
+window can cross into the previous plan week. Each week lists its load days in `carbLoadDays`.
+The projection still models neither the ordinary day-before pre-load nor the IronMan training-day floor.
 
 **Plan import additions** (`schedule_sync.py`): a session's own `zone` (int 1–5) wins over
 `classify_zone`. An optional `fuel` ({carbGPerH, fluidMlPerH, sodiumMgPerH}) and `key: true` are carried

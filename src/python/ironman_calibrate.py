@@ -44,7 +44,8 @@ against synthetic fixtures):
 
 4. Projection (project_plan): per plan week, mean daily calibrated demand
    (and demand + goal surplus), carb g/day and g/kg, using the plan sessions'
-   own zone when present.
+   own zone when present. The carb-load days before a race are priced as the
+   app prices them (top-tier carbs, unrepaid surplus, lower fat floor).
 """
 import argparse
 import datetime as dt
@@ -93,6 +94,13 @@ MIN_ACTIVITY_SEC = 600
 CARB_LOAD_ANCHORS = [(0, 5.0), (600, 6.0), (1200, 7.5), (2000, 9.0), (2800, 10.5), (4000, 12.0)]
 # IOC/Burke tiers, same as the app's FUEL_TIERS.
 FUEL_TIERS = [(20, 3, 5), (60, 5, 7), (180, 6, 10), (float("inf"), 8, 12)]
+# Pre-race carb loading, mirrored from app-source.jsx (CARB_LOAD_DAYS /
+# CARB_LOAD_MIN_DURATION / getCarbLoadState): the last `carbLoadDays` days
+# before a race of >= 90 min pin carbs to the top tier's top end (capped by
+# profile.maxPreloadCarbGPerKg), fat floor drops to carbLoadFatFloorPct.
+CARB_LOAD_DAYS = 3
+CARB_LOAD_MIN_DURATION = 90
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
 # ---------------------------------------------------------------- helpers
@@ -219,8 +227,42 @@ def athlete_inputs(store, plans=None):
         "loseRatePct": fnum(p.get("loseRatePct"), 0.5),
         "proteinGPerKg": fnum(p.get("proteinGPerKg"), 1.0),
         "targetWeightKg": fnum(p.get("targetWeightKg")),
+        "maxPreloadCarbGPerKg": fnum(p.get("maxPreloadCarbGPerKg")) or 12.0,
+        "carbLoadFatFloorPct": fnum(p.get("carbLoadFatFloorPct"), 10.0),
+        "races": race_inputs(store),
         "ftp": ftp, "ftpSource": ftp_src,
     }
+
+
+def race_inputs(store):
+    """The app's race entries (training-schedule, kind "race") as the
+    projection needs them. These carry the per-race carbLoadDays the athlete
+    actually set (0 = off; missing = CARB_LOAD_DAYS, as in the app)."""
+    out = []
+    for e in store.get("training-schedule") or []:
+        if not isinstance(e, dict) or e.get("kind") != "race" or not e.get("raceDate"):
+            continue
+        cld = e.get("carbLoadDays")
+        out.append({"raceDate": e["raceDate"][:10],
+                    "durationMin": fnum(e.get("durationMin"), 0) or 0,
+                    "carbLoadDays": CARB_LOAD_DAYS if cld is None else int(fnum(cld, CARB_LOAD_DAYS))})
+    return out
+
+
+def carb_load_state(races, date_str):
+    """Mirror of the app's getCarbLoadState: only the NEAREST race on or after
+    date_str counts; returns days-to-race when date_str is inside its
+    carb-load window, else None."""
+    upcoming = sorted((r for r in races if r["raceDate"] >= date_str), key=lambda r: r["raceDate"])
+    if not upcoming:
+        return None
+    race = upcoming[0]
+    if race["durationMin"] < CARB_LOAD_MIN_DURATION or not race["carbLoadDays"]:
+        return None
+    days_to = (s2d(race["raceDate"]) - s2d(date_str)).days
+    if days_to <= 0 or days_to > race["carbLoadDays"]:
+        return None
+    return days_to
 
 
 # ------------------------------------------------- 1. session-cost model
@@ -740,6 +782,30 @@ def project_plan(plans, calibration, athlete, start=None, end=None):
             if end and ws > end:
                 continue
             weeks[ws] = {"wk": wk, "sessions": list(wk.get("sessions", []))}
+    # Races for the carb-load window: the app's own race entries win (they
+    # hold the athlete's carbLoadDays); a plan "RACE ..." session on a date
+    # with no app race entry is used as-is with the default window. Every
+    # plan week is scanned (not just the projected range), so a race just
+    # past `end` still loads the days before it.
+    races = list(athlete.get("races") or [])
+    race_dates = {r["raceDate"] for r in races}
+    for plan in plans:
+        for wk in plan.get("weeks", []):
+            ws = wk.get("weekStart")
+            if not ws:
+                continue
+            for s in wk.get("sessions", []):
+                if not (s.get("title") or "").upper().startswith("RACE") or s.get("day") not in WEEKDAYS:
+                    continue
+                rd = d2s(s2d(ws) + dt.timedelta(days=WEEKDAYS.index(s["day"])))
+                if rd not in race_dates:
+                    race_dates.add(rd)
+                    races.append({"raceDate": rd, "durationMin": fnum(s.get("mins"), 0) or 0,
+                                  "carbLoadDays": CARB_LOAD_DAYS})
+    load_cap = athlete.get("maxPreloadCarbGPerKg") or 12.0
+    load_gkg = min(FUEL_TIERS[-1][2], load_cap)
+    load_fat_pct = athlete.get("carbLoadFatFloorPct")
+    load_fat_pct = 10.0 if load_fat_pct is None else load_fat_pct
     out = []
     for ws in sorted(weeks):
         wk = weeks[ws]["wk"]
@@ -752,27 +818,42 @@ def project_plan(plans, calibration, athlete, start=None, end=None):
             if not disc or mins <= 0:
                 continue
             try:
-                di = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].index(s["day"])
+                di = WEEKDAYS.index(s["day"])
             except (KeyError, ValueError):
                 continue
             zone = s.get("zone") if isinstance(s.get("zone"), int) else classify_zone(s["disc"], s.get("title", ""), s.get("detail", ""))
             if (s.get("title") or "").upper().startswith("RACE"):
                 # Race day itself is excluded from the weekly averages (the
-                # app's race entry + carb-load logic handles it).
+                # app's race entry handles it). The carb-load days before it
+                # are priced below via carb_load_state.
                 race_days.append({"day": s["day"], "title": s["title"], "mins": mins})
                 continue
             planned_min += mins
             days[di].append((disc, zone, mins))
         dem, carbs, gkg, sess, tgt, fats = [], [], [], [], [], []
+        load_days = []
         for i in range(7):
-            if race_days and any(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].index(r["day"]) == i for r in race_days):
+            if race_days and any(WEEKDAYS.index(r["day"]) == i for r in race_days):
                 continue  # race day itself is excluded from the weekly average
             g, skcal = day_carb_g_per_kg(days[i], costs, k)
             d = neat * bmr + skcal
             # Same macro bookkeeping as the app: fat fills the remainder,
             # floored at 20% of Target; Target never below the macro sum.
             t = d + goal_kcal
-            fat = max(t * 0.20 / 9, (t - g * w * 4 - protein_g * 4) / 9)
+            fat_floor_pct = 20.0
+            date_str = d2s(s2d(ws) + dt.timedelta(days=i))
+            days_to = carb_load_state(races, date_str)
+            if days_to is not None:
+                # Carb-load day (as the app's raceLoading): carbs pinned at the
+                # top-tier top end, never below the day's own day-load carbs;
+                # the extra carb kcal is added to Target as an unrepaid surplus,
+                # and fat keeps only the lower carb-load floor.
+                g_load = max(g, load_gkg)
+                t += (g_load - g) * w * 4
+                g = g_load
+                fat_floor_pct = load_fat_pct
+                load_days.append({"date": date_str, "daysToRace": days_to, "carbGPerKg": round(g, 1)})
+            fat = max(t * fat_floor_pct / 100 / 9, (t - g * w * 4 - protein_g * 4) / 9)
             t = max(t, g * w * 4 + protein_g * 4 + fat * 9)
             dem.append(d)
             tgt.append(t)
@@ -798,6 +879,7 @@ def project_plan(plans, calibration, athlete, start=None, end=None):
             "fatGPerDay": round(sum(fats) / n),
             "carbShareOfTarget": round(carb_kcal_share, 2) if carb_kcal_share else None,
             "raceDays": race_days,
+            "carbLoadDays": load_days,
         })
     return out
 

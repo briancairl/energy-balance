@@ -103,7 +103,7 @@ src/js/app.js` confirms the compiled output is valid JS.
   protein/carbs/fat from there (keys `208`/`203`/`205`/`204`), falling back to the same-named
   top-level fields only if a nutrient key is missing (those top-level fields are marked
   deprecated in the API's own schema).
-- Manual flow: Log tab → "Sync now" (`/api/macrosfirst/sync`, POST) — fetches the last
+- Manual flow: Log tab → MacrosFirst API panel → "Sync now" (`/api/macrosfirst/sync`, POST) — fetches the last
   `MACROSFIRST_SYNC_LOOKBACK_DAYS` (35) days and merges directly into `nutrition-log`'s
   `macrosfirst` slot per date. No column mapping, no preview step — the API already returns
   structured macros.
@@ -112,6 +112,19 @@ src/js/app.js` confirms the compiled output is valid JS.
   uses. Re-fetching already-synced dates is intentional (cheap, and picks up corrections made
   in MacrosFirst after the fact) rather than something to "optimize" into an incremental sync.
   Last-run timestamp recorded at store key `macrosfirst-last-auto-sync`.
+
+## UI layout (Setup / Log)
+
+Setup and Log are each a vertical list of collapsible panels (`PanelList` in `app-source.jsx`) with a
+text filter on top that matches panel titles, per-panel `keywords`, and the panel body's full text
+(bodies stay mounted while collapsed, so drafts survive and search can see them). Open/closed state is a
+per-browser preference in `localStorage` (`panels:setup`, `panels:log`), not the server store.
+- Setup: Athlete profile, Training data (the "days of training data to pull" `rangeDays` selector +
+  manual "Pull training data" button), Strava, intervals.icu, Model tuning, Goal, App update.
+- Log: manual macros, weight, MacrosFirst API, CSV import. The stored nutrition / training / weight
+  logs live behind the "Stored data…" button (a modal with one tab each). The training tab is
+  read-only: every cached Strava + intervals.icu activity, with intervals.icu rows on Strava days dimmed
+  (the model ignores them there).
 
 ## Data model — things that aren't obvious from a schema alone
 

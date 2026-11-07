@@ -1068,6 +1068,11 @@ const ICONS = {
   trophy: "M8 21h8M12 17v4M7 4h10v4a5 5 0 01-10 0V4zM7 4H3v2a4 4 0 004 4M17 4h4v2a4 4 0 01-4 4",
   sun: "M12 17a5 5 0 100-10 5 5 0 000 10zM12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42",
   moon: "M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z",
+  user: "M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2M12 11a4 4 0 100-8 4 4 0 000 8z",
+  download: "M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3",
+  search: "M11 19a8 8 0 100-16 8 8 0 000 16zM21 21l-4.35-4.35",
+  chevronRight: "M9 18l6-6-6-6",
+  database: "M12 8c4.97 0 9-1.34 9-3s-4.03-3-9-3-9 1.34-9 3 4.03 3 9 3zM21 12c0 1.66-4 3-9 3s-9-1.34-9-3M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5",
 };
 
 // Shared severity palette for goal-weight warnings — reuses the same
@@ -2086,6 +2091,12 @@ function App() {
         input, select, button { font-family: ${body}; }
         input:focus, select:focus { outline: 2px solid ${cyan}; outline-offset: 1px; }
         .card { background: ${panel}; border: 1px solid ${line}; border-radius: 6px; }
+        .panel-head { width: 100%; display: flex; align-items: center; gap: 9px; padding: 16px 22px; background: none; border: none; color: ${paper}; cursor: pointer; text-align: left; font: inherit; flex-wrap: wrap; }
+        .panel-head:hover { background: ${panel2}; }
+        .panel-head:focus-visible { outline: 2px solid ${cyan}; outline-offset: -2px; }
+        .panel-summary { margin-left: auto; font-size: 11.5px; color: ${dim}; font-family: ${mono}; }
+        .subtab { padding: 7px 14px; border-radius: 4px; font-size: 12.5px; font-weight: 600; cursor: pointer; border: 1px solid ${line}; background: transparent; color: ${dim}; }
+        .subtab.active { background: ${panel2}; color: ${cyan}; border-color: ${cyan}; }
         .fieldlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: ${dim}; margin-bottom: 6px; display:block; font-weight:600; }
         .inp { width: 100%; background: ${panel2}; border: 1px solid ${line}; color: ${paper}; border-radius: 4px; padding: 9px 10px; font-size: 14px; font-family: ${mono}; }
         .navbtn { display:flex; align-items:center; gap:8px; padding: 10px 14px; border-radius: 5px; cursor:pointer; font-size:13px; font-weight:600; border:1px solid transparent; }
@@ -2165,7 +2176,9 @@ function App() {
             goalParams={goalParams} trendCorrection={trendCorrection}
             weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus}
             imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={recalibrateIronman}
-            imGoalFloor={ironmanStatus ? ironmanStatus.goalFloor : null} />
+            imGoalFloor={ironmanStatus ? ironmanStatus.goalFloor : null}
+            onFetch={pullAll} fetching={fetching || stravaFetching} fetchError={fetchError}
+            rangeDays={rangeDays} setRangeDays={setRangeDays} />
         )}
         {tab === "import" && (
           <ImportTab onFile={handleCSVFile} csvPreview={csvPreview} colMap={colMap} setColMap={setColMap}
@@ -2173,9 +2186,8 @@ function App() {
             onDeleteDay={deleteNutritionDay} weightLog={weightLog} onSaveWeight={saveManualWeight}
             onDeleteWeight={deleteWeightDay} macrosfirstStatus={macrosfirstStatus} macrosfirstFetching={macrosfirstFetching}
             macrosfirstError={macrosfirstError} onSyncMacrosFirst={syncMacrosFirst} macrosfirstLastAutoSync={macrosfirstLastAutoSync}
-            onFetch={pullAll} fetching={fetching || stravaFetching} fetchError={fetchError}
-            rangeDays={rangeDays} setRangeDays={setRangeDays} lastFetched={lastFetched}
-            importError={importError} importNotice={importNotice} units={units} />
+            importError={importError} importNotice={importNotice} units={units}
+            stravaData={stravaData} intervalsData={intervalsData} kcalOverrides={kcalOverrides} />
         )}
         {tab === "schedule" && (
           <ScheduleTab schedule={schedule} onAdd={addScheduleEntry} onUpdate={updateScheduleEntry}
@@ -2233,15 +2245,132 @@ function ConfirmRange({ value, onCommit, format = (v) => v, ...rangeProps }) {
   );
 }
 
-function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor }) {
+// ---------- collapsible panel list (Setup / Log) ----------
+// Each page is a vertical list of collapsible panels with a text filter on
+// top. Open/closed state is a per-browser UI preference, so it lives in
+// localStorage (not the server store) and is wrapped in try/catch — private
+// windows can throw on access. Panel bodies stay mounted while collapsed
+// (display: none) so half-typed drafts inside them survive a collapse, and so
+// the filter can search a panel's full text, not just its title.
+function readPanelState(storageKey) {
+  try { return JSON.parse(localStorage.getItem(`panels:${storageKey}`) || "null") || {}; } catch { return {}; }
+}
+function writePanelState(storageKey, state) {
+  try { localStorage.setItem(`panels:${storageKey}`, JSON.stringify(state)); } catch { /* ignore */ }
+}
+
+function PanelList({ storageKey, panels, placeholder = "Filter panels…", toolbar = null }) {
+  const [saved, setSaved] = useState(() => readPanelState(storageKey));
+  const [query, setQuery] = useState("");
+  // While filtering, matching panels open automatically; this tracks the ones
+  // the user explicitly closed during the current search.
+  const [searchClosed, setSearchClosed] = useState({});
+  const bodyRefs = useRef({});
+  useEffect(() => { setSearchClosed({}); }, [query]);
+
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const searching = terms.length > 0;
+  const shown = panels.filter((p) => p && !p.hidden);
+  const matches = (p) => {
+    if (!searching) return true;
+    const hay = `${p.title} ${p.keywords || ""} ${bodyRefs.current[p.id]?.textContent || ""}`.toLowerCase();
+    return terms.every((t) => hay.includes(t));
+  };
+  const isOpen = (p) => (searching ? !searchClosed[p.id] : (saved[p.id] ?? !!p.defaultOpen));
+  const persist = (next) => { setSaved(next); writePanelState(storageKey, next); };
+  const toggle = (p) => {
+    if (searching) setSearchClosed((c) => ({ ...c, [p.id]: !c[p.id] }));
+    else persist({ ...saved, [p.id]: !isOpen(p) });
+  };
+  const setAll = (open) => {
+    if (searching) { setSearchClosed(open ? {} : Object.fromEntries(shown.map((p) => [p.id, true]))); return; }
+    persist(Object.fromEntries(shown.map((p) => [p.id, open])));
+  };
+  const visibleCount = shown.filter(matches).length;
+
+  return (
+    <div style={{ display: "grid", gap: 12 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <div style={{ position: "relative", flex: "1 1 280px" }}>
+          <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", display: "flex", pointerEvents: "none" }}>
+            <Icon path={ICONS.search} size={14} color={dim} />
+          </span>
+          <input className="inp" type="search" value={query} onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Escape") setQuery(""); }}
+            placeholder={placeholder} aria-label="Filter panels" style={{ paddingLeft: 32 }} />
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className="btn-ghost" onClick={() => setAll(true)} style={{ padding: "8px 12px", fontSize: 12 }}>Expand all</button>
+          <button className="btn-ghost" onClick={() => setAll(false)} style={{ padding: "8px 12px", fontSize: 12 }}>Collapse all</button>
+          {toolbar}
+        </div>
+      </div>
+      {searching && visibleCount === 0 && (
+        <div style={{ fontSize: 12.5, color: dim, padding: "4px 2px" }}>No panels match “{query.trim()}”.</div>
+      )}
+      {shown.map((p) => {
+        const open = isOpen(p);
+        return (
+          <div key={p.id} className="card" style={{ display: matches(p) ? "block" : "none" }}>
+            <button className="panel-head" onClick={() => toggle(p)} aria-expanded={open}>
+              <span style={{ display: "flex", transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}>
+                <Icon path={ICONS.chevronRight} size={14} color={dim} />
+              </span>
+              {p.icon && <Icon path={p.icon} size={16} color={p.iconColor || cyan} />}
+              <span style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15 }}>{p.title}</span>
+              {p.summary && <span className="panel-summary">{p.summary}</span>}
+            </button>
+            <div ref={(el) => { bodyRefs.current[p.id] = el; }} style={{ display: open ? "block" : "none", padding: "2px 22px 22px" }}>
+              {p.content}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Full-screen-ish overlay for the "advanced" stored-data views. Closes on
+// Escape or a click on the backdrop.
+function Modal({ title, onClose, children }) {
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onCloseRef.current(); };
+    window.addEventListener("keydown", onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prevOverflow; };
+  }, []);
+  return (
+    <div onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ position: "fixed", inset: 0, zIndex: 100, background: "rgba(0,0,0,0.55)", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: "clamp(8px, 4vh, 48px) clamp(8px, 3vw, 32px)", overflowY: "auto" }}>
+      <div role="dialog" aria-modal="true" aria-label={title} className="card"
+        style={{ width: "100%", maxWidth: 1100, padding: 22, boxShadow: "0 18px 48px rgba(0,0,0,0.5)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12 }}>
+          <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 16, display: "flex", alignItems: "center", gap: 8 }}>
+            <Icon path={ICONS.database} size={16} color={cyan} /> {title}
+          </div>
+          <button onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 }}>×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor, onFetch, fetching, fetchError, rangeDays, setRangeDays }) {
   const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
   const units = profile.units || "metric";
   const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
   const [heightText, onHeightChange] = useUnitInput(profile.heightCm, units, cmToDisplayLen, displayToCm, 1);
-  return (
-    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16 }}>Athlete profile</div>
+  const stravaSummary = !stravaStatus.checked ? "checking…" : stravaStatus.connected ? "connected" : "not connected";
+  const intervalsSummary = !intervalsStatus.checked ? "checking…" : intervalsStatus.configured ? "configured" : "not configured";
+  const panels = [
+    { id: "profile", title: "Athlete profile", icon: ICONS.user, defaultOpen: true,
+      keywords: "sex weight height age bmr mifflin",
+      summary: bmr ? `BMR ${fmt(bmr)} kcal` : null,
+      content: (<>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 14 }}>
           <Field label="Sex">
             <select className="inp" value={profile.sex} onChange={set("sex")}>
@@ -2266,12 +2395,38 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
             Mifflin-St Jeor BMR: <b>{fmt(bmr)} kcal/day</b>
           </div>
         )}
-      </div>
+      </>) },
 
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.flame} size={16} color={amber} /> Training calories — Strava
+    { id: "training-data", title: "Training data", icon: ICONS.refresh, defaultOpen: true,
+      keywords: "pull fetch days history range strava intervals sync",
+      summary: `${rangeDays} days`,
+      content: (<>
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+          How many days of history the dashboard covers, and how far back a manual pull reaches into Strava and
+          intervals.icu. Data is cached server-side by date, so a pull only re-fetches today plus any missing days.
         </div>
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 14, flexWrap: "wrap" }}>
+          <Field label="Days of training data to pull">
+            <select className="inp" style={{ width: 140 }} value={rangeDays} onChange={(e) => setRangeDays(parseInt(e.target.value))}>
+              <option value={14}>14 days</option>
+              <option value={21}>21 days</option>
+              <option value={30}>30 days</option>
+              <option value={60}>60 days</option>
+            </select>
+          </Field>
+          <button className="btn-primary" onClick={onFetch} disabled={fetching}>
+            <Icon path={ICONS.refresh} size={13} color={ink} />
+            {fetching ? "Fetching…" : "Pull training data"}
+          </button>
+        </div>
+        {lastFetched && <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>intervals last synced {new Date(lastFetched).toLocaleString()}</div>}
+        {fetchError && <Banner kind="error">{fetchError}</Banner>}
+      </>) },
+
+    { id: "strava", title: "Strava connection", icon: ICONS.flame, iconColor: amber,
+      keywords: "training calories oauth connect",
+      summary: stravaSummary,
+      content: (<>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
           Strava only exposes accurate per-activity <code>calories</code> through an authenticated,
           server-side call — this runs through <code>server.py</code> next to this page, which keeps your
@@ -2307,10 +2462,13 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
             <span>{stravaError}</span>
           </div>
         )}
-      </div>
+      </>) },
 
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>intervals.icu connection <span style={{ color: dim, fontWeight: 400 }}>(optional — wellness / TSB only)</span></div>
+    { id: "intervals", title: "intervals.icu connection", icon: ICONS.link,
+      keywords: "optional wellness tsb ctl atl api key",
+      summary: intervalsSummary,
+      content: (<>
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 8 }}>Optional — wellness / TSB only.</div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
           Used only for CTL/ATL/TSB (recovery buffer below) and as a calorie fallback on days Strava has no
           data. Fetched and cached server-side too, the same way as Strava — add <code>intervals_api_key</code>
@@ -2330,12 +2488,11 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
           <div style={{ fontSize: 12.5, color: dim }}>Not configured — add <code>intervals_api_key</code> to <code>config.json</code> and restart the server to enable this.</div>
         )}
         {lastFetched && <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>last synced {new Date(lastFetched).toLocaleString()} · {intervalsSyncedCount} day{intervalsSyncedCount === 1 ? "" : "s"} covered</div>}
-      </div>
+      </>) },
 
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.gauge} size={16} color={amber} /> Model tuning
-        </div>
+    { id: "tuning", title: "Model tuning", icon: ICONS.gauge, iconColor: amber,
+      keywords: "neat epoc protein carb preload fat floor debt fatigue buffer tsb sliders",
+      content: (<>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 20 }}>
           <Field label="Non-training activity (NEAT)">
             <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
@@ -2417,20 +2574,26 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
           <input type="checkbox" checked={profile.fatigueBuffer} onChange={(e) => setProfile((p) => ({ ...p, fatigueBuffer: e.target.checked }))} />
           Add a +5% BMR recovery buffer on days with a strongly negative training stress balance (TSB &lt; −10)
         </label>
-      </div>
+        <div style={{ display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start", marginTop: 18 }}>
+          <Icon path={ICONS.info} size={14} color={dim} />
+          <div>BMR uses the Mifflin-St Jeor equation. The training and recovery adjustments beyond that are heuristics commonly used in endurance-coaching practice, not a single peer-reviewed formula — tune the sliders above to match how your coach or experience calibrates it.</div>
+        </div>
+      </>) },
 
-      <GoalCard profile={profile} setProfile={setProfile} goalParams={goalParams} trendCorrection={trendCorrection}
-        weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus} imGoalFloor={imGoalFloor}
-        imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={onRecalibrate} />
+    { id: "goal", title: "Goal", icon: ICONS.trophy, iconColor: amber,
+      keywords: "maintain build lose rate target weight trend calibration window ironman",
+      summary: goalParams?.label || null,
+      content: (
+        <GoalCard profile={profile} setProfile={setProfile} goalParams={goalParams} trendCorrection={trendCorrection}
+          weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus} imGoalFloor={imGoalFloor}
+          imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={onRecalibrate} />
+      ) },
 
-      <UpdateCard />
-
-      <div style={{ display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start" }}>
-        <Icon path={ICONS.info} size={14} color={dim} />
-        <div>BMR uses the Mifflin-St Jeor equation. The training and recovery adjustments beyond that are heuristics commonly used in endurance-coaching practice, not a single peer-reviewed formula — tune the sliders above to match how your coach or experience calibrates it.</div>
-      </div>
-    </div>
-  );
+    { id: "update", title: "App update", icon: ICONS.download,
+      keywords: "update upgrade git pull docker rebuild version",
+      content: <UpdateCard /> },
+  ];
+  return <PanelList storageKey="setup" panels={panels} placeholder="Search setup (strava, protein, goal…)" />;
 }
 
 // "Update" button: asks the host to pull origin/main and re-run docker
@@ -2499,10 +2662,7 @@ function UpdateCard() {
   const stale = waitingOnHost && info?.pending && Date.now() - requestedAt > UPDATE_STALE_MS;
   const st = info?.status;
   return (
-    <div className="card" style={{ padding: 22 }}>
-      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-        <Icon path={ICONS.refresh} size={16} color={cyan} /> App update
-      </div>
+    <div>
       <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
         Pulls the latest <code>origin/main</code> and rebuilds/restarts the Docker container — only if main has
         moved since the last update. Runs on the host via the watcher <code>install.sh</code> sets up (or run
@@ -2557,10 +2717,7 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
   const [targetWeightText, onTargetWeightChange] = useUnitInput(profile.targetWeightKg, units, kgToDisplay, displayToKg, 1);
 
   return (
-    <div className="card" style={{ padding: 22 }}>
-      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-        <Icon path={ICONS.flame} size={16} color={amber} /> Goal
-      </div>
+    <div>
       <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.6 }}>
         Shifts your daily Target (shown alongside modeled TDEE on the dashboard) by a steady surplus or
         deficit for 2–3x/week lifting. Defaults: ~0.25%/week gain (a common lean-bulk ceiling for
@@ -2711,43 +2868,27 @@ function IronmanModeSettings({ profile, setProfile, imCal, imCalibrating, imCalE
   );
 }
 
-function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync, onFetch, fetching, fetchError, rangeDays, setRangeDays, lastFetched, importError, importNotice, units }) {
+function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync, importError, importNotice, units, stravaData, intervalsData, kcalOverrides }) {
   const [dragOver, setDragOver] = useState(false);
+  const [storedView, setStoredView] = useState(null); // null | "nutrition" | "training" | "weight"
   const dayCount = Object.keys(nutrition).length;
   const weightCount = Object.keys(weightLog).length;
-  return (
-    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
-      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-          <Field label="Days of history">
-            <select className="inp" style={{ width: 120 }} value={rangeDays} onChange={(e) => setRangeDays(parseInt(e.target.value))}>
-              <option value={14}>14 days</option>
-              <option value={21}>21 days</option>
-              <option value={30}>30 days</option>
-              <option value={60}>60 days</option>
-            </select>
-          </Field>
-          <button className="btn-primary" style={{ marginTop: 18 }} onClick={onFetch} disabled={fetching}>
-            <Icon path={ICONS.refresh} size={13} color={ink} />
-            {fetching ? "Fetching…" : "Pull training data"}
-          </button>
-          {lastFetched && <div style={{ marginTop: 18, fontSize: 11.5, color: dim, fontFamily: mono }}>intervals last synced {new Date(lastFetched).toLocaleString()}</div>}
-        </div>
-        {fetchError && (
-          <div style={{ marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 }}>
-            <Icon path={ICONS.warn} size={15} color={coral} />
-            <span>{fetchError}</span>
-          </div>
-        )}
-      </div>
-
-      <ManualEntryCard nutrition={nutrition} onSave={onSaveManualDay} />
-      <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} units={units} />
-
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.upload} size={16} color={cyan} /> MacrosFirst API
-        </div>
+  const trainingCount = stravaData.activities.length + intervalsData.activities.length;
+  const mfSummary = !macrosfirstStatus.checked ? "checking…"
+    : macrosfirstStatus.unreachable ? "server unreachable"
+    : macrosfirstStatus.configError ? "not configured" : "connected";
+  const panels = [
+    { id: "manual-nutrition", title: "Enter a day's macros", icon: ICONS.plus, defaultOpen: true,
+      keywords: "nutrition protein carbs fat calories manual intake food",
+      content: <ManualEntryCard nutrition={nutrition} onSave={onSaveManualDay} /> },
+    { id: "weight", title: "Log weight", icon: ICONS.plus, defaultOpen: true,
+      keywords: "weigh-in body weight scale",
+      summary: weightCount ? `${weightCount} day${weightCount === 1 ? "" : "s"} logged` : null,
+      content: <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} units={units} /> },
+    { id: "macrosfirst", title: "MacrosFirst API", icon: ICONS.upload,
+      keywords: "sync nutrition import automatic",
+      summary: mfSummary,
+      content: (<>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
           Pulls your daily log directly from MacrosFirst's personal API, through
           <code> server.py</code>. See <code>config.example.json</code> for setup.
@@ -2776,10 +2917,11 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
           </div>
         )}
         {macrosfirstError && <Banner kind="error">{macrosfirstError}</Banner>}
-      </div>
-
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Or import a CSV manually</div>
+      </>) },
+    { id: "csv", title: "Import a CSV", icon: ICONS.upload,
+      keywords: "csv spreadsheet excel file upload map columns",
+      summary: csvPreview ? `${csvPreview.rows.length} rows to map` : null,
+      content: (<>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
           MacrosFirst Premium → Download Food Log (Excel), or export any spreadsheet as CSV. Drop the file here and map its columns below.
         </div>
@@ -2801,46 +2943,159 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
         </div>
         {importError && <Banner kind="error">{importError}</Banner>}
         {!importError && importNotice && <Banner kind="success">{importNotice}</Banner>}
-      </div>
-
-      {csvPreview && (
-        <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Map columns</div>
-          <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>{csvPreview.rows.length} rows found. Match the columns to the fields below.</div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 12 }}>
-            {["date", "calories", "protein", "carbs", "fat"].map((k) => (
-              <Field key={k} label={k}>
-                <select className="inp" value={colMap[k]} onChange={(e) => setColMap((m) => ({ ...m, [k]: e.target.value }))}>
-                  <option value="">— none —</option>
-                  {csvPreview.fields.map((f) => <option key={f} value={f}>{f}</option>)}
-                </select>
-              </Field>
+        {csvPreview && (
+          <div>
+            <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 4, marginTop: 20, paddingTop: 16, borderTop: `1px solid ${line}` }}>Map columns</div>
+            <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>{csvPreview.rows.length} rows found. Match the columns to the fields below.</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 12 }}>
+              {["date", "calories", "protein", "carbs", "fat"].map((k) => (
+                <Field key={k} label={k}>
+                  <select className="inp" value={colMap[k]} onChange={(e) => setColMap((m) => ({ ...m, [k]: e.target.value }))}>
+                    <option value="">— none —</option>
+                    {csvPreview.fields.map((f) => <option key={f} value={f}>{f}</option>)}
+                  </select>
+                </Field>
+              ))}
+            </div>
+            <button className="btn-primary" style={{ marginTop: 18 }} onClick={() => onImport()}>Import {csvPreview.rows.length} rows</button>
+          </div>
+        )}
+      </>) },
+  ];
+  const storedButton = (
+    <button className="btn-ghost" onClick={() => setStoredView("nutrition")} style={{ padding: "8px 12px", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}
+      title="Browse and edit everything stored on the server">
+      <Icon path={ICONS.database} size={13} color={cyan} /> Stored data…
+    </button>
+  );
+  return (
+    <>
+      <PanelList storageKey="log" panels={panels} placeholder="Search log (weight, csv, macros…)" toolbar={storedButton} />
+      {storedView && (
+        <Modal title="Stored data" onClose={() => setStoredView(null)}>
+          <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
+            {[
+              ["nutrition", `Nutrition (${dayCount})`],
+              ["training", `Training (${trainingCount})`],
+              ["weight", `Weight (${weightCount})`],
+            ].map(([id, label]) => (
+              <button key={id} className={`subtab ${storedView === id ? "active" : ""}`} onClick={() => setStoredView(id)}>{label}</button>
             ))}
           </div>
-          <button className="btn-primary" style={{ marginTop: 18 }} onClick={() => onImport()}>Import {csvPreview.rows.length} rows</button>
+          {storedView === "nutrition" && (
+            <>
+              <div style={{ fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 }}>{dayCount} day{dayCount === 1 ? "" : "s"} of intake saved. Click the pencil to edit a day.</div>
+              {dayCount > 0 && (
+                <div style={{ overflowX: "auto" }}>
+                  <NutritionLogTable nutrition={nutrition} onSave={onSaveManualDay} onDelete={onDeleteDay} />
+                </div>
+              )}
+            </>
+          )}
+          {storedView === "training" && (
+            <TrainingLogView stravaData={stravaData} intervalsData={intervalsData} kcalOverrides={kcalOverrides} />
+          )}
+          {storedView === "weight" && (
+            <>
+              <div style={{ fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 }}>{weightCount} day{weightCount === 1 ? "" : "s"} of weight saved. Click the pencil to edit a day.</div>
+              {weightCount > 0 && (
+                <div style={{ overflowX: "auto" }}>
+                  <WeightLogTable weightLog={weightLog} onSave={onSaveWeight} onDelete={onDeleteWeight} units={units} />
+                </div>
+              )}
+            </>
+          )}
+        </Modal>
+      )}
+    </>
+  );
+}
+
+// Read-only view of every cached training activity (Strava + intervals.icu),
+// newest first. Mirrors dailyRows' per-day source priority: on a date Strava
+// has activities for, intervals.icu's copies aren't used, so they're shown
+// dimmed as "superseded" rather than hidden.
+function TrainingLogView({ stravaData, intervalsData, kcalOverrides }) {
+  const [filter, setFilter] = useState("");
+  const rows = useMemo(() => {
+    const stravaDates = new Set();
+    const out = [];
+    for (const a of stravaData.activities) {
+      const date = (a.start_date_local || "").slice(0, 10);
+      if (!date) continue;
+      stravaDates.add(date);
+      const ov = kcalOverrides && kcalOverrides[`strava-${a.id}`];
+      out.push({ key: `strava-${a.id}`, date, provider: "strava", name: a.name || a.type || "Activity", type: a.type || "",
+        durationMin: Math.round((a.moving_time || 0) / 60), kcal: stravaActivityKcal(a),
+        override: typeof ov === "number" && ov >= 0 ? ov : null, IF: stravaIntensityFactor(a) });
+    }
+    for (const a of intervalsData.activities) {
+      const date = (a.start_date_local || a.start_date || "").slice(0, 10);
+      if (!date) continue;
+      out.push({ key: `intervals-${a.id}`, date, provider: "intervals", name: a.name || a.type || "Activity", type: a.type || "",
+        durationMin: Math.round((a.moving_time || 0) / 60), kcal: activityKcal(a), override: null, IF: intensityFactor(a) });
+    }
+    for (const r of out) r.superseded = r.provider === "intervals" && stravaDates.has(r.date);
+    out.sort((x, y) => (x.date === y.date ? y.provider.localeCompare(x.provider) : x.date < y.date ? 1 : -1)); // Strava first within a day
+    return out;
+  }, [stravaData, intervalsData, kcalOverrides]);
+  const terms = filter.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = terms.length
+    ? rows.filter((r) => { const hay = `${r.date} ${r.provider} ${r.name} ${r.type}`.toLowerCase(); return terms.every((t) => hay.includes(t)); })
+    : rows;
+  const syncedDays = new Set([...stravaData.syncedDates, ...intervalsData.syncedDates]).size;
+  return (
+    <>
+      <div style={{ fontSize: 12.5, color: dim, marginBottom: 12, lineHeight: 1.5 }}>
+        {rows.length} cached activit{rows.length === 1 ? "y" : "ies"} across {syncedDays} synced day{syncedDays === 1 ? "" : "s"}.
+        Read-only — this is what the server has cached from Strava and intervals.icu. On days Strava has data, intervals.icu
+        copies are ignored by the model (shown dimmed). Change how many days get pulled in Setup → Training data.
+      </div>
+      {rows.length > 0 && (
+        <input className="inp" type="search" value={filter} onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter by date, name or type…" style={{ marginBottom: 12, maxWidth: 320 }} />
+      )}
+      {shown.length > 0 && (
+        <div style={{ overflowX: "auto" }}>
+          <table className="data">
+            <thead>
+              <tr><th>Date</th><th style={{ textAlign: "left" }}>Activity</th><th style={{ textAlign: "left" }}>Type</th><th>Duration</th><th>kcal</th><th>IF</th></tr>
+            </thead>
+            <tbody>
+              {shown.map((r) => (
+                <tr key={r.key} style={r.superseded ? { opacity: 0.45 } : undefined} title={r.superseded ? "Superseded by Strava data for this day" : undefined}>
+                  <td style={{ whiteSpace: "nowrap" }}>{r.date}<ProviderBadge provider={r.provider} /></td>
+                  <td style={{ textAlign: "left" }}>{r.name}</td>
+                  <td style={{ textAlign: "left", color: dim }}>{r.type}</td>
+                  <td>{r.durationMin ? `${Math.floor(r.durationMin / 60)}:${String(r.durationMin % 60).padStart(2, "0")}` : "—"}</td>
+                  <td style={{ color: amber }}>
+                    {r.override !== null
+                      ? <span title={`Overridden — device reported ${fmt(r.kcal)} kcal (used in IronMan mode)`}>{fmt(r.override)}*</span>
+                      : r.kcal ? fmt(r.kcal) : "—"}
+                  </td>
+                  <td style={{ color: dim }}>{fmt(r.IF, 2)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
+      {rows.length > 0 && shown.length === 0 && <div style={{ fontSize: 12.5, color: dim }}>No activities match “{filter.trim()}”.</div>}
+    </>
+  );
+}
 
-      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored nutrition log</div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 }}>{dayCount} day{dayCount === 1 ? "" : "s"} of intake saved. Click a row to edit it.</div>
-        {dayCount > 0 && (
-          <div style={{ overflowX: "auto" }}>
-            <NutritionLogTable nutrition={nutrition} onSave={onSaveManualDay} onDelete={onDeleteDay} />
-          </div>
-        )}
-      </div>
-
-      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored weight log</div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 }}>{weightCount} day{weightCount === 1 ? "" : "s"} of weight saved. Click a row to edit it.</div>
-        {weightCount > 0 && (
-          <div style={{ overflowX: "auto" }}>
-            <WeightLogTable weightLog={weightLog} onSave={onSaveWeight} onDelete={onDeleteWeight} units={units} />
-          </div>
-        )}
-      </div>
-    </div>
+function ProviderBadge({ provider }) {
+  const isStrava = provider === "strava";
+  return (
+    <span style={{
+      fontSize: 10, fontWeight: 700, letterSpacing: "0.04em", textTransform: "uppercase",
+      padding: "2px 6px", borderRadius: 3, marginLeft: 8,
+      background: isStrava ? "rgba(232,163,61,0.15)" : "rgba(79,209,217,0.12)",
+      color: isStrava ? amber : cyan,
+    }}>
+      {isStrava ? "Strava" : "intervals"}
+    </span>
   );
 }
 
@@ -2906,10 +3161,7 @@ function ManualEntryCard({ nutrition, onSave }) {
   }
 
   return (
-    <div className="card" style={{ padding: 22 }}>
-      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-        <Icon path={ICONS.plus} size={16} color={cyan} /> Enter a day's macros directly
-      </div>
+    <div>
       <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
         Skip the CSV for a single day — type in totals from MacrosFirst (or anywhere) and calories are
         computed automatically (4 kcal/g protein & carbs, 9 kcal/g fat). Pick a date that's already logged
@@ -3111,10 +3363,7 @@ function WeightEntryCard({ weightLog, onSave, units }) {
   }
 
   return (
-    <div className="card" style={{ padding: 22 }}>
-      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-        <Icon path={ICONS.plus} size={16} color={cyan} /> Log today's weight
-      </div>
+    <div>
       <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
         Feeds directly into BMR and fueling targets for that day — body weight shifts across a training
         block, so this keeps demand and g/kg targets tracking you rather than a fixed Setup value.

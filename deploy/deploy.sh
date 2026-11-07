@@ -128,11 +128,22 @@ startup_log() {
 # why. Sets HTTPS_URL on success.
 HTTPS_URL=""
 report_https() {
-  local since="${1:-}" logs="" i
-  for i in $(seq 1 30); do
+  local since="${1:-}" logs="" i waited=0
+  # Done = HTTPS up, a definite failure, or startup finished without TLS.
+  # The server gets its cert in the background, and a machine's first one
+  # can take minutes, so allow up to ~6 minutes.
+  local done_re='HTTPS \(real, trusted cert\)|Could not obtain a TLS|HTTPS listener failed|no tls_hostname is set'
+  for i in $(seq 1 180); do
     logs="$(startup_log "$since")"
-    printf '%s' "$logs" | grep -qE 'Login required|Generated login' && break
     [ -z "$since" ] && break
+    if printf '%s' "$logs" | grep -qE 'Login required|Generated login'; then
+      printf '%s' "$logs" | grep -qE "$done_re" && break
+      printf '%s' "$logs" | grep -q 'Setting up HTTPS' || break
+      if [ "$waited" -eq 0 ]; then
+        log "Waiting for $HOST's HTTPS certificate (a machine's first one can take a few minutes)…"
+        waited=1
+      fi
+    fi
     sleep 2
   done
   if [ -z "$logs" ]; then
@@ -150,19 +161,29 @@ report_https() {
     warn "    deploy/deploy.sh --config-set tls_enabled=true $HOST"
     return
   fi
-  warn "HTTPS failed to start on $HOST, so it's plain HTTP only. The server said:"
-  printf '%s\n' "$logs" | { grep -E 'tailscale|tls_hostname|HTTPS|TLS|certificate' || true; } | sed 's/^/      /' >&2
+  if ! printf '%s' "$logs" | grep -qE "$done_re"; then
+    warn "HTTPS isn't up on $HOST yet — still waiting for its certificate (HTTP works meanwhile)."
+    warn "  Check again in a few minutes with: deploy/deploy.sh --status $HOST"
+    return
+  fi
+  warn "HTTPS failed to start on $HOST, so it's plain HTTP only (the server retries every 5 minutes). It said:"
+  printf '%s\n' "$logs" | { grep -E 'tailscale|tls_hostname|HTTPS|TLS|certificate|Retrying' || true; } | sed 's/^/      /' >&2
   if ! rsh 'test -S /var/run/tailscale/tailscaled.sock'; then
     warn "  $HOST has no Tailscale daemon socket at /var/run/tailscale/tailscaled.sock."
     warn "  Install Tailscale there (https://tailscale.com/download/linux), run 'sudo tailscale up',"
     warn "  then: deploy/deploy.sh --config-set tls_enabled=true $HOST   (restarts the app)"
   fi
   local pinned
-  pinned="$(printf '%s' "$logs" | sed -n 's/.*Setting up HTTPS for \(.*\) ….*/\1/p' | tail -1)"
+  pinned="$(printf '%s' "$logs" | sed -n 's/.*Setting up HTTPS for \(.*\) (from tls_hostname in config.json).*/\1/p' | tail -1)"
   if [ -n "$pinned" ]; then
-    warn "  It asked for a cert for '$pinned'. Tailscale only issues a cert for the machine's own name,"
-    warn "  so if that's another machine's name, let it auto-detect with:"
+    warn "  config.json pins tls_hostname='$pinned'. Tailscale only issues a cert for the machine's own"
+    warn "  name, so if that's another machine's, let it auto-detect with:"
     warn "    deploy/deploy.sh --config-set tls_hostname= $HOST"
+  else
+    local name
+    name="$(printf '%s' "$logs" | sed -n 's/.*Setting up HTTPS for \(.*\) (auto-detected).*/\1/p' | tail -1)"
+    warn "  To see what Tailscale itself says, run this ON $HOST (it can take a minute or two):"
+    warn "    sudo tailscale cert --cert-file /tmp/eb.crt --key-file /tmp/eb.key ${name:-<its-name>.ts.net}"
   fi
 }
 

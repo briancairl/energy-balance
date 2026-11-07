@@ -362,7 +362,10 @@ looking for the longest valid-JSON prefix) — keep it around.
   `tailscale status --json` if blank) / `tls_port` (default `port + 1`). Runs as a **second**
   listener alongside the plain-HTTP one (doesn't replace it — this is what keeps local OAuth
   working). Cert obtained via `tailscale cert` on startup, renewed daily in a background
-  thread, reloaded into the running `SSLContext` in place (no restart needed). Requires
+  thread, reloaded into the running `SSLContext` in place (no restart needed). Setup runs in a
+  background thread (`https_setup_loop`) so HTTP serves immediately; `tailscale cert` gets a
+  generous timeout (`TLS_CERT_TIMEOUT`, a node's first cert can take minutes) and failures are
+  retried every `TLS_RETRY_SECONDS`. Requires
   MagicDNS + "Enable HTTPS" turned on once in the Tailscale admin console.
 
 ## `configs/config.json` field reference

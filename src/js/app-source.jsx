@@ -1324,10 +1324,10 @@ function App() {
 
   // Landing tab: once the store has loaded and every connection check has
   // answered, open the Dashboard if the app is fully configured (athlete
-  // profile complete + Strava, intervals.icu and MacrosFirst all connected),
-  // otherwise Setup. Decided once; never overrides a tab the user already picked.
-  const fullyConfigured = !!bmr && stravaStatus.connected === true && intervalsStatus.configured === true
-    && macrosfirstStatus.connected === true;
+  // profile complete + Strava and MacrosFirst connected; intervals.icu is
+  // optional for now), otherwise Setup. Decided once; never overrides a tab
+  // the user already picked.
+  const fullyConfigured = !!bmr && stravaStatus.connected === true && macrosfirstStatus.connected === true;
   useEffect(() => {
     if (tab !== null) return;
     if (!loaded || !stravaStatus.checked || !intervalsStatus.checked || !macrosfirstStatus.checked) return;

@@ -999,7 +999,7 @@
       () => calcBMR(profile.sex, parseFloat(profile.weightKg), parseFloat(profile.heightCm), parseFloat(profile.age)),
       [profile.sex, profile.weightKg, profile.heightCm, profile.age]
     );
-    const fullyConfigured = !!bmr && stravaStatus.connected === true && intervalsStatus.configured === true && macrosfirstStatus.connected === true;
+    const fullyConfigured = !!bmr && stravaStatus.connected === true && macrosfirstStatus.connected === true;
     useEffect(() => {
       if (tab !== null) return;
       if (!loaded || !stravaStatus.checked || !intervalsStatus.checked || !macrosfirstStatus.checked) return;

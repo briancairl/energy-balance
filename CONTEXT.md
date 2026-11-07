@@ -116,7 +116,8 @@ src/js/app.js` confirms the compiled output is valid JS.
 ## UI layout (Setup / Log)
 
 **Landing tab:** the app opens on the Dashboard when it's fully configured (athlete profile complete, i.e.
-BMR computable, and Strava connected + intervals.icu configured + MacrosFirst configured), otherwise on Setup.
+BMR computable, and Strava connected + MacrosFirst configured; intervals.icu is optional for now), otherwise
+on Setup.
 `tab` starts as `null` ("Loading…") until the store and all three status checks have answered (8 s fallback
 to Setup); it's decided once and never overrides a tab the user already opened.
 

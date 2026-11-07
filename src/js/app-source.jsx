@@ -1107,7 +1107,9 @@ function Banner({ kind = "info", children }) {
 }
 
 function App() {
-  const [tab, setTab] = useState("setup");
+  // null until the startup checks below decide the landing tab: Dashboard
+  // when everything is set up, Setup otherwise.
+  const [tab, setTab] = useState(null);
   const [theme, setTheme] = useState(() => (document.documentElement.dataset.theme === "light" ? "light" : "dark"));
   const toggleTheme = useCallback(() => {
     setTheme((prev) => {
@@ -1319,6 +1321,23 @@ function App() {
     () => calcBMR(profile.sex, parseFloat(profile.weightKg), parseFloat(profile.heightCm), parseFloat(profile.age)),
     [profile.sex, profile.weightKg, profile.heightCm, profile.age]
   );
+
+  // Landing tab: once the store has loaded and every connection check has
+  // answered, open the Dashboard if the app is fully configured (athlete
+  // profile complete + Strava, intervals.icu and MacrosFirst all connected),
+  // otherwise Setup. Decided once; never overrides a tab the user already picked.
+  const fullyConfigured = !!bmr && stravaStatus.connected === true && intervalsStatus.configured === true
+    && macrosfirstStatus.connected === true;
+  useEffect(() => {
+    if (tab !== null) return;
+    if (!loaded || !stravaStatus.checked || !intervalsStatus.checked || !macrosfirstStatus.checked) return;
+    setTab(fullyConfigured ? "dashboard" : "setup");
+  }, [tab, loaded, stravaStatus.checked, intervalsStatus.checked, macrosfirstStatus.checked, fullyConfigured]);
+  // Safety net: if a status check never answers, don't sit on "Loading…".
+  useEffect(() => {
+    const t = setTimeout(() => setTab((cur) => cur ?? "setup"), 8000);
+    return () => clearTimeout(t);
+  }, []);
 
   const goalParams = useMemo(() => getGoalParams(profile), [profile.goal, profile.buildRatePct, profile.loseRatePct]);
   const targetWindowDays = getTargetWindowDays(profile);
@@ -1594,6 +1613,22 @@ function App() {
     // network calls happen for days already cached, on either end.
     await Promise.all([fetchIntervals(), fetchStrava()]);
     setTab("dashboard");
+  }
+
+  // Dashboard "Sync now": refreshes the training caches (Strava +
+  // intervals.icu, full rangeDays window) and the MacrosFirst nutrition log
+  // at the same time. Each source is skipped if it isn't connected, and each
+  // reports its own error (fetchError / stravaError / macrosfirstError).
+  const [syncAllRunning, setSyncAllRunning] = useState(false);
+  const [syncAllFinishedAt, setSyncAllFinishedAt] = useState(null);
+  async function syncAll() {
+    setSyncAllRunning(true);
+    try {
+      await Promise.all([fetchIntervals(), fetchStrava(), syncMacrosFirst()]);
+    } finally {
+      setSyncAllRunning(false);
+      setSyncAllFinishedAt(new Date().toISOString());
+    }
   }
 
   // Personalized kcal/min rates learned from this athlete's own matched
@@ -2214,6 +2249,19 @@ function App() {
             matchOverrides={matchOverrides}
             onSetMatchOverride={setScheduleMatchOverride} profile={profile} setProfile={setProfile}
             weightLog={weightLog} matchedKcalRates={matchedKcalRates} />
+        )}
+        {tab === null && (
+          <div style={{ fontSize: 12.5, color: dim, padding: "40px 0", textAlign: "center" }}>Loading…</div>
+        )}
+        {tab === "dashboard" && (
+          <DashboardSyncBar onSync={syncAll} running={syncAllRunning || fetching || stravaFetching || macrosfirstFetching}
+            finishedAt={syncAllFinishedAt}
+            sources={[
+              { name: "Strava", connected: !!stravaStatus.connected, lastSynced: stravaLastFetched, error: stravaError },
+              { name: "intervals.icu", connected: !!intervalsStatus.configured, lastSynced: lastFetched, error: fetchError },
+              { name: "MacrosFirst", connected: !!macrosfirstStatus.connected, lastSynced: macrosfirstLastAutoSync, error: macrosfirstError },
+            ]}
+            onOpenSetup={() => setTab("setup")} />
         )}
         {tab === "dashboard" && (
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
@@ -4417,6 +4465,45 @@ function ScheduleEntryList({ entries, empty, onEdit, onDelete }) {
           <button title="Delete" onClick={() => onDelete(s)} style={iconBtn}><Icon path={ICONS.trash} size={13} color={coral} /></button>
         </div>
       ))}
+    </div>
+  );
+}
+
+// Dashboard header strip: one "Sync now" for every connected source, with
+// each source's last-sync time and any error from the latest attempt.
+function DashboardSyncBar({ onSync, running, finishedAt, sources, onOpenSetup }) {
+  const connected = sources.filter((s) => s.connected);
+  const missing = sources.filter((s) => !s.connected);
+  const errors = connected.filter((s) => s.error);
+  const fmtTime = (t) => (t ? new Date(t).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "never");
+  return (
+    <div className="card" style={{ padding: "12px 16px", marginBottom: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+        <button className="btn-primary" onClick={onSync} disabled={running || connected.length === 0}
+          title={connected.length ? `Refresh ${connected.map((s) => s.name).join(", ")}` : "Nothing is connected yet"}>
+          <Icon path={ICONS.refresh} size={13} color={ink} /> {running ? "Syncing…" : "Sync now"}
+        </button>
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 11.5, fontFamily: mono, color: dim }}>
+          {connected.map((s) => (
+            <span key={s.name} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <Icon path={s.error ? ICONS.warn : ICONS.check} size={11} color={s.error ? coral : mint} />
+              {s.name} · {fmtTime(s.lastSynced)}
+            </span>
+          ))}
+        </div>
+        {!running && finishedAt && errors.length === 0 && connected.length > 0 && (
+          <span style={{ fontSize: 12, color: mint, display: "flex", alignItems: "center", gap: 5 }}>
+            <Icon path={ICONS.check} size={12} color={mint} /> Synced
+          </span>
+        )}
+        {missing.length > 0 && (
+          <span style={{ fontSize: 11.5, color: dim, marginLeft: "auto" }}>
+            Not connected: {missing.map((s) => s.name).join(", ")} ·{" "}
+            <button onClick={onOpenSetup} style={{ background: "none", border: "none", padding: 0, color: cyan, cursor: "pointer", fontSize: 11.5 }}>Setup</button>
+          </span>
+        )}
+      </div>
+      {errors.map((s) => <Banner key={s.name} kind="error">{s.name}: {s.error}</Banner>)}
     </div>
   );
 }

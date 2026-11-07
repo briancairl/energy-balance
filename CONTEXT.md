@@ -115,6 +115,16 @@ src/js/app.js` confirms the compiled output is valid JS.
 
 ## UI layout (Setup / Log)
 
+**Landing tab:** the app opens on the Dashboard when it's fully configured (athlete profile complete, i.e.
+BMR computable, and Strava connected + intervals.icu configured + MacrosFirst configured), otherwise on Setup.
+`tab` starts as `null` ("Loading…") until the store and all three status checks have answered (8 s fallback
+to Setup); it's decided once and never overrides a tab the user already opened.
+
+**Dashboard "Sync now"** (`DashboardSyncBar`, rendered by `App` above `DashboardTab` so it shows even when the
+dashboard is empty): `syncAll()` runs `fetchIntervals()`, `fetchStrava()` and `syncMacrosFirst()` concurrently
+(full `rangeDays` window for training). Each source is skipped when not connected and reports its own error;
+the bar shows each connected source's last-sync time, and lists unconnected ones with a link to Setup.
+
 Setup and Log are each a vertical list of collapsible panels (`PanelList` in `app-source.jsx`) with a
 text filter on top that matches panel titles, per-panel `keywords`, and the panel body's full text
 (bodies stay mounted while collapsed, so drafts survive and search can see them). Open/closed state is a

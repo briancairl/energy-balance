@@ -814,7 +814,7 @@
     return /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: s.bg, border: `1px solid ${s.color}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement(Icon, { path: iconPath, size: 14, color: s.color }), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }, children));
   }
   function App() {
-    const [tab, setTab] = useState("setup");
+    const [tab, setTab] = useState(null);
     const [theme, setTheme] = useState(() => document.documentElement.dataset.theme === "light" ? "light" : "dark");
     const toggleTheme = useCallback(() => {
       setTheme((prev) => {
@@ -999,6 +999,16 @@
       () => calcBMR(profile.sex, parseFloat(profile.weightKg), parseFloat(profile.heightCm), parseFloat(profile.age)),
       [profile.sex, profile.weightKg, profile.heightCm, profile.age]
     );
+    const fullyConfigured = !!bmr && stravaStatus.connected === true && intervalsStatus.configured === true && macrosfirstStatus.connected === true;
+    useEffect(() => {
+      if (tab !== null) return;
+      if (!loaded || !stravaStatus.checked || !intervalsStatus.checked || !macrosfirstStatus.checked) return;
+      setTab(fullyConfigured ? "dashboard" : "setup");
+    }, [tab, loaded, stravaStatus.checked, intervalsStatus.checked, macrosfirstStatus.checked, fullyConfigured]);
+    useEffect(() => {
+      const t = setTimeout(() => setTab((cur) => cur != null ? cur : "setup"), 8e3);
+      return () => clearTimeout(t);
+    }, []);
     const goalParams = useMemo(() => getGoalParams(profile), [profile.goal, profile.buildRatePct, profile.loseRatePct]);
     const targetWindowDays = getTargetWindowDays(profile);
     const trendCorrection = useMemo(
@@ -1227,6 +1237,17 @@
     async function pullAll() {
       await Promise.all([fetchIntervals(), fetchStrava()]);
       setTab("dashboard");
+    }
+    const [syncAllRunning, setSyncAllRunning] = useState(false);
+    const [syncAllFinishedAt, setSyncAllFinishedAt] = useState(null);
+    async function syncAll() {
+      setSyncAllRunning(true);
+      try {
+        await Promise.all([fetchIntervals(), fetchStrava(), syncMacrosFirst()]);
+      } finally {
+        setSyncAllRunning(false);
+        setSyncAllFinishedAt((/* @__PURE__ */ new Date()).toISOString());
+      }
     }
     const matchedKcalRates = useMemo(
       () => buildMatchedKcalRates(schedule, stravaData, intervalsData, matchOverrides),
@@ -1697,6 +1718,19 @@
         setProfile,
         weightLog,
         matchedKcalRates
+      }
+    ), tab === null && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, padding: "40px 0", textAlign: "center" } }, "Loading\u2026"), tab === "dashboard" && /* @__PURE__ */ React.createElement(
+      DashboardSyncBar,
+      {
+        onSync: syncAll,
+        running: syncAllRunning || fetching || stravaFetching || macrosfirstFetching,
+        finishedAt: syncAllFinishedAt,
+        sources: [
+          { name: "Strava", connected: !!stravaStatus.connected, lastSynced: stravaLastFetched, error: stravaError },
+          { name: "intervals.icu", connected: !!intervalsStatus.configured, lastSynced: lastFetched, error: fetchError },
+          { name: "MacrosFirst", connected: !!macrosfirstStatus.connected, lastSynced: macrosfirstLastAutoSync, error: macrosfirstError }
+        ],
+        onOpenSetup: () => setTab("setup")
       }
     ), tab === "dashboard" && /* @__PURE__ */ React.createElement(
       DashboardTab,
@@ -3368,6 +3402,24 @@
     if (!entries.length) return /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, empty);
     const iconBtn = { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim };
     return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8 } }, entries.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, style: scheduleRowStyle(false) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, s.kind === "race" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("b", null, s.notes || s.activityType), " \xB7 ", s.activityType, " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min"), /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.kind === "race" ? /* @__PURE__ */ React.createElement(React.Fragment, null, s.raceDate, " \xB7 ", s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper", " \xB7 ", raceCarbLoadDays(s) > 0 ? `carb-load ${raceCarbLoadDays(s)}d` : "no carb-load") : s.kind === "single" ? /* @__PURE__ */ React.createElement(React.Fragment, null, s.date, s.notes ? ` \xB7 ${s.notes}` : "") : /* @__PURE__ */ React.createElement(React.Fragment, null, s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", "), " \xB7 from ", s.startDate, s.endDate ? ` to ${s.endDate}` : " (ongoing)", s.notes ? ` \xB7 ${s.notes}` : "", s.skipDates && s.skipDates.length ? ` \xB7 ${s.skipDates.length} day${s.skipDates.length === 1 ? "" : "s"} skipped` : ""), s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`, s.source && ` \xB7 from ${s.source}`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => onEdit(s), style: iconBtn }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => onDelete(s), style: iconBtn }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))));
+  }
+  function DashboardSyncBar({ onSync, running, finishedAt, sources, onOpenSetup }) {
+    const connected = sources.filter((s) => s.connected);
+    const missing = sources.filter((s) => !s.connected);
+    const errors = connected.filter((s) => s.error);
+    const fmtTime = (t) => t ? new Date(t).toLocaleString(void 0, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "never";
+    return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "12px 16px", marginBottom: 20 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        className: "btn-primary",
+        onClick: onSync,
+        disabled: running || connected.length === 0,
+        title: connected.length ? `Refresh ${connected.map((s) => s.name).join(", ")}` : "Nothing is connected yet"
+      },
+      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }),
+      " ",
+      running ? "Syncing\u2026" : "Sync now"
+    ), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 14, flexWrap: "wrap", fontSize: 11.5, fontFamily: mono, color: dim } }, connected.map((s) => /* @__PURE__ */ React.createElement("span", { key: s.name, style: { display: "flex", alignItems: "center", gap: 5 } }, /* @__PURE__ */ React.createElement(Icon, { path: s.error ? ICONS.warn : ICONS.check, size: 11, color: s.error ? coral : mint }), s.name, " \xB7 ", fmtTime(s.lastSynced)))), !running && finishedAt && errors.length === 0 && connected.length > 0 && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 12, color: mint, display: "flex", alignItems: "center", gap: 5 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 12, color: mint }), " Synced"), missing.length > 0 && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11.5, color: dim, marginLeft: "auto" } }, "Not connected: ", missing.map((s) => s.name).join(", "), " \xB7", " ", /* @__PURE__ */ React.createElement("button", { onClick: onOpenSetup, style: { background: "none", border: "none", padding: 0, color: cyan, cursor: "pointer", fontSize: 11.5 } }, "Setup"))), errors.map((s) => /* @__PURE__ */ React.createElement(Banner, { key: s.name, kind: "error" }, s.name, ": ", s.error)));
   }
   function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units, targetWindowDays, ironmanStatus, imProjection, imProjectionError, imMissingCalibration }) {
     var _a;

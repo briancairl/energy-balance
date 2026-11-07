@@ -2141,11 +2141,9 @@ function App() {
         @media (hover: none) { .cal-add, .chip-del { opacity: 1; } }
         @media (max-width: 700px) { .chip-del { display: none; } }
         .modal-body table.data thead th { position: sticky; top: 0; background: ${panel}; z-index: 1; }
-        .cal-week .cal-pair { flex: 0 1 420px; min-width: 0; }
-        .cal-week .cal-chips > .cal-chip-wrap { flex: 0 1 220px; }
         .cal-week .cal-chip-text { display: inline !important; }
         .cal-week .cal-chip-emoji { display: none !important; }
-        @media (max-width: 700px) { .cal-week .chip-del { display: flex; } .cal-week .cal-pair { flex-basis: 100%; } }
+        @media (max-width: 700px) { .cal-week .chip-del { display: flex; } }
         .subtab { padding: 7px 14px; border-radius: 4px; font-size: 12.5px; font-weight: 600; cursor: pointer; border: 1px solid ${line}; background: transparent; color: ${dim}; }
         .subtab.active { background: ${panel2}; color: ${cyan}; border-color: ${cyan}; }
         .fieldlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: ${dim}; margin-bottom: 6px; display:block; font-weight:600; }
@@ -3907,15 +3905,19 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
   const [confirmDelete, setConfirmDelete] = useState(null); // null | { planned, dateKey }
   const [listView, setListView] = useState(null); // null | "races" | "single" | "recurring"
   const [editingMatchDay, setEditingMatchDay] = useState(null); // date key, or null
-  // Calendar view: "3week" (default grid), "month" (4-week grid) or "week"
+  // Calendar view: "month" (default; 4-week grid from this Sunday) or "week"
   // (one week as a vertical list, navigable by weekOffset from this week).
   // The view is a per-browser preference, like panel open state.
   const [calView, setCalViewState] = useState(() => {
-    try { return localStorage.getItem("schedule-view") || "3week"; } catch { return "3week"; }
+    // Anything else saved (e.g. the retired "3week" view) falls back to month.
+    try { return localStorage.getItem("schedule-view") === "week" ? "week" : "month"; } catch { return "month"; }
   });
   const setCalView = (v) => { setCalViewState(v); try { localStorage.setItem("schedule-view", v); } catch { /* ignore */ } };
   const [weekOffset, setWeekOffset] = useState(0);
   const weekListRef = useRef(null);
+  // Bumped when the user opens Week view or presses Today, to bring today's
+  // row into view (the list scrolls with the page, not in its own box).
+  const [scrollTodayTick, setScrollTodayTick] = useState(0);
   // Both default on (undefined !== false) so existing profiles pick up the
   // new toggles already enabled — nothing changes until someone opts out.
   const showActual = profile.scheduleShowActual !== false;
@@ -3962,7 +3964,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
   // dashboard. Week view shows one Sunday-to-Saturday week, weekOffset weeks
   // from this one.
   const calendarStart = daysAgo(new Date().getDay() - (calView === "week" ? weekOffset * 7 : 0));
-  const calendarLength = calView === "week" ? 7 : calView === "month" ? 28 : 21;
+  const calendarLength = calView === "week" ? 7 : 28;
   const calendarDays = [];
   for (let i = 0; i < calendarLength; i++) {
     const d = new Date(calendarStart);
@@ -3995,19 +3997,13 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
   const isWeekView = calView === "week";
   const weekRelLabel = weekOffset === 0 ? "This week" : weekOffset === 1 ? "Next week" : weekOffset === -1 ? "Last week"
     : weekOffset > 0 ? `In ${weekOffset} weeks` : `${-weekOffset} weeks ago`;
-  const rangeLabel = isWeekView ? weekRelLabel : calView === "month" ? "Next 4 weeks" : "Next 3 weeks";
+  const rangeLabel = isWeekView ? weekRelLabel : "Next 4 weeks";
 
-  // Week view: when the shown week contains today, scroll today's row into
-  // view inside the list.
   useEffect(() => {
-    if (!isWeekView || weekOffset !== 0) return;
-    const list = weekListRef.current;
-    const el = list && list.querySelector('[data-today="true"]');
-    if (!el) return;
-    const top = el.offsetTop - list.offsetTop;
-    const overflow = top + el.offsetHeight - list.clientHeight;
-    if (overflow > 0) list.scrollTop = Math.min(top - 4, overflow + 4);
-  }, [isWeekView, weekOffset]);
+    if (!scrollTodayTick || !isWeekView) return;
+    const el = weekListRef.current && weekListRef.current.querySelector('[data-today="true"]');
+    if (el) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [scrollTodayTick]);
 
   return (
     <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
@@ -4017,9 +4013,9 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
             <Icon path={ICONS.calendar} size={16} color={cyan} /> Calendar
           </div>
           <div role="tablist" aria-label="Calendar view" style={{ display: "flex", gap: 4 }}>
-            {[["3week", "3 weeks"], ["month", "Month"], ["week", "Week"]].map(([id, label]) => (
+            {[["month", "Month"], ["week", "Week"]].map(([id, label]) => (
               <button key={id} role="tab" aria-selected={calView === id} className={`subtab ${calView === id ? "active" : ""}`}
-                onClick={() => { setCalView(id); if (id === "week") setWeekOffset(0); }} style={{ padding: "6px 11px", fontSize: 12 }}>{label}</button>
+                onClick={() => { setCalView(id); if (id === "week") { setWeekOffset(0); setScrollTodayTick((n) => n + 1); } }} style={{ padding: "6px 11px", fontSize: 12 }}>{label}</button>
             ))}
           </div>
           <button className="btn-primary" onClick={() => openAdd(null)} style={{ padding: "7px 12px", fontSize: 12 }}>
@@ -4073,13 +4069,13 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
             <button className="btn-ghost" onClick={() => setWeekOffset((o) => o + 1)} aria-label="Next week" title="Next week"
               style={{ padding: "6px 10px", display: "flex" }}><Icon path={ICONS.chevronRight} size={16} color={paper} /></button>
             {weekOffset !== 0 && (
-              <button className="btn-ghost" onClick={() => setWeekOffset(0)} style={{ padding: "6px 10px", fontSize: 12 }}>Today</button>
+              <button className="btn-ghost" onClick={() => { setWeekOffset(0); setScrollTodayTick((n) => n + 1); }} style={{ padding: "6px 10px", fontSize: 12 }}>Today</button>
             )}
           </div>
         )}
         <div ref={weekListRef} className={isWeekView ? "cal-week" : undefined}
           style={isWeekView
-            ? { display: "flex", flexDirection: "column", gap: 6, maxHeight: "min(70vh, 900px)", overflowY: "auto", paddingRight: 4 }
+            ? { display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gridAutoRows: "1fr", gap: 6 }
             : { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }}>
           {!isWeekView && WEEKDAY_LABELS.map((label) => (
             <div key={label} style={{ fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 }}>{label}</div>
@@ -4233,7 +4229,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                     <span style={{ color: amber, fontWeight: 600 }}>{Math.round(day.actualKcal)}</span>
                   </div>
                 )}
-                <div className="cal-chips" style={{ display: "flex", flexDirection: isWeekView ? "row" : "column", flexWrap: isWeekView ? "wrap" : "nowrap", gap: isWeekView ? 6 : 3 }}>
+                <div className="cal-chips" style={{ display: "flex", flexDirection: "column", gap: isWeekView ? 4 : 3, maxWidth: isWeekView ? 640 : undefined }}>
                 {isWeekView && day.pairs.length === 0 && day.extras.length === 0 && (
                   <div style={{ fontSize: 11.5, color: dim }}>{day.taper ? "Rest · tapering" : "Rest day"}</div>
                 )}

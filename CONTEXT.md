@@ -138,10 +138,11 @@ per-browser preference in `localStorage` (`panels:setup`, `panels:log`), not the
   logs live behind the "Stored data…" button (a modal with one tab each). The training tab is
   read-only: every cached Strava + intervals.icu activity, with intervals.icu rows on Strava days dimmed
   (the model ignores them there).
-- Schedule: the calendar has three views (per-browser `localStorage` key `schedule-view`): **3 weeks**
-  (default grid from this Sunday), **Month** (same grid, 4 weeks) and **Week** (one Sunday–Saturday week
-  as a vertically scrollable list of day rows, with ‹ "Week of …" › navigation and a Today button;
-  `weekOffset` is relative to this week). All three share the same day/chip rendering.
+- Schedule: the calendar has two views (per-browser `localStorage` key `schedule-view`): **Month** (default;
+  4-week grid from this Sunday) and **Week** (one Sunday–Saturday week as a column of day rows, all as tall as
+  the week's busiest day; sessions stack vertically with the matched actual beside each, like the grid; the list
+  scrolls with the page; ‹ "Week of …" › navigation and a Today button; `weekOffset` is relative to this week).
+  Both share the same day/chip rendering.
   The calendar is the editor. Hovering a day shows **+** (add a session or race there, in a
   pop-up `ScheduleEntryEditor`); hovering a planned chip shows a trash icon (confirm dialog); clicking a chip
   opens it for editing (the pop-up also has Delete, which is how phones delete — the chip trash is hidden

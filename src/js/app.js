@@ -1588,11 +1588,9 @@
         @media (hover: none) { .cal-add, .chip-del { opacity: 1; } }
         @media (max-width: 700px) { .chip-del { display: none; } }
         .modal-body table.data thead th { position: sticky; top: 0; background: ${panel}; z-index: 1; }
-        .cal-week .cal-pair { flex: 0 1 420px; min-width: 0; }
-        .cal-week .cal-chips > .cal-chip-wrap { flex: 0 1 220px; }
         .cal-week .cal-chip-text { display: inline !important; }
         .cal-week .cal-chip-emoji { display: none !important; }
-        @media (max-width: 700px) { .cal-week .chip-del { display: flex; } .cal-week .cal-pair { flex-basis: 100%; } }
+        @media (max-width: 700px) { .cal-week .chip-del { display: flex; } }
         .subtab { padding: 7px 14px; border-radius: 4px; font-size: 12.5px; font-weight: 600; cursor: pointer; border: 1px solid ${line}; background: transparent; color: ${dim}; }
         .subtab.active { background: ${panel2}; color: ${cyan}; border-color: ${cyan}; }
         .fieldlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: ${dim}; margin-bottom: 6px; display:block; font-weight:600; }
@@ -2913,9 +2911,9 @@
     const [editingMatchDay, setEditingMatchDay] = useState(null);
     const [calView, setCalViewState] = useState(() => {
       try {
-        return localStorage.getItem("schedule-view") || "3week";
+        return localStorage.getItem("schedule-view") === "week" ? "week" : "month";
       } catch {
-        return "3week";
+        return "month";
       }
     });
     const setCalView = (v) => {
@@ -2927,6 +2925,7 @@
     };
     const [weekOffset, setWeekOffset] = useState(0);
     const weekListRef = useRef(null);
+    const [scrollTodayTick, setScrollTodayTick] = useState(0);
     const showActual = profile.scheduleShowActual !== false;
     const showCalories = profile.scheduleShowCalories !== false;
     const activityLibrary = useMemo(
@@ -2960,7 +2959,7 @@
       onUpdate(id, { ...rest, skipDates: Array.from(/* @__PURE__ */ new Set([...entry.skipDates || [], dateKey])).sort() });
     }
     const calendarStart = daysAgo((/* @__PURE__ */ new Date()).getDay() - (calView === "week" ? weekOffset * 7 : 0));
-    const calendarLength = calView === "week" ? 7 : calView === "month" ? 28 : 21;
+    const calendarLength = calView === "week" ? 7 : 28;
     const calendarDays = [];
     for (let i = 0; i < calendarLength; i++) {
       const d = new Date(calendarStart);
@@ -2992,17 +2991,13 @@
     const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
     const isWeekView = calView === "week";
     const weekRelLabel = weekOffset === 0 ? "This week" : weekOffset === 1 ? "Next week" : weekOffset === -1 ? "Last week" : weekOffset > 0 ? `In ${weekOffset} weeks` : `${-weekOffset} weeks ago`;
-    const rangeLabel = isWeekView ? weekRelLabel : calView === "month" ? "Next 4 weeks" : "Next 3 weeks";
+    const rangeLabel = isWeekView ? weekRelLabel : "Next 4 weeks";
     useEffect(() => {
-      if (!isWeekView || weekOffset !== 0) return;
-      const list = weekListRef.current;
-      const el = list && list.querySelector('[data-today="true"]');
-      if (!el) return;
-      const top = el.offsetTop - list.offsetTop;
-      const overflow = top + el.offsetHeight - list.clientHeight;
-      if (overflow > 0) list.scrollTop = Math.min(top - 4, overflow + 4);
-    }, [isWeekView, weekOffset]);
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, display: "flex", alignItems: "center", gap: 7, marginRight: "auto" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Calendar"), /* @__PURE__ */ React.createElement("div", { role: "tablist", "aria-label": "Calendar view", style: { display: "flex", gap: 4 } }, [["3week", "3 weeks"], ["month", "Month"], ["week", "Week"]].map(([id, label]) => /* @__PURE__ */ React.createElement(
+      if (!scrollTodayTick || !isWeekView) return;
+      const el = weekListRef.current && weekListRef.current.querySelector('[data-today="true"]');
+      if (el) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }, [scrollTodayTick]);
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, display: "flex", alignItems: "center", gap: 7, marginRight: "auto" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Calendar"), /* @__PURE__ */ React.createElement("div", { role: "tablist", "aria-label": "Calendar view", style: { display: "flex", gap: 4 } }, [["month", "Month"], ["week", "Week"]].map(([id, label]) => /* @__PURE__ */ React.createElement(
       "button",
       {
         key: id,
@@ -3011,7 +3006,10 @@
         className: `subtab ${calView === id ? "active" : ""}`,
         onClick: () => {
           setCalView(id);
-          if (id === "week") setWeekOffset(0);
+          if (id === "week") {
+            setWeekOffset(0);
+            setScrollTodayTick((n) => n + 1);
+          }
         },
         style: { padding: "6px 11px", fontSize: 12 }
       },
@@ -3061,12 +3059,15 @@
         style: { padding: "6px 10px", display: "flex" }
       },
       /* @__PURE__ */ React.createElement(Icon, { path: ICONS.chevronRight, size: 16, color: paper })
-    ), weekOffset !== 0 && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: () => setWeekOffset(0), style: { padding: "6px 10px", fontSize: 12 } }, "Today")), /* @__PURE__ */ React.createElement(
+    ), weekOffset !== 0 && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: () => {
+      setWeekOffset(0);
+      setScrollTodayTick((n) => n + 1);
+    }, style: { padding: "6px 10px", fontSize: 12 } }, "Today")), /* @__PURE__ */ React.createElement(
       "div",
       {
         ref: weekListRef,
         className: isWeekView ? "cal-week" : void 0,
-        style: isWeekView ? { display: "flex", flexDirection: "column", gap: 6, maxHeight: "min(70vh, 900px)", overflowY: "auto", paddingRight: 4 } : { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }
+        style: isWeekView ? { display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gridAutoRows: "1fr", gap: 6 } : { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }
       },
       !isWeekView && WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)),
       calendarDays.map((day) => {
@@ -3250,7 +3251,7 @@
             /* @__PURE__ */ React.createElement("span", { style: { color: dim } }, "/"),
             /* @__PURE__ */ React.createElement("span", { style: { color: amber, fontWeight: 600 } }, Math.round(day.actualKcal))
           ),
-          /* @__PURE__ */ React.createElement("div", { className: "cal-chips", style: { display: "flex", flexDirection: isWeekView ? "row" : "column", flexWrap: isWeekView ? "wrap" : "nowrap", gap: isWeekView ? 6 : 3 } }, isWeekView && day.pairs.length === 0 && day.extras.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: dim } }, day.taper ? "Rest \xB7 tapering" : "Rest day"), showActual ? /* @__PURE__ */ React.createElement(React.Fragment, null, day.pairs.map(({ planned, actual, manual }, i) => {
+          /* @__PURE__ */ React.createElement("div", { className: "cal-chips", style: { display: "flex", flexDirection: "column", gap: isWeekView ? 4 : 3, maxWidth: isWeekView ? 640 : void 0 } }, isWeekView && day.pairs.length === 0 && day.extras.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: dim } }, day.taper ? "Rest \xB7 tapering" : "Rest day"), showActual ? /* @__PURE__ */ React.createElement(React.Fragment, null, day.pairs.map(({ planned, actual, manual }, i) => {
             const isGroup = Array.isArray(actual);
             return /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, className: "cal-pair", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i, isGroup), isGroup ? actualChipGroup(actual, i, manual) : actual ? actualChip(actual, true, i, manual) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null);
           }), day.extras.map((actual, i) => /* @__PURE__ */ React.createElement("div", { key: `extra${i}`, className: "cal-pair", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, /* @__PURE__ */ React.createElement("div", null), actualChip(actual, false, i)))) : day.pairs.map(({ planned }, i) => plannedChip(planned, i)))

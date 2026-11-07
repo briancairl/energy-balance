@@ -118,18 +118,32 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 ASSETS_DIR = os.path.join(ROOT, "assets")
 CONFIGS_DIR = os.path.join(ROOT, "configs")
-CACHES_DIR = os.path.join(ROOT, "caches")
-SECRETS_DIR = os.path.join(ROOT, "secrets")
 JS_DIR = os.path.join(ROOT, "src", "js")
 
-CONFIG_PATH = os.path.join(CONFIGS_DIR, "config.json")
+# Where the per-install data lives: config.json, schedule_sources/, the TLS
+# cert/key, secrets/ and caches/. Defaults to the project dir itself (the
+# bind-mounted checkout docker-compose.yml uses). EB_DATA_DIR moves all of it
+# under one separate directory with the same layout — deploy/deploy.sh sets
+# it to /data, a named Docker volume, so the image only carries code and an
+# image update never touches the data. Shipped files (configs/manifest.json,
+# configs/config.example.json) always come from the project dir.
+DATA_DIR = os.environ.get("EB_DATA_DIR") or ROOT
+DATA_CONFIGS_DIR = os.path.join(DATA_DIR, "configs")
+CACHES_DIR = os.path.join(DATA_DIR, "caches")
+SECRETS_DIR = os.path.join(DATA_DIR, "secrets")
+# "remote" when the image was pushed by deploy/deploy.sh from another
+# machine: there's no git checkout or update watcher on this host, so the
+# in-app Update button is replaced by a note to run deploy.sh instead.
+UPDATE_MODE = os.environ.get("EB_UPDATE_MODE") or "local"
+
+CONFIG_PATH = os.path.join(DATA_CONFIGS_DIR, "config.json")
 TOKENS_PATH = os.path.join(SECRETS_DIR, "tokens.json")
 CACHE_PATH = os.path.join(CACHES_DIR, "strava_cache.json")
 INTERVALS_CACHE_PATH = os.path.join(CACHES_DIR, "intervals_cache.json")
 STORE_PATH = os.path.join(SECRETS_DIR, "app_store.json")
-SCHEDULE_SOURCES_DIR = os.path.join(CONFIGS_DIR, "schedule_sources")
-TLS_CERT_PATH = os.path.join(CONFIGS_DIR, "tailscale.crt")
-TLS_KEY_PATH = os.path.join(CONFIGS_DIR, "tailscale.key")
+SCHEDULE_SOURCES_DIR = os.path.join(DATA_CONFIGS_DIR, "schedule_sources")
+TLS_CERT_PATH = os.path.join(DATA_CONFIGS_DIR, "tailscale.crt")
+TLS_KEY_PATH = os.path.join(DATA_CONFIGS_DIR, "tailscale.key")
 # In-app updates: POST /api/update drops UPDATE_REQUEST_PATH; on the host,
 # energy-balance-update.path (installed by install.sh) sees it and runs
 # update.sh, which pulls origin/main and re-runs docker compose if main moved,
@@ -211,6 +225,7 @@ def save_json(path, data):
     corrupt the original. Combined with _json_lock, this is what actually
     fixes the race — atomicity alone isn't enough if two writers still
     interleave their read-modify-write cycles."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
     with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -265,6 +280,7 @@ def get_tls_config():
     cfg = load_json(CONFIG_PATH, {})
     if not cfg.get("tls_enabled"):
         return None
+    pinned = bool(cfg.get("tls_hostname"))
     hostname = cfg.get("tls_hostname") or get_tailscale_hostname()
     if not hostname:
         print("⚠️  tls_enabled is true but no tls_hostname is set and none could be")
@@ -272,7 +288,7 @@ def get_tls_config():
         print("     or make sure the tailscale CLI is on PATH and you're logged in.")
         return None
     tls_port = cfg.get("tls_port") or (cfg.get("port", 8081) + 1)
-    return {"hostname": hostname, "port": tls_port}
+    return {"hostname": hostname, "port": tls_port, "pinned": pinned}
 
 
 def get_tailscale_hostname():
@@ -291,6 +307,16 @@ def get_tailscale_hostname():
         return None
 
 
+# A machine's FIRST `tailscale cert` has to go through Let's Encrypt's DNS
+# challenge, which regularly takes over a minute; after that tailscaled
+# answers from its cache instantly. A short timeout kills that first request
+# every time, so it could never succeed.
+TLS_CERT_TIMEOUT = 300
+# If getting a cert fails, try again this often (instead of staying on HTTP
+# until someone restarts the server).
+TLS_RETRY_SECONDS = 5 * 60
+
+
 def ensure_tls_cert(hostname, cert_path, key_path):
     """Obtains (or renews) a real, trusted certificate for this hostname via
     Tailscale's built-in Let's Encrypt integration. Safe to call repeatedly —
@@ -299,7 +325,7 @@ def ensure_tls_cert(hostname, cert_path, key_path):
     try:
         result = subprocess.run(
             ["tailscale", "cert", "--cert-file", cert_path, "--key-file", key_path, hostname],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=TLS_CERT_TIMEOUT,
         )
         if result.returncode != 0:
             print(f"  `tailscale cert` failed: {result.stderr.strip()}")
@@ -327,6 +353,32 @@ def run_https_server(port, cert_path, key_path, ready_box):
     ready_box["context"] = context
     ready_box["event"].set()
     https_server.serve_forever()
+
+
+def https_setup_loop(tls_cfg):
+    """Gets a cert and starts the HTTPS listener, retrying every
+    TLS_RETRY_SECONDS until it works; then hands off to tls_renewal_loop."""
+    hostname, port = tls_cfg["hostname"], tls_cfg["port"]
+    while True:
+        if ensure_tls_cert(hostname, TLS_CERT_PATH, TLS_KEY_PATH):
+            ready_box = {"event": threading.Event()}
+            threading.Thread(
+                target=run_https_server,
+                args=(port, TLS_CERT_PATH, TLS_KEY_PATH, ready_box),
+                daemon=True,
+            ).start()
+            ready_box["event"].wait(timeout=10)
+            if "context" in ready_box:
+                print(f"  HTTPS (real, trusted cert): https://{hostname}:{port}/")
+                tls_renewal_loop(hostname, TLS_CERT_PATH, TLS_KEY_PATH, ready_box["context"])
+                return
+            print("  ⚠️  HTTPS listener failed to start — staying on HTTP only.")
+            return
+        print("  ⚠️  Could not obtain a TLS certificate — on HTTP only for now.")
+        print("     Make sure MagicDNS + \"Enable HTTPS\" are turned on for your tailnet:")
+        print("     https://tailscale.com/docs/how-to/set-up-https-certificates")
+        print(f"     Retrying in {TLS_RETRY_SECONDS // 60} minutes.")
+        time.sleep(TLS_RETRY_SECONDS)
 
 
 def tls_renewal_loop(hostname, cert_path, key_path, ssl_context):
@@ -853,6 +905,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/update/status":
             request = load_json(UPDATE_REQUEST_PATH) if os.path.exists(UPDATE_REQUEST_PATH) else None
             return self._send_json({
+                "mode": UPDATE_MODE,
                 "pending": request is not None,
                 "requested_at": (request or {}).get("requested_at"),
                 "status": load_json(UPDATE_STATUS_PATH),
@@ -1109,6 +1162,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True, "key": key})
 
         if path == "/api/update":
+            if UPDATE_MODE == "remote":
+                return self._send_json({"error": "This install is deployed from another machine — run deploy/deploy.sh there to update it."}, 409)
             requested_at = datetime.now().astimezone().isoformat(timespec="seconds")
             save_json(UPDATE_REQUEST_PATH, {"requested_at": requested_at})
             return self._send_json({"ok": True, "requested_at": requested_at})
@@ -1402,7 +1457,7 @@ def main():
     cfg = get_config()
     port = cfg["port"] if cfg else 8081
     if not cfg:
-        print(f"⚠️  No valid config.json found in {CONFIGS_DIR}.")
+        print(f"⚠️  No valid config.json found in {DATA_CONFIGS_DIR}.")
         print("   Copy configs/config.example.json -> configs/config.json and fill in your Strava client_id/client_secret.")
         print(f"   The server will still start on port {port} so you can see setup instructions at /login.")
 
@@ -1419,28 +1474,11 @@ def main():
 
     tls_cfg = get_tls_config()
     if tls_cfg:
-        print(f"  Setting up HTTPS for {tls_cfg['hostname']} …")
-        if ensure_tls_cert(tls_cfg["hostname"], TLS_CERT_PATH, TLS_KEY_PATH):
-            ready_box = {"event": threading.Event()}
-            threading.Thread(
-                target=run_https_server,
-                args=(tls_cfg["port"], TLS_CERT_PATH, TLS_KEY_PATH, ready_box),
-                daemon=True,
-            ).start()
-            ready_box["event"].wait(timeout=10)
-            if "context" in ready_box:
-                print(f"  HTTPS (real, trusted cert): https://{tls_cfg['hostname']}:{tls_cfg['port']}/")
-                threading.Thread(
-                    target=tls_renewal_loop,
-                    args=(tls_cfg["hostname"], TLS_CERT_PATH, TLS_KEY_PATH, ready_box["context"]),
-                    daemon=True,
-                ).start()
-            else:
-                print("  ⚠️  HTTPS listener failed to start in time — continuing on HTTP only.")
-        else:
-            print("  ⚠️  Could not obtain a TLS certificate — continuing on HTTP only.")
-            print("     Make sure MagicDNS + \"Enable HTTPS\" are turned on for your tailnet:")
-            print("     https://tailscale.com/docs/how-to/set-up-https-certificates")
+        source = "from tls_hostname in config.json" if tls_cfg["pinned"] else "auto-detected"
+        print(f"  Setting up HTTPS for {tls_cfg['hostname']} ({source}) …")
+        # In the background: plain HTTP serves right away while the (possibly
+        # slow, first-ever) cert request runs, and failures are retried.
+        threading.Thread(target=https_setup_loop, args=(tls_cfg,), daemon=True).start()
 
     if get_macrosfirst_config():
         threading.Thread(target=macrosfirst_auto_sync_loop, daemon=True).start()

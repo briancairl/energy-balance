@@ -90,7 +90,7 @@ MacrosFirst (optional):
   1. Create a personal access token at https://app.macrosfirst.com/personal-access-tokens.
   2. In config.json, set macrosfirst_api_token to that token (looks like
      "mf_live_...").
-  3. Restart the server, open the Log tab, and click "Sync now" — or just
+  3. Restart the server, open Setup → Nutrition logging connection, and click "Sync now" — or just
      wait for the nightly automatic sync (macrosfirst_sync_time in
      config.json, default 04:00).
 """
@@ -1267,6 +1267,11 @@ class Handler(BaseHTTPRequestHandler):
                 updates = sync_macrosfirst(mcfg, days_back=days_back)
             except urllib.error.HTTPError as e:
                 return self._send_json({"error": f"MacrosFirst API error {e.code}: {e.read().decode()}"}, 502)
+            except (urllib.error.URLError, OSError) as e:
+                # Network-level failure (DNS, proxy, timeout): answer with a
+                # readable error instead of dropping the connection.
+                reason = getattr(e, "reason", e)
+                return self._send_json({"error": f"Couldn't reach MacrosFirst: {reason}"}, 502)
             return self._send_json({"ok": True, "count": len(updates), "days": updates})
 
         # Lets the browser's own file picker/drop zone (ScheduleTab) trigger

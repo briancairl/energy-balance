@@ -1647,7 +1647,12 @@
         setRangeDays,
         onImportScheduleFile: handleScheduleFile,
         scheduleImportError,
-        scheduleImportNotice
+        scheduleImportNotice,
+        macrosfirstStatus,
+        macrosfirstFetching,
+        macrosfirstError,
+        onSyncMacrosFirst: syncMacrosFirst,
+        macrosfirstLastAutoSync
       }
     ), tab === "import" && /* @__PURE__ */ React.createElement(
       ImportTab,
@@ -1663,11 +1668,6 @@
         weightLog,
         onSaveWeight: saveManualWeight,
         onDeleteWeight: deleteWeightDay,
-        macrosfirstStatus,
-        macrosfirstFetching,
-        macrosfirstError,
-        onSyncMacrosFirst: syncMacrosFirst,
-        macrosfirstLastAutoSync,
         importError,
         importNotice,
         units,
@@ -1902,13 +1902,14 @@
       ))
     ), importFileError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, importFileError), !importFileError && importFileNotice && /* @__PURE__ */ React.createElement(Banner, { kind: "success" }, importFileNotice));
   }
-  function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor, onFetch, fetching, fetchError, rangeDays, setRangeDays, onImportScheduleFile, scheduleImportError, scheduleImportNotice }) {
+  function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor, onFetch, fetching, fetchError, rangeDays, setRangeDays, onImportScheduleFile, scheduleImportError, scheduleImportNotice, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync }) {
     var _a, _b, _c;
     const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
     const units = profile.units || "metric";
     const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
     const [heightText, onHeightChange] = useUnitInput(profile.heightCm, units, cmToDisplayLen, displayToCm, 1);
     const stravaSummary = !stravaStatus.checked ? "checking\u2026" : stravaStatus.connected ? "connected" : "not connected";
+    const mfSummary = !macrosfirstStatus.checked ? "checking\u2026" : macrosfirstStatus.unreachable ? "server unreachable" : macrosfirstStatus.configError ? "not configured" : "connected";
     const intervalsSummary = !intervalsStatus.checked ? "checking\u2026" : intervalsStatus.configured ? "configured" : "not configured";
     const panels = [
       {
@@ -1969,6 +1970,14 @@
         keywords: "optional wellness tsb ctl atl api key",
         summary: intervalsSummary,
         content: /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 8 } }, "Optional \u2014 wellness / TSB only."), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Used only for CTL/ATL/TSB (recovery buffer below) and as a calorie fallback on days Strava has no data. Fetched and cached server-side too, the same way as Strava \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "intervals_api_key"), "(and optionally ", /* @__PURE__ */ React.createElement("code", null, "intervals_athlete_id"), ", default ", /* @__PURE__ */ React.createElement("code", null, "0"), ") to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), "and restart ", /* @__PURE__ */ React.createElement("code", null, "server.py"), ". Get the key from intervals.icu \u2192 Settings \u2192 Developer Settings."), !intervalsStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : intervalsStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : intervalsStatus.configured ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Configured \u2014 athlete ", intervalsStatus.athleteId)) : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "intervals_api_key"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server to enable this."), lastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "last synced ", new Date(lastFetched).toLocaleString(), " \xB7 ", intervalsSyncedCount, " day", intervalsSyncedCount === 1 ? "" : "s", " covered"))
+      },
+      {
+        id: "macrosfirst",
+        title: "Nutrition logging connection",
+        icon: ICONS.upload,
+        keywords: "macrosfirst macros first api sync nutrition import automatic token",
+        summary: mfSummary,
+        content: /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "MacrosFirst \u2014 pulls your daily log directly from MacrosFirst's personal API, through", /* @__PURE__ */ React.createElement("code", null, " server.py"), ". See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup."), !macrosfirstStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : macrosfirstStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : macrosfirstStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "macrosfirst_api_token"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server.") : /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected")), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: onSyncMacrosFirst, disabled: macrosfirstFetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), " ", macrosfirstFetching ? "Syncing\u2026" : "Sync now")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, macrosfirstLastAutoSync ? `Last automatic sync: ${new Date(macrosfirstLastAutoSync).toLocaleString()}` : 'No automatic sync yet \u2014 runs daily (set macrosfirst_sync_time in config.json, default 04:00), or click "Sync now".')), macrosfirstError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, macrosfirstError))
       },
       {
         id: "tuning",
@@ -2256,13 +2265,12 @@
       }
     ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "What your gut is currently trained to absorb on rides \u22653h; used only when a planned session has no ", /* @__PURE__ */ React.createElement("code", null, "fuel"), " of its own. Build toward 90\u2013110 g/h over the block (glucose:fructose mixes), practising in training first."))));
   }
-  function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync, importError, importNotice, units, stravaData, intervalsData, kcalOverrides }) {
+  function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, importError, importNotice, units, stravaData, intervalsData, kcalOverrides }) {
     const [dragOver, setDragOver] = useState(false);
     const [storedView, setStoredView] = useState(null);
     const dayCount = Object.keys(nutrition).length;
     const weightCount = Object.keys(weightLog).length;
     const trainingCount = stravaData.activities.length + intervalsData.activities.length;
-    const mfSummary = !macrosfirstStatus.checked ? "checking\u2026" : macrosfirstStatus.unreachable ? "server unreachable" : macrosfirstStatus.configError ? "not configured" : "connected";
     const panels = [
       {
         id: "manual-nutrition",
@@ -2280,14 +2288,6 @@
         keywords: "weigh-in body weight scale",
         summary: weightCount ? `${weightCount} day${weightCount === 1 ? "" : "s"} logged` : null,
         content: /* @__PURE__ */ React.createElement(WeightEntryCard, { weightLog, onSave: onSaveWeight, units })
-      },
-      {
-        id: "macrosfirst",
-        title: "MacrosFirst API",
-        icon: ICONS.upload,
-        keywords: "sync nutrition import automatic",
-        summary: mfSummary,
-        content: /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Pulls your daily log directly from MacrosFirst's personal API, through", /* @__PURE__ */ React.createElement("code", null, " server.py"), ". See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup."), !macrosfirstStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : macrosfirstStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : macrosfirstStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "macrosfirst_api_token"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server.") : /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected")), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: onSyncMacrosFirst, disabled: macrosfirstFetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), " ", macrosfirstFetching ? "Syncing\u2026" : "Sync now")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, macrosfirstLastAutoSync ? `Last automatic sync: ${new Date(macrosfirstLastAutoSync).toLocaleString()}` : 'No automatic sync yet \u2014 runs daily (set macrosfirst_sync_time in config.json, default 04:00), or click "Sync now".')), macrosfirstError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, macrosfirstError))
       },
       {
         id: "csv",

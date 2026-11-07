@@ -2189,14 +2189,15 @@ function App() {
             onFetch={pullAll} fetching={fetching || stravaFetching} fetchError={fetchError}
             rangeDays={rangeDays} setRangeDays={setRangeDays}
             onImportScheduleFile={handleScheduleFile} scheduleImportError={scheduleImportError}
-            scheduleImportNotice={scheduleImportNotice} />
+            scheduleImportNotice={scheduleImportNotice}
+            macrosfirstStatus={macrosfirstStatus} macrosfirstFetching={macrosfirstFetching}
+            macrosfirstError={macrosfirstError} onSyncMacrosFirst={syncMacrosFirst} macrosfirstLastAutoSync={macrosfirstLastAutoSync} />
         )}
         {tab === "import" && (
           <ImportTab onFile={handleCSVFile} csvPreview={csvPreview} colMap={colMap} setColMap={setColMap}
             onImport={importMappedCSV} nutrition={nutrition} onSaveManualDay={saveManualDay}
             onDeleteDay={deleteNutritionDay} weightLog={weightLog} onSaveWeight={saveManualWeight}
-            onDeleteWeight={deleteWeightDay} macrosfirstStatus={macrosfirstStatus} macrosfirstFetching={macrosfirstFetching}
-            macrosfirstError={macrosfirstError} onSyncMacrosFirst={syncMacrosFirst} macrosfirstLastAutoSync={macrosfirstLastAutoSync}
+            onDeleteWeight={deleteWeightDay}
             importError={importError} importNotice={importNotice} units={units}
             stravaData={stravaData} intervalsData={intervalsData} kcalOverrides={kcalOverrides} />
         )}
@@ -2411,12 +2412,15 @@ function ScheduleImportPanel({ onImportFile, importFileError, importFileNotice }
   );
 }
 
-function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor, onFetch, fetching, fetchError, rangeDays, setRangeDays, onImportScheduleFile, scheduleImportError, scheduleImportNotice }) {
+function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor, onFetch, fetching, fetchError, rangeDays, setRangeDays, onImportScheduleFile, scheduleImportError, scheduleImportNotice, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync }) {
   const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
   const units = profile.units || "metric";
   const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
   const [heightText, onHeightChange] = useUnitInput(profile.heightCm, units, cmToDisplayLen, displayToCm, 1);
   const stravaSummary = !stravaStatus.checked ? "checking…" : stravaStatus.connected ? "connected" : "not connected";
+  const mfSummary = !macrosfirstStatus.checked ? "checking…"
+    : macrosfirstStatus.unreachable ? "server unreachable"
+    : macrosfirstStatus.configError ? "not configured" : "connected";
   const intervalsSummary = !intervalsStatus.checked ? "checking…" : intervalsStatus.configured ? "configured" : "not configured";
   const panels = [
     { id: "profile", title: "Athlete profile", icon: ICONS.user, defaultOpen: true,
@@ -2545,6 +2549,40 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
           <div style={{ fontSize: 12.5, color: dim }}>Not configured — add <code>intervals_api_key</code> to <code>config.json</code> and restart the server to enable this.</div>
         )}
         {lastFetched && <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>last synced {new Date(lastFetched).toLocaleString()} · {intervalsSyncedCount} day{intervalsSyncedCount === 1 ? "" : "s"} covered</div>}
+      </>) },
+
+    { id: "macrosfirst", title: "Nutrition logging connection", icon: ICONS.upload,
+      keywords: "macrosfirst macros first api sync nutrition import automatic token",
+      summary: mfSummary,
+      content: (<>
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+          MacrosFirst — pulls your daily log directly from MacrosFirst's personal API, through
+          <code> server.py</code>. See <code>config.example.json</code> for setup.
+        </div>
+        {!macrosfirstStatus.checked ? (
+          <div style={{ fontSize: 12.5, color: dim }}>Checking connection…</div>
+        ) : macrosfirstStatus.unreachable ? (
+          <div style={{ fontSize: 12.5, color: coral }}>Can't reach the local server. Make sure you're running this page via <code>python3 server.py</code>, not a plain file server.</div>
+        ) : macrosfirstStatus.configError ? (
+          <div style={{ fontSize: 12.5, color: coral }}>Not configured — add <code>macrosfirst_api_token</code> to <code>config.json</code> and restart the server.</div>
+        ) : (
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                <Icon path={ICONS.check} size={15} color={mint} /><span>Connected</span>
+              </div>
+              <button className="btn-primary" onClick={onSyncMacrosFirst} disabled={macrosfirstFetching}>
+                <Icon path={ICONS.refresh} size={13} color={ink} /> {macrosfirstFetching ? "Syncing…" : "Sync now"}
+              </button>
+            </div>
+            <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>
+              {macrosfirstLastAutoSync
+                ? `Last automatic sync: ${new Date(macrosfirstLastAutoSync).toLocaleString()}`
+                : "No automatic sync yet — runs daily (set macrosfirst_sync_time in config.json, default 04:00), or click \"Sync now\"."}
+            </div>
+          </div>
+        )}
+        {macrosfirstError && <Banner kind="error">{macrosfirstError}</Banner>}
       </>) },
 
     { id: "tuning", title: "Model tuning", icon: ICONS.gauge, iconColor: amber,
@@ -2925,15 +2963,12 @@ function IronmanModeSettings({ profile, setProfile, imCal, imCalibrating, imCalE
   );
 }
 
-function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync, importError, importNotice, units, stravaData, intervalsData, kcalOverrides }) {
+function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, importError, importNotice, units, stravaData, intervalsData, kcalOverrides }) {
   const [dragOver, setDragOver] = useState(false);
   const [storedView, setStoredView] = useState(null); // null | "nutrition" | "training" | "weight"
   const dayCount = Object.keys(nutrition).length;
   const weightCount = Object.keys(weightLog).length;
   const trainingCount = stravaData.activities.length + intervalsData.activities.length;
-  const mfSummary = !macrosfirstStatus.checked ? "checking…"
-    : macrosfirstStatus.unreachable ? "server unreachable"
-    : macrosfirstStatus.configError ? "not configured" : "connected";
   const panels = [
     { id: "manual-nutrition", title: "Enter a day's macros", icon: ICONS.plus, defaultOpen: true,
       keywords: "nutrition protein carbs fat calories manual intake food",
@@ -2942,39 +2977,6 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
       keywords: "weigh-in body weight scale",
       summary: weightCount ? `${weightCount} day${weightCount === 1 ? "" : "s"} logged` : null,
       content: <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} units={units} /> },
-    { id: "macrosfirst", title: "MacrosFirst API", icon: ICONS.upload,
-      keywords: "sync nutrition import automatic",
-      summary: mfSummary,
-      content: (<>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
-          Pulls your daily log directly from MacrosFirst's personal API, through
-          <code> server.py</code>. See <code>config.example.json</code> for setup.
-        </div>
-        {!macrosfirstStatus.checked ? (
-          <div style={{ fontSize: 12.5, color: dim }}>Checking connection…</div>
-        ) : macrosfirstStatus.unreachable ? (
-          <div style={{ fontSize: 12.5, color: coral }}>Can't reach the local server. Make sure you're running this page via <code>python3 server.py</code>, not a plain file server.</div>
-        ) : macrosfirstStatus.configError ? (
-          <div style={{ fontSize: 12.5, color: coral }}>Not configured — add <code>macrosfirst_api_token</code> to <code>config.json</code> and restart the server.</div>
-        ) : (
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-                <Icon path={ICONS.check} size={15} color={mint} /><span>Connected</span>
-              </div>
-              <button className="btn-primary" onClick={onSyncMacrosFirst} disabled={macrosfirstFetching}>
-                <Icon path={ICONS.refresh} size={13} color={ink} /> {macrosfirstFetching ? "Syncing…" : "Sync now"}
-              </button>
-            </div>
-            <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>
-              {macrosfirstLastAutoSync
-                ? `Last automatic sync: ${new Date(macrosfirstLastAutoSync).toLocaleString()}`
-                : "No automatic sync yet — runs daily (set macrosfirst_sync_time in config.json, default 04:00), or click \"Sync now\"."}
-            </div>
-          </div>
-        )}
-        {macrosfirstError && <Banner kind="error">{macrosfirstError}</Banner>}
-      </>) },
     { id: "csv", title: "Import a CSV", icon: ICONS.upload,
       keywords: "csv spreadsheet excel file upload map columns",
       summary: csvPreview ? `${csvPreview.rows.length} rows to map` : null,

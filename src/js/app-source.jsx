@@ -2821,6 +2821,17 @@ function UpdateCard() {
 
   const stale = waitingOnHost && info?.pending && Date.now() - requestedAt > UPDATE_STALE_MS;
   const st = info?.status;
+  // Pushed from another machine by deploy/deploy.sh: no checkout or update
+  // watcher here, so updates have to be started from that machine.
+  if (info?.mode === "remote") {
+    return (
+      <div style={{ fontSize: 12.5, color: dim, lineHeight: 1.5 }}>
+        This install was deployed from another machine. To update it, run
+        <code> deploy/deploy.sh &lt;user@this-host&gt;</code> from that machine's checkout — only the app is
+        replaced; this host's data (config, secrets, caches, logs) is kept.
+      </div>
+    );
+  }
   return (
     <div>
       <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>

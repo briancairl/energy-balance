@@ -2187,7 +2187,9 @@ function App() {
             imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={recalibrateIronman}
             imGoalFloor={ironmanStatus ? ironmanStatus.goalFloor : null}
             onFetch={pullAll} fetching={fetching || stravaFetching} fetchError={fetchError}
-            rangeDays={rangeDays} setRangeDays={setRangeDays} />
+            rangeDays={rangeDays} setRangeDays={setRangeDays}
+            onImportScheduleFile={handleScheduleFile} scheduleImportError={scheduleImportError}
+            scheduleImportNotice={scheduleImportNotice} />
         )}
         {tab === "import" && (
           <ImportTab onFile={handleCSVFile} csvPreview={csvPreview} colMap={colMap} setColMap={setColMap}
@@ -2201,8 +2203,7 @@ function App() {
         {tab === "schedule" && (
           <ScheduleTab schedule={schedule} onAdd={addScheduleEntry} onUpdate={updateScheduleEntry}
             onDelete={deleteScheduleEntry} stravaData={stravaData} intervalsData={intervalsData}
-            onImportFile={handleScheduleFile} importFileError={scheduleImportError}
-            importFileNotice={scheduleImportNotice} matchOverrides={matchOverrides}
+            matchOverrides={matchOverrides}
             onSetMatchOverride={setScheduleMatchOverride} profile={profile} setProfile={setProfile}
             weightLog={weightLog} matchedKcalRates={matchedKcalRates} />
         )}
@@ -2377,7 +2378,40 @@ function Modal({ title, onClose, children, icon = ICONS.database, iconColor = cy
   );
 }
 
-function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor, onFetch, fetching, fetchError, rangeDays, setRangeDays }) {
+// Drop zone for a training-plan / schedule .json (Setup → Import schedule).
+function ScheduleImportPanel({ onImportFile, importFileError, importFileNotice }) {
+  const [dragOver, setDragOver] = useState(false);
+  return (
+    <>
+      <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+        Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file.
+        It's saved under <code>schedule_sources/</code> and re-imported automatically from then on
+        whenever that file's contents change — no need to come back here and re-upload it.
+      </div>
+      <div
+        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => { e.preventDefault(); setDragOver(false); if (e.dataTransfer.files[0]) onImportFile(e.dataTransfer.files[0]); }}
+        style={{
+          border: `1.5px dashed ${dragOver ? cyan : line}`, borderRadius: 6, padding: "28px 20px",
+          textAlign: "center", background: dragOver ? "rgba(79,209,217,0.05)" : "transparent", transition: "all 0.15s",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}><Icon path={ICONS.upload} size={22} color={dim} /></div>
+        <div style={{ fontSize: 13, marginBottom: 12 }}>Drop a .json schedule file here, or</div>
+        <label className="btn-ghost" style={{ display: "inline-block" }}>
+          Choose file
+          <input type="file" accept=".json,application/json" style={{ display: "none" }}
+            onChange={(e) => { if (e.target.files[0]) onImportFile(e.target.files[0]); e.target.value = ""; }} />
+        </label>
+      </div>
+      {importFileError && <Banner kind="error">{importFileError}</Banner>}
+      {!importFileError && importFileNotice && <Banner kind="success">{importFileNotice}</Banner>}
+    </>
+  );
+}
+
+function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor, onFetch, fetching, fetchError, rangeDays, setRangeDays, onImportScheduleFile, scheduleImportError, scheduleImportNotice }) {
   const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
   const units = profile.units || "metric";
   const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
@@ -2440,6 +2474,11 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
         {lastFetched && <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>intervals last synced {new Date(lastFetched).toLocaleString()}</div>}
         {fetchError && <Banner kind="error">{fetchError}</Banner>}
       </>) },
+
+    { id: "schedule-import", title: "Import schedule", icon: ICONS.calendar,
+      keywords: "training plan json file upload schedule_sources sessions races",
+      summary: scheduleImportError ? "import failed" : null,
+      content: <ScheduleImportPanel onImportFile={onImportScheduleFile} importFileError={scheduleImportError} importFileNotice={scheduleImportNotice} /> },
 
     { id: "strava", title: "Strava connection", icon: ICONS.flame, iconColor: amber,
       keywords: "training calories oauth connect",
@@ -3791,12 +3830,11 @@ function ScheduleEntryEditor({ initialForm, isEdit, activityLibrary, onSave, onC
 }
 
 function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData,
-  onImportFile, importFileError, importFileNotice, matchOverrides, onSetMatchOverride,
+  matchOverrides, onSetMatchOverride,
   profile, setProfile, weightLog, matchedKcalRates }) {
   const [editor, setEditor] = useState(null); // null | { id: string|null, form }
   const [confirmDelete, setConfirmDelete] = useState(null); // null | { planned, dateKey }
   const [listView, setListView] = useState(null); // null | "races" | "single" | "recurring"
-  const [scheduleDragOver, setScheduleDragOver] = useState(false);
   const [editingMatchDay, setEditingMatchDay] = useState(null); // date key, or null
   // Both default on (undefined !== false) so existing profiles pick up the
   // new toggles already enabled — nothing changes until someone opts out.
@@ -4199,35 +4237,6 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
         );
       })()}
 
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.upload} size={16} color={cyan} /> Import schedule from file
-        </div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
-          Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file.
-          It's saved under <code>schedule_sources/</code> and re-imported automatically from then on
-          whenever that file's contents change — no need to come back here and re-upload it.
-        </div>
-        <div
-          onDragOver={(e) => { e.preventDefault(); setScheduleDragOver(true); }}
-          onDragLeave={() => setScheduleDragOver(false)}
-          onDrop={(e) => { e.preventDefault(); setScheduleDragOver(false); if (e.dataTransfer.files[0]) onImportFile(e.dataTransfer.files[0]); }}
-          style={{
-            border: `1.5px dashed ${scheduleDragOver ? cyan : line}`, borderRadius: 6, padding: "28px 20px",
-            textAlign: "center", background: scheduleDragOver ? "rgba(79,209,217,0.05)" : "transparent", transition: "all 0.15s",
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}><Icon path={ICONS.upload} size={22} color={dim} /></div>
-          <div style={{ fontSize: 13, marginBottom: 12 }}>Drop a .json schedule file here, or</div>
-          <label className="btn-ghost" style={{ display: "inline-block" }}>
-            Choose file
-            <input type="file" accept=".json,application/json" style={{ display: "none" }}
-              onChange={(e) => { if (e.target.files[0]) onImportFile(e.target.files[0]); e.target.value = ""; }} />
-          </label>
-        </div>
-        {importFileError && <Banner kind="error">{importFileError}</Banner>}
-        {!importFileError && importFileNotice && <Banner kind="success">{importFileNotice}</Banner>}
-      </div>
 
       {listView && (
         <Modal title="All sessions & races" onClose={() => setListView(null)} icon={ICONS.calendar}>

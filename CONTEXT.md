@@ -120,7 +120,8 @@ text filter on top that matches panel titles, per-panel `keywords`, and the pane
 (bodies stay mounted while collapsed, so drafts survive and search can see them). Open/closed state is a
 per-browser preference in `localStorage` (`panels:setup`, `panels:log`), not the server store.
 - Setup: Athlete profile, Training data (the "days of training data to pull" `rangeDays` selector +
-  manual "Pull training data" button), Strava, intervals.icu, Model tuning, Goal, App update.
+  manual "Pull training data" button), Import schedule (the `.json` plan drop zone that writes into
+  `schedule_sources/`), Strava, intervals.icu, Model tuning, Goal, App update.
 - Log: manual macros, weight, MacrosFirst API, CSV import. The stored nutrition / training / weight
   logs live behind the "Stored data…" button (a modal with one tab each). The training tab is
   read-only: every cached Strava + intervals.icu activity, with intervals.icu rows on Strava days dimmed

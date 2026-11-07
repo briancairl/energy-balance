@@ -1644,7 +1644,10 @@
         fetching: fetching || stravaFetching,
         fetchError,
         rangeDays,
-        setRangeDays
+        setRangeDays,
+        onImportScheduleFile: handleScheduleFile,
+        scheduleImportError,
+        scheduleImportNotice
       }
     ), tab === "import" && /* @__PURE__ */ React.createElement(
       ImportTab,
@@ -1681,9 +1684,6 @@
         onDelete: deleteScheduleEntry,
         stravaData,
         intervalsData,
-        onImportFile: handleScheduleFile,
-        importFileError: scheduleImportError,
-        importFileNotice: scheduleImportNotice,
         matchOverrides,
         onSetMatchOverride: setScheduleMatchOverride,
         profile,
@@ -1862,7 +1862,47 @@
       )
     );
   }
-  function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor, onFetch, fetching, fetchError, rangeDays, setRangeDays }) {
+  function ScheduleImportPanel({ onImportFile, importFileError, importFileNotice }) {
+    const [dragOver, setDragOver] = useState(false);
+    return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file. It's saved under ", /* @__PURE__ */ React.createElement("code", null, "schedule_sources/"), " and re-imported automatically from then on whenever that file's contents change \u2014 no need to come back here and re-upload it."), /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        onDragOver: (e) => {
+          e.preventDefault();
+          setDragOver(true);
+        },
+        onDragLeave: () => setDragOver(false),
+        onDrop: (e) => {
+          e.preventDefault();
+          setDragOver(false);
+          if (e.dataTransfer.files[0]) onImportFile(e.dataTransfer.files[0]);
+        },
+        style: {
+          border: `1.5px dashed ${dragOver ? cyan : line}`,
+          borderRadius: 6,
+          padding: "28px 20px",
+          textAlign: "center",
+          background: dragOver ? "rgba(79,209,217,0.05)" : "transparent",
+          transition: "all 0.15s"
+        }
+      },
+      /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "center", marginBottom: 10 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 22, color: dim })),
+      /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, marginBottom: 12 } }, "Drop a .json schedule file here, or"),
+      /* @__PURE__ */ React.createElement("label", { className: "btn-ghost", style: { display: "inline-block" } }, "Choose file", /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "file",
+          accept: ".json,application/json",
+          style: { display: "none" },
+          onChange: (e) => {
+            if (e.target.files[0]) onImportFile(e.target.files[0]);
+            e.target.value = "";
+          }
+        }
+      ))
+    ), importFileError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, importFileError), !importFileError && importFileNotice && /* @__PURE__ */ React.createElement(Banner, { kind: "success" }, importFileNotice));
+  }
+  function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor, onFetch, fetching, fetchError, rangeDays, setRangeDays, onImportScheduleFile, scheduleImportError, scheduleImportNotice }) {
     var _a, _b, _c;
     const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
     const units = profile.units || "metric";
@@ -1904,6 +1944,14 @@
         keywords: "pull fetch days history range strava intervals sync",
         summary: `${rangeDays} days`,
         content: /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "How many days of history the dashboard covers, and how far back a manual pull reaches into Strava and intervals.icu. Data is cached server-side by date, so a pull only re-fetches today plus any missing days."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "flex-end", gap: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(Field, { label: "Days of training data to pull" }, /* @__PURE__ */ React.createElement("select", { className: "inp", style: { width: 140 }, value: rangeDays, onChange: (e) => setRangeDays(parseInt(e.target.value)) }, /* @__PURE__ */ React.createElement("option", { value: 14 }, "14 days"), /* @__PURE__ */ React.createElement("option", { value: 21 }, "21 days"), /* @__PURE__ */ React.createElement("option", { value: 30 }, "30 days"), /* @__PURE__ */ React.createElement("option", { value: 60 }, "60 days"))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: onFetch, disabled: fetching }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.refresh, size: 13, color: ink }), fetching ? "Fetching\u2026" : "Pull training data")), lastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "intervals last synced ", new Date(lastFetched).toLocaleString()), fetchError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, fetchError))
+      },
+      {
+        id: "schedule-import",
+        title: "Import schedule",
+        icon: ICONS.calendar,
+        keywords: "training plan json file upload schedule_sources sessions races",
+        summary: scheduleImportError ? "import failed" : null,
+        content: /* @__PURE__ */ React.createElement(ScheduleImportPanel, { onImportFile: onImportScheduleFile, importFileError: scheduleImportError, importFileNotice: scheduleImportNotice })
       },
       {
         id: "strava",
@@ -2804,9 +2852,6 @@
     onDelete,
     stravaData,
     intervalsData,
-    onImportFile,
-    importFileError,
-    importFileNotice,
     matchOverrides,
     onSetMatchOverride,
     profile,
@@ -2818,7 +2863,6 @@
     const [editor, setEditor] = useState(null);
     const [confirmDelete, setConfirmDelete] = useState(null);
     const [listView, setListView] = useState(null);
-    const [scheduleDragOver, setScheduleDragOver] = useState(false);
     const [editingMatchDay, setEditingMatchDay] = useState(null);
     const showActual = profile.scheduleShowActual !== false;
     const showCalories = profile.scheduleShowCalories !== false;
@@ -3170,43 +3214,7 @@
           }
         ), a.activityType, " \xB7 ", a.durationMin, "m \xB7 ", a.name)))), mode === "auto" && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: dim, marginTop: 4 } }, "Auto-detected", actualNames.length ? ` \u2014 matched to "${actualNames.join('", "')}"` : " \u2014 no match found"));
       }), day.dayActuals.length === 0 && day.pairs.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim } }, "No Strava/intervals.icu activities synced for this day.")));
-    })(), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 16, color: cyan }), " Import schedule from file"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file. It's saved under ", /* @__PURE__ */ React.createElement("code", null, "schedule_sources/"), " and re-imported automatically from then on whenever that file's contents change \u2014 no need to come back here and re-upload it."), /* @__PURE__ */ React.createElement(
-      "div",
-      {
-        onDragOver: (e) => {
-          e.preventDefault();
-          setScheduleDragOver(true);
-        },
-        onDragLeave: () => setScheduleDragOver(false),
-        onDrop: (e) => {
-          e.preventDefault();
-          setScheduleDragOver(false);
-          if (e.dataTransfer.files[0]) onImportFile(e.dataTransfer.files[0]);
-        },
-        style: {
-          border: `1.5px dashed ${scheduleDragOver ? cyan : line}`,
-          borderRadius: 6,
-          padding: "28px 20px",
-          textAlign: "center",
-          background: scheduleDragOver ? "rgba(79,209,217,0.05)" : "transparent",
-          transition: "all 0.15s"
-        }
-      },
-      /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "center", marginBottom: 10 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.upload, size: 22, color: dim })),
-      /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, marginBottom: 12 } }, "Drop a .json schedule file here, or"),
-      /* @__PURE__ */ React.createElement("label", { className: "btn-ghost", style: { display: "inline-block" } }, "Choose file", /* @__PURE__ */ React.createElement(
-        "input",
-        {
-          type: "file",
-          accept: ".json,application/json",
-          style: { display: "none" },
-          onChange: (e) => {
-            if (e.target.files[0]) onImportFile(e.target.files[0]);
-            e.target.value = "";
-          }
-        }
-      ))
-    ), importFileError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, importFileError), !importFileError && importFileNotice && /* @__PURE__ */ React.createElement(Banner, { kind: "success" }, importFileNotice)), listView && /* @__PURE__ */ React.createElement(Modal, { title: "All sessions & races", onClose: () => setListView(null), icon: ICONS.calendar }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" } }, [["races", `Races (${races.length})`], ["single", `Single sessions (${singles.length})`], ["recurring", `Recurring (${recurring.length})`]].map(([id, label]) => /* @__PURE__ */ React.createElement("button", { key: id, className: `subtab ${listView === id ? "active" : ""}`, onClick: () => setListView(id) }, label)), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: () => openAdd(null), style: { padding: "7px 12px", fontSize: 12, marginLeft: "auto" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 13, color: ink }), " Add")), /* @__PURE__ */ React.createElement(
+    })(), listView && /* @__PURE__ */ React.createElement(Modal, { title: "All sessions & races", onClose: () => setListView(null), icon: ICONS.calendar }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" } }, [["races", `Races (${races.length})`], ["single", `Single sessions (${singles.length})`], ["recurring", `Recurring (${recurring.length})`]].map(([id, label]) => /* @__PURE__ */ React.createElement("button", { key: id, className: `subtab ${listView === id ? "active" : ""}`, onClick: () => setListView(id) }, label)), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: () => openAdd(null), style: { padding: "7px 12px", fontSize: 12, marginLeft: "auto" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 13, color: ink }), " Add")), /* @__PURE__ */ React.createElement(
       ScheduleEntryList,
       {
         entries: listView === "races" ? races : listView === "single" ? singles : recurring,

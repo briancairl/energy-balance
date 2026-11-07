@@ -169,6 +169,8 @@ def covered_by_existing(session_date, kept_entries):
         end = e.get("endDate")
         if end and iso > end:
             continue
+        if iso in (e.get("skipDates") or []):  # occurrence removed in the app
+            continue
         return True
     return False
 

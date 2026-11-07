@@ -103,7 +103,7 @@ src/js/app.js` confirms the compiled output is valid JS.
   protein/carbs/fat from there (keys `208`/`203`/`205`/`204`), falling back to the same-named
   top-level fields only if a nutrient key is missing (those top-level fields are marked
   deprecated in the API's own schema).
-- Manual flow: Log tab → "Sync now" (`/api/macrosfirst/sync`, POST) — fetches the last
+- Manual flow: Setup → Nutrition logging connection → "Sync now" (`/api/macrosfirst/sync`, POST) — fetches the last
   `MACROSFIRST_SYNC_LOOKBACK_DAYS` (35) days and merges directly into `nutrition-log`'s
   `macrosfirst` slot per date. No column mapping, no preview step — the API already returns
   structured macros.
@@ -112,6 +112,45 @@ src/js/app.js` confirms the compiled output is valid JS.
   uses. Re-fetching already-synced dates is intentional (cheap, and picks up corrections made
   in MacrosFirst after the fact) rather than something to "optimize" into an incremental sync.
   Last-run timestamp recorded at store key `macrosfirst-last-auto-sync`.
+
+## UI layout (Setup / Log)
+
+**Landing tab:** the app opens on the Dashboard when it's fully configured (athlete profile complete, i.e.
+BMR computable, and Strava connected + MacrosFirst configured; intervals.icu is optional for now), otherwise
+on Setup.
+`tab` starts as `null` ("Loading…") until the store and all three status checks have answered (8 s fallback
+to Setup); it's decided once and never overrides a tab the user already opened.
+
+**Dashboard "Sync now"** (`DashboardSyncBar`, rendered by `App` above `DashboardTab` so it shows even when the
+dashboard is empty): `syncAll()` runs `fetchIntervals()`, `fetchStrava()` and `syncMacrosFirst()` concurrently
+(full `rangeDays` window for training). Each source is skipped when not connected and reports its own error;
+the bar shows each connected source's last-sync time, and lists unconnected ones with a link to Setup.
+
+Setup and Log are each a vertical list of collapsible panels (`PanelList` in `app-source.jsx`) with a
+text filter on top that matches panel titles, per-panel `keywords`, and the panel body's full text
+(bodies stay mounted while collapsed, so drafts survive and search can see them). Open/closed state is a
+per-browser preference in `localStorage` (`panels:setup`, `panels:log`), not the server store.
+- Setup: Athlete profile, Training data (the "days of training data to pull" `rangeDays` selector +
+  manual "Pull training data" button), Import schedule (the `.json` plan drop zone that writes into
+  `schedule_sources/`), Training connections (Strava + intervals.icu status in one panel), Nutrition
+  logging connection (MacrosFirst status + "Sync now"), Model tuning, Goal, App update.
+- Log: manual macros, weight, CSV import. The stored nutrition / training / weight
+  logs live behind the "Stored data…" button (a modal with one tab each). The training tab is
+  read-only: every cached Strava + intervals.icu activity, with intervals.icu rows on Strava days dimmed
+  (the model ignores them there).
+- Schedule: the calendar has two views (per-browser `localStorage` key `schedule-view`): **Month** (default;
+  4-week grid from this Sunday) and **Week** (one Sunday–Saturday week as a column of day rows, all as tall as
+  the week's busiest day; sessions stack vertically with the matched actual beside each, like the grid; the list
+  scrolls with the page; ‹ "Week of …" › navigation and a Today button; `weekOffset` is relative to this week).
+  Both share the same day/chip rendering.
+  The calendar is the editor. Hovering a day shows **+** (add a session or race there, in a
+  pop-up `ScheduleEntryEditor`); hovering a planned chip shows a trash icon (confirm dialog); clicking a chip
+  opens it for editing (the pop-up also has Delete, which is how phones delete — the chip trash is hidden
+  under 700px, except in Week view). The full Races / Single / Recurring lists live behind "All sessions & races".
+- Pop-outs (`Modal`) are capped at the viewport height: title and sub-tabs (`toolbar` prop) stay fixed and
+  only the body scrolls (table headers are sticky inside it).
+  Deleting one occurrence of a recurring session ("Skip this day only") adds the date to the entry's
+  `skipDates`, honoured by `getScheduledSessionsForDate` and by `schedule_sync.covered_by_existing`.
 
 ## Data model — things that aren't obvious from a schema alone
 

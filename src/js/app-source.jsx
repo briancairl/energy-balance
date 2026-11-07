@@ -466,6 +466,8 @@ function getScheduledSessionsForDate(schedule, dateStr) {
     if (!s.daysOfWeek.includes(weekday)) return false;
     if (dateStr < s.startDate) return false;
     if (s.endDate && dateStr > s.endDate) return false;
+    // Occurrences removed one at a time from the calendar ("skip this day").
+    if (Array.isArray(s.skipDates) && s.skipDates.includes(dateStr)) return false;
     return true;
   });
 }
@@ -1068,6 +1070,12 @@ const ICONS = {
   trophy: "M8 21h8M12 17v4M7 4h10v4a5 5 0 01-10 0V4zM7 4H3v2a4 4 0 004 4M17 4h4v2a4 4 0 01-4 4",
   sun: "M12 17a5 5 0 100-10 5 5 0 000 10zM12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42",
   moon: "M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z",
+  user: "M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2M12 11a4 4 0 100-8 4 4 0 000 8z",
+  download: "M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3",
+  search: "M11 19a8 8 0 100-16 8 8 0 000 16zM21 21l-4.35-4.35",
+  chevronRight: "M9 18l6-6-6-6",
+  chevronLeft: "M15 18l-6-6 6-6",
+  database: "M12 8c4.97 0 9-1.34 9-3s-4.03-3-9-3-9 1.34-9 3 4.03 3 9 3zM21 12c0 1.66-4 3-9 3s-9-1.34-9-3M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5",
 };
 
 // Shared severity palette for goal-weight warnings — reuses the same
@@ -1099,7 +1107,9 @@ function Banner({ kind = "info", children }) {
 }
 
 function App() {
-  const [tab, setTab] = useState("setup");
+  // null until the startup checks below decide the landing tab: Dashboard
+  // when everything is set up, Setup otherwise.
+  const [tab, setTab] = useState(null);
   const [theme, setTheme] = useState(() => (document.documentElement.dataset.theme === "light" ? "light" : "dark"));
   const toggleTheme = useCallback(() => {
     setTheme((prev) => {
@@ -1311,6 +1321,23 @@ function App() {
     () => calcBMR(profile.sex, parseFloat(profile.weightKg), parseFloat(profile.heightCm), parseFloat(profile.age)),
     [profile.sex, profile.weightKg, profile.heightCm, profile.age]
   );
+
+  // Landing tab: once the store has loaded and every connection check has
+  // answered, open the Dashboard if the app is fully configured (athlete
+  // profile complete + Strava and MacrosFirst connected; intervals.icu is
+  // optional for now), otherwise Setup. Decided once; never overrides a tab
+  // the user already picked.
+  const fullyConfigured = !!bmr && stravaStatus.connected === true && macrosfirstStatus.connected === true;
+  useEffect(() => {
+    if (tab !== null) return;
+    if (!loaded || !stravaStatus.checked || !intervalsStatus.checked || !macrosfirstStatus.checked) return;
+    setTab(fullyConfigured ? "dashboard" : "setup");
+  }, [tab, loaded, stravaStatus.checked, intervalsStatus.checked, macrosfirstStatus.checked, fullyConfigured]);
+  // Safety net: if a status check never answers, don't sit on "Loading…".
+  useEffect(() => {
+    const t = setTimeout(() => setTab((cur) => cur ?? "setup"), 8000);
+    return () => clearTimeout(t);
+  }, []);
 
   const goalParams = useMemo(() => getGoalParams(profile), [profile.goal, profile.buildRatePct, profile.loseRatePct]);
   const targetWindowDays = getTargetWindowDays(profile);
@@ -1586,6 +1613,22 @@ function App() {
     // network calls happen for days already cached, on either end.
     await Promise.all([fetchIntervals(), fetchStrava()]);
     setTab("dashboard");
+  }
+
+  // Dashboard "Sync now": refreshes the training caches (Strava +
+  // intervals.icu, full rangeDays window) and the MacrosFirst nutrition log
+  // at the same time. Each source is skipped if it isn't connected, and each
+  // reports its own error (fetchError / stravaError / macrosfirstError).
+  const [syncAllRunning, setSyncAllRunning] = useState(false);
+  const [syncAllFinishedAt, setSyncAllFinishedAt] = useState(null);
+  async function syncAll() {
+    setSyncAllRunning(true);
+    try {
+      await Promise.all([fetchIntervals(), fetchStrava(), syncMacrosFirst()]);
+    } finally {
+      setSyncAllRunning(false);
+      setSyncAllFinishedAt(new Date().toISOString());
+    }
   }
 
   // Personalized kcal/min rates learned from this athlete's own matched
@@ -2086,6 +2129,23 @@ function App() {
         input, select, button { font-family: ${body}; }
         input:focus, select:focus { outline: 2px solid ${cyan}; outline-offset: 1px; }
         .card { background: ${panel}; border: 1px solid ${line}; border-radius: 6px; }
+        .panel-head { width: 100%; display: flex; align-items: center; gap: 9px; padding: 16px 22px; background: none; border: none; color: ${paper}; cursor: pointer; text-align: left; font: inherit; flex-wrap: wrap; }
+        .panel-head:hover { background: ${panel2}; }
+        .panel-head:focus-visible { outline: 2px solid ${cyan}; outline-offset: -2px; }
+        .panel-summary { margin-left: auto; font-size: 11.5px; color: ${dim}; font-family: ${mono}; }
+        .cal-day { position: relative; }
+        .cal-add, .chip-del { opacity: 0; transition: opacity 0.12s; }
+        .cal-day:hover .cal-add, .cal-add:focus-visible { opacity: 1; }
+        .cal-chip-wrap { position: relative; min-width: 0; }
+        .cal-chip-wrap:hover .chip-del, .chip-del:focus-visible { opacity: 1; }
+        @media (hover: none) { .cal-add, .chip-del { opacity: 1; } }
+        @media (max-width: 700px) { .chip-del { display: none; } }
+        .modal-body table.data thead th { position: sticky; top: 0; background: ${panel}; z-index: 1; }
+        .cal-week .cal-chip-text { display: inline !important; }
+        .cal-week .cal-chip-emoji { display: none !important; }
+        @media (max-width: 700px) { .cal-week .chip-del { display: flex; } }
+        .subtab { padding: 7px 14px; border-radius: 4px; font-size: 12.5px; font-weight: 600; cursor: pointer; border: 1px solid ${line}; background: transparent; color: ${dim}; }
+        .subtab.active { background: ${panel2}; color: ${cyan}; border-color: ${cyan}; }
         .fieldlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: ${dim}; margin-bottom: 6px; display:block; font-weight:600; }
         .inp { width: 100%; background: ${panel2}; border: 1px solid ${line}; color: ${paper}; border-radius: 4px; padding: 9px 10px; font-size: 14px; font-family: ${mono}; }
         .navbtn { display:flex; align-items:center; gap:8px; padding: 10px 14px; border-radius: 5px; cursor:pointer; font-size:13px; font-weight:600; border:1px solid transparent; }
@@ -2165,25 +2225,41 @@ function App() {
             goalParams={goalParams} trendCorrection={trendCorrection}
             weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus}
             imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={recalibrateIronman}
-            imGoalFloor={ironmanStatus ? ironmanStatus.goalFloor : null} />
+            imGoalFloor={ironmanStatus ? ironmanStatus.goalFloor : null}
+            onFetch={pullAll} fetching={fetching || stravaFetching} fetchError={fetchError}
+            rangeDays={rangeDays} setRangeDays={setRangeDays}
+            onImportScheduleFile={handleScheduleFile} scheduleImportError={scheduleImportError}
+            scheduleImportNotice={scheduleImportNotice}
+            macrosfirstStatus={macrosfirstStatus} macrosfirstFetching={macrosfirstFetching}
+            macrosfirstError={macrosfirstError} onSyncMacrosFirst={syncMacrosFirst} macrosfirstLastAutoSync={macrosfirstLastAutoSync} />
         )}
         {tab === "import" && (
           <ImportTab onFile={handleCSVFile} csvPreview={csvPreview} colMap={colMap} setColMap={setColMap}
             onImport={importMappedCSV} nutrition={nutrition} onSaveManualDay={saveManualDay}
             onDeleteDay={deleteNutritionDay} weightLog={weightLog} onSaveWeight={saveManualWeight}
-            onDeleteWeight={deleteWeightDay} macrosfirstStatus={macrosfirstStatus} macrosfirstFetching={macrosfirstFetching}
-            macrosfirstError={macrosfirstError} onSyncMacrosFirst={syncMacrosFirst} macrosfirstLastAutoSync={macrosfirstLastAutoSync}
-            onFetch={pullAll} fetching={fetching || stravaFetching} fetchError={fetchError}
-            rangeDays={rangeDays} setRangeDays={setRangeDays} lastFetched={lastFetched}
-            importError={importError} importNotice={importNotice} units={units} />
+            onDeleteWeight={deleteWeightDay}
+            importError={importError} importNotice={importNotice} units={units}
+            stravaData={stravaData} intervalsData={intervalsData} kcalOverrides={kcalOverrides} />
         )}
         {tab === "schedule" && (
           <ScheduleTab schedule={schedule} onAdd={addScheduleEntry} onUpdate={updateScheduleEntry}
             onDelete={deleteScheduleEntry} stravaData={stravaData} intervalsData={intervalsData}
-            onImportFile={handleScheduleFile} importFileError={scheduleImportError}
-            importFileNotice={scheduleImportNotice} matchOverrides={matchOverrides}
+            matchOverrides={matchOverrides}
             onSetMatchOverride={setScheduleMatchOverride} profile={profile} setProfile={setProfile}
             weightLog={weightLog} matchedKcalRates={matchedKcalRates} />
+        )}
+        {tab === null && (
+          <div style={{ fontSize: 12.5, color: dim, padding: "40px 0", textAlign: "center" }}>Loading…</div>
+        )}
+        {tab === "dashboard" && (
+          <DashboardSyncBar onSync={syncAll} running={syncAllRunning || fetching || stravaFetching || macrosfirstFetching}
+            finishedAt={syncAllFinishedAt}
+            sources={[
+              { name: "Strava", connected: !!stravaStatus.connected, lastSynced: stravaLastFetched, error: stravaError },
+              { name: "intervals.icu", connected: !!intervalsStatus.configured, lastSynced: lastFetched, error: fetchError },
+              { name: "MacrosFirst", connected: !!macrosfirstStatus.connected, lastSynced: macrosfirstLastAutoSync, error: macrosfirstError },
+            ]}
+            onOpenSetup={() => setTab("setup")} />
         )}
         {tab === "dashboard" && (
           <DashboardTab rows={dailyRows} summary={summary} bmr={bmr} fuelingByTier={fuelingByTier}
@@ -2233,15 +2309,188 @@ function ConfirmRange({ value, onCommit, format = (v) => v, ...rangeProps }) {
   );
 }
 
-function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor }) {
+// ---------- collapsible panel list (Setup / Log) ----------
+// Each page is a vertical list of collapsible panels with a text filter on
+// top. Open/closed state is a per-browser UI preference, so it lives in
+// localStorage (not the server store) and is wrapped in try/catch — private
+// windows can throw on access. Panel bodies stay mounted while collapsed
+// (display: none) so half-typed drafts inside them survive a collapse, and so
+// the filter can search a panel's full text, not just its title.
+function readPanelState(storageKey) {
+  try { return JSON.parse(localStorage.getItem(`panels:${storageKey}`) || "null") || {}; } catch { return {}; }
+}
+function writePanelState(storageKey, state) {
+  try { localStorage.setItem(`panels:${storageKey}`, JSON.stringify(state)); } catch { /* ignore */ }
+}
+
+function PanelList({ storageKey, panels, placeholder = "Filter panels…", toolbar = null }) {
+  const [saved, setSaved] = useState(() => readPanelState(storageKey));
+  const [query, setQuery] = useState("");
+  // While filtering, matching panels open automatically; this tracks the ones
+  // the user explicitly closed during the current search.
+  const [searchClosed, setSearchClosed] = useState({});
+  const bodyRefs = useRef({});
+  useEffect(() => { setSearchClosed({}); }, [query]);
+
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const searching = terms.length > 0;
+  const shown = panels.filter((p) => p && !p.hidden);
+  const matches = (p) => {
+    if (!searching) return true;
+    const hay = `${p.title} ${p.keywords || ""} ${bodyRefs.current[p.id]?.textContent || ""}`.toLowerCase();
+    return terms.every((t) => hay.includes(t));
+  };
+  const isOpen = (p) => (searching ? !searchClosed[p.id] : (saved[p.id] ?? !!p.defaultOpen));
+  const persist = (next) => { setSaved(next); writePanelState(storageKey, next); };
+  const toggle = (p) => {
+    if (searching) setSearchClosed((c) => ({ ...c, [p.id]: !c[p.id] }));
+    else persist({ ...saved, [p.id]: !isOpen(p) });
+  };
+  const setAll = (open) => {
+    if (searching) { setSearchClosed(open ? {} : Object.fromEntries(shown.map((p) => [p.id, true]))); return; }
+    persist(Object.fromEntries(shown.map((p) => [p.id, open])));
+  };
+  const visibleCount = shown.filter(matches).length;
+
+  return (
+    <div style={{ display: "grid", gap: 12 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <div style={{ position: "relative", flex: "1 1 280px" }}>
+          <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", display: "flex", pointerEvents: "none" }}>
+            <Icon path={ICONS.search} size={14} color={dim} />
+          </span>
+          <input className="inp" type="search" value={query} onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Escape") setQuery(""); }}
+            placeholder={placeholder} aria-label="Filter panels" style={{ paddingLeft: 32 }} />
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className="btn-ghost" onClick={() => setAll(true)} style={{ padding: "8px 12px", fontSize: 12 }}>Expand all</button>
+          <button className="btn-ghost" onClick={() => setAll(false)} style={{ padding: "8px 12px", fontSize: 12 }}>Collapse all</button>
+          {toolbar}
+        </div>
+      </div>
+      {searching && visibleCount === 0 && (
+        <div style={{ fontSize: 12.5, color: dim, padding: "4px 2px" }}>No panels match “{query.trim()}”.</div>
+      )}
+      {shown.map((p) => {
+        const open = isOpen(p);
+        return (
+          <div key={p.id} className="card" style={{ display: matches(p) ? "block" : "none" }}>
+            <button className="panel-head" onClick={() => toggle(p)} aria-expanded={open}>
+              <span style={{ display: "flex", transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}>
+                <Icon path={ICONS.chevronRight} size={14} color={dim} />
+              </span>
+              {p.icon && <Icon path={p.icon} size={16} color={p.iconColor || cyan} />}
+              <span style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15 }}>{p.title}</span>
+              {p.summary && <span className="panel-summary">{p.summary}</span>}
+            </button>
+            <div ref={(el) => { bodyRefs.current[p.id] = el; }} style={{ display: open ? "block" : "none", padding: "2px 22px 22px" }}>
+              {p.content}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Full-screen-ish overlay for the "advanced" stored-data views. Closes on
+// Escape or a click on the backdrop.
+const modalStack = [];
+// The pop-out is capped at the viewport height: its title (and optional
+// `toolbar`, e.g. sub-tabs) stay put while only the body scrolls, so long
+// lists never push the header off-screen. `scrollKey` resets the body to the
+// top when it changes (e.g. switching tabs).
+function Modal({ title, onClose, children, icon = ICONS.database, iconColor = cyan, maxWidth = 1100, toolbar = null, scrollKey }) {
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const bodyRef = useRef(null);
+  useEffect(() => { if (bodyRef.current) bodyRef.current.scrollTop = 0; }, [scrollKey]);
+  useEffect(() => {
+    // Modals can stack (e.g. the editor opened from the schedule list), so
+    // Escape only closes the topmost one.
+    const token = {};
+    modalStack.push(token);
+    const onKey = (e) => { if (e.key === "Escape" && modalStack[modalStack.length - 1] === token) onCloseRef.current(); };
+    window.addEventListener("keydown", onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      modalStack.splice(modalStack.indexOf(token), 1);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, []);
+  return (
+    <div onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ position: "fixed", inset: 0, zIndex: 100, background: "rgba(0,0,0,0.55)", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: "clamp(8px, 4vh, 48px) clamp(8px, 3vw, 32px)" }}>
+      <div role="dialog" aria-modal="true" aria-label={title} className="card"
+        style={{ width: "100%", maxWidth, maxHeight: "100%", display: "flex", flexDirection: "column", boxShadow: "0 18px 48px rgba(0,0,0,0.5)", overflow: "hidden" }}>
+        <div style={{ padding: "22px 22px 0", flexShrink: 0 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12 }}>
+          <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 16, display: "flex", alignItems: "center", gap: 8 }}>
+            <Icon path={icon} size={16} color={iconColor} /> {title}
+          </div>
+          <button onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 }}>×</button>
+        </div>
+        {toolbar}
+        </div>
+        <div ref={bodyRef} className="modal-body" style={{ overflowY: "auto", overscrollBehavior: "contain", minHeight: 0, flex: "1 1 auto", padding: "0 22px 22px" }}>
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Drop zone for a training-plan / schedule .json (Setup → Import schedule).
+function ScheduleImportPanel({ onImportFile, importFileError, importFileNotice }) {
+  const [dragOver, setDragOver] = useState(false);
+  return (
+    <>
+      <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+        Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file.
+        It's saved under <code>schedule_sources/</code> and re-imported automatically from then on
+        whenever that file's contents change — no need to come back here and re-upload it.
+      </div>
+      <div
+        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => { e.preventDefault(); setDragOver(false); if (e.dataTransfer.files[0]) onImportFile(e.dataTransfer.files[0]); }}
+        style={{
+          border: `1.5px dashed ${dragOver ? cyan : line}`, borderRadius: 6, padding: "28px 20px",
+          textAlign: "center", background: dragOver ? "rgba(79,209,217,0.05)" : "transparent", transition: "all 0.15s",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}><Icon path={ICONS.upload} size={22} color={dim} /></div>
+        <div style={{ fontSize: 13, marginBottom: 12 }}>Drop a .json schedule file here, or</div>
+        <label className="btn-ghost" style={{ display: "inline-block" }}>
+          Choose file
+          <input type="file" accept=".json,application/json" style={{ display: "none" }}
+            onChange={(e) => { if (e.target.files[0]) onImportFile(e.target.files[0]); e.target.value = ""; }} />
+        </label>
+      </div>
+      {importFileError && <Banner kind="error">{importFileError}</Banner>}
+      {!importFileError && importFileNotice && <Banner kind="success">{importFileNotice}</Banner>}
+    </>
+  );
+}
+
+function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaError, stravaLastFetched, stravaSyncedCount, intervalsStatus, intervalsSyncedCount, goalParams, trendCorrection, weightTrendAvg, weightGoalStatus, imCal, imCalibrating, imCalError, onRecalibrate, imGoalFloor, onFetch, fetching, fetchError, rangeDays, setRangeDays, onImportScheduleFile, scheduleImportError, scheduleImportNotice, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync }) {
   const set = (k) => (e) => setProfile((p) => ({ ...p, [k]: e.target.value }));
   const units = profile.units || "metric";
   const [weightText, onWeightChange] = useUnitInput(profile.weightKg, units, kgToDisplay, displayToKg, 1);
   const [heightText, onHeightChange] = useUnitInput(profile.heightCm, units, cmToDisplayLen, displayToCm, 1);
-  return (
-    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16 }}>Athlete profile</div>
+  const stravaSummary = !stravaStatus.checked ? "checking…" : stravaStatus.connected ? "connected" : "not connected";
+  const mfSummary = !macrosfirstStatus.checked ? "checking…"
+    : macrosfirstStatus.unreachable ? "server unreachable"
+    : macrosfirstStatus.configError ? "not configured" : "connected";
+  const intervalsSummary = !intervalsStatus.checked ? "checking…" : intervalsStatus.configured ? "configured" : "not configured";
+  const panels = [
+    { id: "profile", title: "Athlete profile", icon: ICONS.user, defaultOpen: true,
+      keywords: "sex weight height age bmr mifflin",
+      summary: bmr ? `BMR ${fmt(bmr)} kcal` : null,
+      content: (<>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 14 }}>
           <Field label="Sex">
             <select className="inp" value={profile.sex} onChange={set("sex")}>
@@ -2266,11 +2515,45 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
             Mifflin-St Jeor BMR: <b>{fmt(bmr)} kcal/day</b>
           </div>
         )}
-      </div>
+      </>) },
 
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.flame} size={16} color={amber} /> Training calories — Strava
+    { id: "training-data", title: "Training data", icon: ICONS.refresh, defaultOpen: true,
+      keywords: "pull fetch days history range strava intervals sync",
+      summary: `${rangeDays} days`,
+      content: (<>
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+          How many days of history the dashboard covers, and how far back a manual pull reaches into Strava and
+          intervals.icu. Data is cached server-side by date, so a pull only re-fetches today plus any missing days.
+        </div>
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 14, flexWrap: "wrap" }}>
+          <Field label="Days of training data to pull">
+            <select className="inp" style={{ width: 140 }} value={rangeDays} onChange={(e) => setRangeDays(parseInt(e.target.value))}>
+              <option value={14}>14 days</option>
+              <option value={21}>21 days</option>
+              <option value={30}>30 days</option>
+              <option value={60}>60 days</option>
+            </select>
+          </Field>
+          <button className="btn-primary" onClick={onFetch} disabled={fetching}>
+            <Icon path={ICONS.refresh} size={13} color={ink} />
+            {fetching ? "Fetching…" : "Pull training data"}
+          </button>
+        </div>
+        {lastFetched && <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>intervals last synced {new Date(lastFetched).toLocaleString()}</div>}
+        {fetchError && <Banner kind="error">{fetchError}</Banner>}
+      </>) },
+
+    { id: "schedule-import", title: "Import schedule", icon: ICONS.calendar,
+      keywords: "training plan json file upload schedule_sources sessions races",
+      summary: scheduleImportError ? "import failed" : null,
+      content: <ScheduleImportPanel onImportFile={onImportScheduleFile} importFileError={scheduleImportError} importFileNotice={scheduleImportNotice} /> },
+
+    { id: "training-connections", title: "Training connections", icon: ICONS.link,
+      keywords: "strava intervals.icu intervals training calories oauth connect optional wellness tsb ctl atl api key",
+      summary: `Strava ${stravaSummary} · intervals.icu ${intervalsSummary}`,
+      content: (<>
+        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 6, display: "flex", alignItems: "center", gap: 7 }}>
+          <Icon path={ICONS.flame} size={15} color={amber} /> Strava
         </div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
           Strava only exposes accurate per-activity <code>calories</code> through an authenticated,
@@ -2307,10 +2590,11 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
             <span>{stravaError}</span>
           </div>
         )}
-      </div>
 
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>intervals.icu connection <span style={{ color: dim, fontWeight: 400 }}>(optional — wellness / TSB only)</span></div>
+        <div style={{ borderTop: `1px solid ${line}`, margin: "20px 0 16px" }} />
+        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 6, display: "flex", alignItems: "center", gap: 7 }}>
+          <Icon path={ICONS.activity} size={15} color={cyan} /> intervals.icu <span style={{ color: dim, fontWeight: 400, fontSize: 12.5 }}>(optional — wellness / TSB only)</span>
+        </div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
           Used only for CTL/ATL/TSB (recovery buffer below) and as a calorie fallback on days Strava has no
           data. Fetched and cached server-side too, the same way as Strava — add <code>intervals_api_key</code>
@@ -2330,12 +2614,45 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
           <div style={{ fontSize: 12.5, color: dim }}>Not configured — add <code>intervals_api_key</code> to <code>config.json</code> and restart the server to enable this.</div>
         )}
         {lastFetched && <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>last synced {new Date(lastFetched).toLocaleString()} · {intervalsSyncedCount} day{intervalsSyncedCount === 1 ? "" : "s"} covered</div>}
-      </div>
+      </>) },
 
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 16, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.gauge} size={16} color={amber} /> Model tuning
+    { id: "macrosfirst", title: "Nutrition logging connection", icon: ICONS.upload,
+      keywords: "macrosfirst macros first api sync nutrition import automatic token",
+      summary: mfSummary,
+      content: (<>
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+          MacrosFirst — pulls your daily log directly from MacrosFirst's personal API, through
+          <code> server.py</code>. See <code>config.example.json</code> for setup.
         </div>
+        {!macrosfirstStatus.checked ? (
+          <div style={{ fontSize: 12.5, color: dim }}>Checking connection…</div>
+        ) : macrosfirstStatus.unreachable ? (
+          <div style={{ fontSize: 12.5, color: coral }}>Can't reach the local server. Make sure you're running this page via <code>python3 server.py</code>, not a plain file server.</div>
+        ) : macrosfirstStatus.configError ? (
+          <div style={{ fontSize: 12.5, color: coral }}>Not configured — add <code>macrosfirst_api_token</code> to <code>config.json</code> and restart the server.</div>
+        ) : (
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                <Icon path={ICONS.check} size={15} color={mint} /><span>Connected</span>
+              </div>
+              <button className="btn-primary" onClick={onSyncMacrosFirst} disabled={macrosfirstFetching}>
+                <Icon path={ICONS.refresh} size={13} color={ink} /> {macrosfirstFetching ? "Syncing…" : "Sync now"}
+              </button>
+            </div>
+            <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>
+              {macrosfirstLastAutoSync
+                ? `Last automatic sync: ${new Date(macrosfirstLastAutoSync).toLocaleString()}`
+                : "No automatic sync yet — runs daily (set macrosfirst_sync_time in config.json, default 04:00), or click \"Sync now\"."}
+            </div>
+          </div>
+        )}
+        {macrosfirstError && <Banner kind="error">{macrosfirstError}</Banner>}
+      </>) },
+
+    { id: "tuning", title: "Model tuning", icon: ICONS.gauge, iconColor: amber,
+      keywords: "neat epoc protein carb preload fat floor debt fatigue buffer tsb sliders",
+      content: (<>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 20 }}>
           <Field label="Non-training activity (NEAT)">
             <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
@@ -2417,20 +2734,26 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
           <input type="checkbox" checked={profile.fatigueBuffer} onChange={(e) => setProfile((p) => ({ ...p, fatigueBuffer: e.target.checked }))} />
           Add a +5% BMR recovery buffer on days with a strongly negative training stress balance (TSB &lt; −10)
         </label>
-      </div>
+        <div style={{ display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start", marginTop: 18 }}>
+          <Icon path={ICONS.info} size={14} color={dim} />
+          <div>BMR uses the Mifflin-St Jeor equation. The training and recovery adjustments beyond that are heuristics commonly used in endurance-coaching practice, not a single peer-reviewed formula — tune the sliders above to match how your coach or experience calibrates it.</div>
+        </div>
+      </>) },
 
-      <GoalCard profile={profile} setProfile={setProfile} goalParams={goalParams} trendCorrection={trendCorrection}
-        weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus} imGoalFloor={imGoalFloor}
-        imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={onRecalibrate} />
+    { id: "goal", title: "Goal", icon: ICONS.trophy, iconColor: amber,
+      keywords: "maintain build lose rate target weight trend calibration window ironman",
+      summary: goalParams?.label || null,
+      content: (
+        <GoalCard profile={profile} setProfile={setProfile} goalParams={goalParams} trendCorrection={trendCorrection}
+          weightTrendAvg={weightTrendAvg} weightGoalStatus={weightGoalStatus} imGoalFloor={imGoalFloor}
+          imCal={imCal} imCalibrating={imCalibrating} imCalError={imCalError} onRecalibrate={onRecalibrate} />
+      ) },
 
-      <UpdateCard />
-
-      <div style={{ display: "flex", gap: 8, fontSize: 12, color: dim, alignItems: "flex-start" }}>
-        <Icon path={ICONS.info} size={14} color={dim} />
-        <div>BMR uses the Mifflin-St Jeor equation. The training and recovery adjustments beyond that are heuristics commonly used in endurance-coaching practice, not a single peer-reviewed formula — tune the sliders above to match how your coach or experience calibrates it.</div>
-      </div>
-    </div>
-  );
+    { id: "update", title: "App update", icon: ICONS.download,
+      keywords: "update upgrade git pull docker rebuild version",
+      content: <UpdateCard /> },
+  ];
+  return <PanelList storageKey="setup" panels={panels} placeholder="Search setup (strava, protein, goal…)" />;
 }
 
 // "Update" button: asks the host to pull origin/main and re-run docker
@@ -2499,10 +2822,7 @@ function UpdateCard() {
   const stale = waitingOnHost && info?.pending && Date.now() - requestedAt > UPDATE_STALE_MS;
   const st = info?.status;
   return (
-    <div className="card" style={{ padding: 22 }}>
-      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-        <Icon path={ICONS.refresh} size={16} color={cyan} /> App update
-      </div>
+    <div>
       <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
         Pulls the latest <code>origin/main</code> and rebuilds/restarts the Docker container — only if main has
         moved since the last update. Runs on the host via the watcher <code>install.sh</code> sets up (or run
@@ -2557,10 +2877,7 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
   const [targetWeightText, onTargetWeightChange] = useUnitInput(profile.targetWeightKg, units, kgToDisplay, displayToKg, 1);
 
   return (
-    <div className="card" style={{ padding: 22 }}>
-      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-        <Icon path={ICONS.flame} size={16} color={amber} /> Goal
-      </div>
+    <div>
       <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.6 }}>
         Shifts your daily Target (shown alongside modeled TDEE on the dashboard) by a steady surplus or
         deficit for 2–3x/week lifting. Defaults: ~0.25%/week gain (a common lean-bulk ceiling for
@@ -2711,75 +3028,24 @@ function IronmanModeSettings({ profile, setProfile, imCal, imCalibrating, imCalE
   );
 }
 
-function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, macrosfirstStatus, macrosfirstFetching, macrosfirstError, onSyncMacrosFirst, macrosfirstLastAutoSync, onFetch, fetching, fetchError, rangeDays, setRangeDays, lastFetched, importError, importNotice, units }) {
+function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, importError, importNotice, units, stravaData, intervalsData, kcalOverrides }) {
   const [dragOver, setDragOver] = useState(false);
+  const [storedView, setStoredView] = useState(null); // null | "nutrition" | "training" | "weight"
   const dayCount = Object.keys(nutrition).length;
   const weightCount = Object.keys(weightLog).length;
-  return (
-    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
-      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-          <Field label="Days of history">
-            <select className="inp" style={{ width: 120 }} value={rangeDays} onChange={(e) => setRangeDays(parseInt(e.target.value))}>
-              <option value={14}>14 days</option>
-              <option value={21}>21 days</option>
-              <option value={30}>30 days</option>
-              <option value={60}>60 days</option>
-            </select>
-          </Field>
-          <button className="btn-primary" style={{ marginTop: 18 }} onClick={onFetch} disabled={fetching}>
-            <Icon path={ICONS.refresh} size={13} color={ink} />
-            {fetching ? "Fetching…" : "Pull training data"}
-          </button>
-          {lastFetched && <div style={{ marginTop: 18, fontSize: 11.5, color: dim, fontFamily: mono }}>intervals last synced {new Date(lastFetched).toLocaleString()}</div>}
-        </div>
-        {fetchError && (
-          <div style={{ marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 }}>
-            <Icon path={ICONS.warn} size={15} color={coral} />
-            <span>{fetchError}</span>
-          </div>
-        )}
-      </div>
-
-      <ManualEntryCard nutrition={nutrition} onSave={onSaveManualDay} />
-      <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} units={units} />
-
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.upload} size={16} color={cyan} /> MacrosFirst API
-        </div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
-          Pulls your daily log directly from MacrosFirst's personal API, through
-          <code> server.py</code>. See <code>config.example.json</code> for setup.
-        </div>
-        {!macrosfirstStatus.checked ? (
-          <div style={{ fontSize: 12.5, color: dim }}>Checking connection…</div>
-        ) : macrosfirstStatus.unreachable ? (
-          <div style={{ fontSize: 12.5, color: coral }}>Can't reach the local server. Make sure you're running this page via <code>python3 server.py</code>, not a plain file server.</div>
-        ) : macrosfirstStatus.configError ? (
-          <div style={{ fontSize: 12.5, color: coral }}>Not configured — add <code>macrosfirst_api_token</code> to <code>config.json</code> and restart the server.</div>
-        ) : (
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-                <Icon path={ICONS.check} size={15} color={mint} /><span>Connected</span>
-              </div>
-              <button className="btn-primary" onClick={onSyncMacrosFirst} disabled={macrosfirstFetching}>
-                <Icon path={ICONS.refresh} size={13} color={ink} /> {macrosfirstFetching ? "Syncing…" : "Sync now"}
-              </button>
-            </div>
-            <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>
-              {macrosfirstLastAutoSync
-                ? `Last automatic sync: ${new Date(macrosfirstLastAutoSync).toLocaleString()}`
-                : "No automatic sync yet — runs daily (set macrosfirst_sync_time in config.json, default 04:00), or click \"Sync now\"."}
-            </div>
-          </div>
-        )}
-        {macrosfirstError && <Banner kind="error">{macrosfirstError}</Banner>}
-      </div>
-
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Or import a CSV manually</div>
+  const trainingCount = stravaData.activities.length + intervalsData.activities.length;
+  const panels = [
+    { id: "manual-nutrition", title: "Enter a day's macros", icon: ICONS.plus, defaultOpen: true,
+      keywords: "nutrition protein carbs fat calories manual intake food",
+      content: <ManualEntryCard nutrition={nutrition} onSave={onSaveManualDay} /> },
+    { id: "weight", title: "Log weight", icon: ICONS.plus, defaultOpen: true,
+      keywords: "weigh-in body weight scale",
+      summary: weightCount ? `${weightCount} day${weightCount === 1 ? "" : "s"} logged` : null,
+      content: <WeightEntryCard weightLog={weightLog} onSave={onSaveWeight} units={units} /> },
+    { id: "csv", title: "Import a CSV", icon: ICONS.upload,
+      keywords: "csv spreadsheet excel file upload map columns",
+      summary: csvPreview ? `${csvPreview.rows.length} rows to map` : null,
+      content: (<>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
           MacrosFirst Premium → Download Food Log (Excel), or export any spreadsheet as CSV. Drop the file here and map its columns below.
         </div>
@@ -2801,46 +3067,161 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
         </div>
         {importError && <Banner kind="error">{importError}</Banner>}
         {!importError && importNotice && <Banner kind="success">{importNotice}</Banner>}
-      </div>
-
-      {csvPreview && (
-        <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Map columns</div>
-          <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>{csvPreview.rows.length} rows found. Match the columns to the fields below.</div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 12 }}>
-            {["date", "calories", "protein", "carbs", "fat"].map((k) => (
-              <Field key={k} label={k}>
-                <select className="inp" value={colMap[k]} onChange={(e) => setColMap((m) => ({ ...m, [k]: e.target.value }))}>
-                  <option value="">— none —</option>
-                  {csvPreview.fields.map((f) => <option key={f} value={f}>{f}</option>)}
-                </select>
-              </Field>
-            ))}
+        {csvPreview && (
+          <div>
+            <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 4, marginTop: 20, paddingTop: 16, borderTop: `1px solid ${line}` }}>Map columns</div>
+            <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>{csvPreview.rows.length} rows found. Match the columns to the fields below.</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 12 }}>
+              {["date", "calories", "protein", "carbs", "fat"].map((k) => (
+                <Field key={k} label={k}>
+                  <select className="inp" value={colMap[k]} onChange={(e) => setColMap((m) => ({ ...m, [k]: e.target.value }))}>
+                    <option value="">— none —</option>
+                    {csvPreview.fields.map((f) => <option key={f} value={f}>{f}</option>)}
+                  </select>
+                </Field>
+              ))}
+            </div>
+            <button className="btn-primary" style={{ marginTop: 18 }} onClick={() => onImport()}>Import {csvPreview.rows.length} rows</button>
           </div>
-          <button className="btn-primary" style={{ marginTop: 18 }} onClick={() => onImport()}>Import {csvPreview.rows.length} rows</button>
+        )}
+      </>) },
+  ];
+  const storedButton = (
+    <button className="btn-ghost" onClick={() => setStoredView("nutrition")} style={{ padding: "8px 12px", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}
+      title="Browse and edit everything stored on the server">
+      <Icon path={ICONS.database} size={13} color={cyan} /> Stored data…
+    </button>
+  );
+  return (
+    <>
+      <PanelList storageKey="log" panels={panels} placeholder="Search log (weight, csv, macros…)" toolbar={storedButton} />
+      {storedView && (
+        <Modal title="Stored data" onClose={() => setStoredView(null)} scrollKey={storedView}
+          toolbar={(
+            <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
+              {[
+                ["nutrition", `Nutrition (${dayCount})`],
+                ["training", `Training (${trainingCount})`],
+                ["weight", `Weight (${weightCount})`],
+              ].map(([id, label]) => (
+                <button key={id} className={`subtab ${storedView === id ? "active" : ""}`} onClick={() => setStoredView(id)}>{label}</button>
+              ))}
+            </div>
+          )}>
+          {storedView === "nutrition" && (
+            <>
+              <div style={{ fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 }}>{dayCount} day{dayCount === 1 ? "" : "s"} of intake saved. Click the pencil to edit a day.</div>
+              {dayCount > 0 && (
+                <div style={{ overflowX: "auto" }}>
+                  <NutritionLogTable nutrition={nutrition} onSave={onSaveManualDay} onDelete={onDeleteDay} />
+                </div>
+              )}
+            </>
+          )}
+          {storedView === "training" && (
+            <TrainingLogView stravaData={stravaData} intervalsData={intervalsData} kcalOverrides={kcalOverrides} />
+          )}
+          {storedView === "weight" && (
+            <>
+              <div style={{ fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 }}>{weightCount} day{weightCount === 1 ? "" : "s"} of weight saved. Click the pencil to edit a day.</div>
+              {weightCount > 0 && (
+                <div style={{ overflowX: "auto" }}>
+                  <WeightLogTable weightLog={weightLog} onSave={onSaveWeight} onDelete={onDeleteWeight} units={units} />
+                </div>
+              )}
+            </>
+          )}
+        </Modal>
+      )}
+    </>
+  );
+}
+
+// Read-only view of every cached training activity (Strava + intervals.icu),
+// newest first. Mirrors dailyRows' per-day source priority: on a date Strava
+// has activities for, intervals.icu's copies aren't used, so they're shown
+// dimmed as "superseded" rather than hidden.
+function TrainingLogView({ stravaData, intervalsData, kcalOverrides }) {
+  const [filter, setFilter] = useState("");
+  const rows = useMemo(() => {
+    const stravaDates = new Set();
+    const out = [];
+    for (const a of stravaData.activities) {
+      const date = (a.start_date_local || "").slice(0, 10);
+      if (!date) continue;
+      stravaDates.add(date);
+      const ov = kcalOverrides && kcalOverrides[`strava-${a.id}`];
+      out.push({ key: `strava-${a.id}`, date, provider: "strava", name: a.name || a.type || "Activity", type: a.type || "",
+        durationMin: Math.round((a.moving_time || 0) / 60), kcal: stravaActivityKcal(a),
+        override: typeof ov === "number" && ov >= 0 ? ov : null, IF: stravaIntensityFactor(a) });
+    }
+    for (const a of intervalsData.activities) {
+      const date = (a.start_date_local || a.start_date || "").slice(0, 10);
+      if (!date) continue;
+      out.push({ key: `intervals-${a.id}`, date, provider: "intervals", name: a.name || a.type || "Activity", type: a.type || "",
+        durationMin: Math.round((a.moving_time || 0) / 60), kcal: activityKcal(a), override: null, IF: intensityFactor(a) });
+    }
+    for (const r of out) r.superseded = r.provider === "intervals" && stravaDates.has(r.date);
+    out.sort((x, y) => (x.date === y.date ? y.provider.localeCompare(x.provider) : x.date < y.date ? 1 : -1)); // Strava first within a day
+    return out;
+  }, [stravaData, intervalsData, kcalOverrides]);
+  const terms = filter.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = terms.length
+    ? rows.filter((r) => { const hay = `${r.date} ${r.provider} ${r.name} ${r.type}`.toLowerCase(); return terms.every((t) => hay.includes(t)); })
+    : rows;
+  const syncedDays = new Set([...stravaData.syncedDates, ...intervalsData.syncedDates]).size;
+  return (
+    <>
+      <div style={{ fontSize: 12.5, color: dim, marginBottom: 12, lineHeight: 1.5 }}>
+        {rows.length} cached activit{rows.length === 1 ? "y" : "ies"} across {syncedDays} synced day{syncedDays === 1 ? "" : "s"}.
+        Read-only — this is what the server has cached from Strava and intervals.icu. On days Strava has data, intervals.icu
+        copies are ignored by the model (shown dimmed). Change how many days get pulled in Setup → Training data.
+      </div>
+      {rows.length > 0 && (
+        <input className="inp" type="search" value={filter} onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter by date, name or type…" style={{ marginBottom: 12, maxWidth: 320 }} />
+      )}
+      {shown.length > 0 && (
+        <div style={{ overflowX: "auto" }}>
+          <table className="data">
+            <thead>
+              <tr><th>Date</th><th style={{ textAlign: "left" }}>Activity</th><th style={{ textAlign: "left" }}>Type</th><th>Duration</th><th>kcal</th><th>IF</th></tr>
+            </thead>
+            <tbody>
+              {shown.map((r) => (
+                <tr key={r.key} style={r.superseded ? { opacity: 0.45 } : undefined} title={r.superseded ? "Superseded by Strava data for this day" : undefined}>
+                  <td style={{ whiteSpace: "nowrap" }}>{r.date}<ProviderBadge provider={r.provider} /></td>
+                  <td style={{ textAlign: "left" }}>{r.name}</td>
+                  <td style={{ textAlign: "left", color: dim }}>{r.type}</td>
+                  <td>{r.durationMin ? `${Math.floor(r.durationMin / 60)}:${String(r.durationMin % 60).padStart(2, "0")}` : "—"}</td>
+                  <td style={{ color: amber }}>
+                    {r.override !== null
+                      ? <span title={`Overridden — device reported ${fmt(r.kcal)} kcal (used in IronMan mode)`}>{fmt(r.override)}*</span>
+                      : r.kcal ? fmt(r.kcal) : "—"}
+                  </td>
+                  <td style={{ color: dim }}>{fmt(r.IF, 2)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
+      {rows.length > 0 && shown.length === 0 && <div style={{ fontSize: 12.5, color: dim }}>No activities match “{filter.trim()}”.</div>}
+    </>
+  );
+}
 
-      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored nutrition log</div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 }}>{dayCount} day{dayCount === 1 ? "" : "s"} of intake saved. Click a row to edit it.</div>
-        {dayCount > 0 && (
-          <div style={{ overflowX: "auto" }}>
-            <NutritionLogTable nutrition={nutrition} onSave={onSaveManualDay} onDelete={onDeleteDay} />
-          </div>
-        )}
-      </div>
-
-      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Stored weight log</div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 }}>{weightCount} day{weightCount === 1 ? "" : "s"} of weight saved. Click a row to edit it.</div>
-        {weightCount > 0 && (
-          <div style={{ overflowX: "auto" }}>
-            <WeightLogTable weightLog={weightLog} onSave={onSaveWeight} onDelete={onDeleteWeight} units={units} />
-          </div>
-        )}
-      </div>
-    </div>
+function ProviderBadge({ provider }) {
+  const isStrava = provider === "strava";
+  return (
+    <span style={{
+      fontSize: 10, fontWeight: 700, letterSpacing: "0.04em", textTransform: "uppercase",
+      padding: "2px 6px", borderRadius: 3, marginLeft: 8,
+      background: isStrava ? "rgba(232,163,61,0.15)" : "rgba(79,209,217,0.12)",
+      color: isStrava ? amber : cyan,
+    }}>
+      {isStrava ? "Strava" : "intervals"}
+    </span>
   );
 }
 
@@ -2906,10 +3287,7 @@ function ManualEntryCard({ nutrition, onSave }) {
   }
 
   return (
-    <div className="card" style={{ padding: 22 }}>
-      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-        <Icon path={ICONS.plus} size={16} color={cyan} /> Enter a day's macros directly
-      </div>
+    <div>
       <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
         Skip the CSV for a single day — type in totals from MacrosFirst (or anywhere) and calories are
         computed automatically (4 kcal/g protein & carbs, 9 kcal/g fat). Pick a date that's already logged
@@ -3111,10 +3489,7 @@ function WeightEntryCard({ weightLog, onSave, units }) {
   }
 
   return (
-    <div className="card" style={{ padding: 22 }}>
-      <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-        <Icon path={ICONS.plus} size={16} color={cyan} /> Log today's weight
-      </div>
+    <div>
       <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
         Feeds directly into BMR and fueling targets for that day — body weight shifts across a training
         block, so this keeps demand and g/kg targets tracking you rather than a fixed Setup value.
@@ -3266,8 +3641,7 @@ function sourceActivityLabel(src) {
   return `${src.date} · ${src.name} · ${src.durationMin}min · ${src.kcal}kcal`;
 }
 
-// Shared look for a schedule-listing row, with a temporary highlight state
-// used when jumping in from the "Upcoming" calendar (see jumpToDay below).
+// Shared look for a schedule-listing row (optionally highlighted).
 function scheduleRowStyle(highlighted) {
   return {
     display: "flex", alignItems: "center", gap: 12, padding: "10px 12px",
@@ -3278,29 +3652,46 @@ function scheduleRowStyle(highlighted) {
   };
 }
 
-function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData,
-  onImportFile, importFileError, importFileNotice, matchOverrides, onSetMatchOverride,
-  profile, setProfile, weightLog, matchedKcalRates }) {
-  const [form, setForm] = useState(emptyScheduleForm());
-  const [editingId, setEditingId] = useState(null);
-  const [highlightIds, setHighlightIds] = useState([]);
-  const [scheduleDragOver, setScheduleDragOver] = useState(false);
-  const [editingMatchDay, setEditingMatchDay] = useState(null); // date key, or null
-  const itemRefs = useRef({});
-  // Both default on (undefined !== false) so existing profiles pick up the
-  // new toggles already enabled — nothing changes until someone opts out.
-  const showActual = profile.scheduleShowActual !== false;
-  const showCalories = profile.scheduleShowCalories !== false;
+function scheduleEntryFromForm(form) {
+  const base = {
+    activityType: form.activityType,
+    zone: form.zone,
+    durationMin: parseInt(form.durationMin) || 0,
+    notes: form.notes,
+    sourceActivity: form.sourceActivity,
+  };
+  if (form.kind === "race") {
+    return { kind: "race", ...base, raceDate: form.raceDate,
+      taperDays: form.taperEnabled ? Math.max(1, parseInt(form.taperDays) || DEFAULT_TAPER_DAYS) : 0,
+      carbLoadDays: form.carbLoadEnabled ? Math.max(1, parseInt(form.carbLoadDays) || CARB_LOAD_DAYS) : 0 };
+  }
+  if (form.kind === "single") return { kind: "single", ...base, date: form.date };
+  return { kind: "recurring", ...base, daysOfWeek: form.daysOfWeek, startDate: form.startDate,
+    endDate: form.ongoing ? null : (form.endDate || null),
+    ...(form.skipDates && form.skipDates.length ? { skipDates: form.skipDates } : {}) };
+}
+function scheduleFormFromEntry(s) {
+  const common = { ...emptyScheduleForm(), activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
+    notes: s.notes || "", sourceActivity: s.sourceActivity || null };
+  if (s.kind === "race") {
+    return { ...common, kind: "race", raceDate: s.raceDate,
+      taperEnabled: (s.taperDays ?? DEFAULT_TAPER_DAYS) > 0, taperDays: String(s.taperDays || DEFAULT_TAPER_DAYS),
+      carbLoadEnabled: raceCarbLoadDays(s) > 0, carbLoadDays: String(raceCarbLoadDays(s) || CARB_LOAD_DAYS) };
+  }
+  if (s.kind === "single") return { ...common, kind: "single", date: s.date };
+  return { ...common, kind: "recurring", daysOfWeek: s.daysOfWeek, startDate: s.startDate, endDate: s.endDate || "",
+    ongoing: !s.endDate, skipDates: s.skipDates || [] };
+}
+function scheduleEntryLabel(s) {
+  if (s.kind === "race") return s.notes || `${s.activityType} race`;
+  return `${s.activityType} Z${s.zone} · ${s.durationMin} min${s.notes ? ` · ${s.notes}` : ""}`;
+}
 
-  const activityLibrary = useMemo(
-    () => getActivityLibrary(stravaData, intervalsData),
-    [stravaData, intervalsData]
-  );
-  const actualsByDate = useMemo(() => {
-    const map = {};
-    for (const a of activityLibrary) (map[a.date] || (map[a.date] = [])).push(a);
-    return map;
-  }, [activityLibrary]);
+// Add/edit form for one schedule entry (recurring session, single session or
+// race), shown in a pop-up. Owns its own draft so cancelling discards it.
+function ScheduleEntryEditor({ initialForm, isEdit, activityLibrary, onSave, onCancel, onDelete }) {
+  const [form, setForm] = useState(initialForm);
+  const [error, setError] = useState(null);
   function applySourceActivity(key) {
     const src = activityLibrary.find((a) => a.key === key);
     if (!src) { setForm((f) => ({ ...f, sourceActivity: null })); return; }
@@ -3312,486 +3703,28 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
       sourceActivity: { key: src.key, date: src.date, name: src.name, durationMin: src.durationMin, kcal: src.kcal, intensityFactor: src.intensityFactor },
     }));
   }
-
-  // Scrolls the listing card(s) below to the session(s)/race scheduled on the
-  // clicked calendar day, and flashes them briefly so they're easy to spot.
-  function jumpToDay(day) {
-    const ids = day.sessions.map((s) => s.id).concat(day.race ? [day.race.id] : []);
-    if (!ids.length) return;
-    setHighlightIds(ids);
-    const firstEl = itemRefs.current[ids[0]];
-    if (firstEl) firstEl.scrollIntoView({ behavior: "smooth", block: "center" });
-    window.clearTimeout(jumpToDay._t);
-    jumpToDay._t = window.setTimeout(() => setHighlightIds([]), 2000);
-  }
-
-  const recurring = schedule.filter((s) => s.kind !== "race" && s.kind !== "single");
-  const singles = schedule.filter((s) => s.kind === "single").slice().sort((a, b) => (a.date < b.date ? -1 : 1));
-  const races = getRaces(schedule).slice().sort((a, b) => (a.raceDate < b.raceDate ? -1 : 1));
-
   function toggleDay(n) {
     setForm((f) => ({
       ...f,
       daysOfWeek: f.daysOfWeek.includes(n) ? f.daysOfWeek.filter((d) => d !== n) : [...f.daysOfWeek, n].sort(),
     }));
   }
-
-  function startEdit(s) {
-    setEditingId(s.id);
-    if (s.kind === "race") {
-      setForm({
-        ...emptyScheduleForm(),
-        kind: "race", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
-        raceDate: s.raceDate, taperEnabled: (s.taperDays ?? DEFAULT_TAPER_DAYS) > 0,
-        taperDays: String(s.taperDays || DEFAULT_TAPER_DAYS),
-        carbLoadEnabled: raceCarbLoadDays(s) > 0,
-        carbLoadDays: String(raceCarbLoadDays(s) || CARB_LOAD_DAYS), notes: s.notes || "",
-        sourceActivity: s.sourceActivity || null,
-      });
-    } else if (s.kind === "single") {
-      setForm({
-        ...emptyScheduleForm(),
-        kind: "single", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
-        date: s.date, notes: s.notes || "", sourceActivity: s.sourceActivity || null,
-      });
-    } else {
-      setForm({
-        ...emptyScheduleForm(),
-        kind: "recurring", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
-        daysOfWeek: s.daysOfWeek, startDate: s.startDate, endDate: s.endDate || "",
-        ongoing: !s.endDate, notes: s.notes || "", sourceActivity: s.sourceActivity || null,
-      });
-    }
-  }
-  function cancelEdit() {
-    setEditingId(null);
-    setForm(emptyScheduleForm());
-  }
-
   function handleSubmit() {
-    if (form.kind === "race") {
-      const entry = {
-        kind: "race",
-        activityType: form.activityType,
-        zone: form.zone,
-        durationMin: parseInt(form.durationMin) || 0,
-        raceDate: form.raceDate,
-        taperDays: form.taperEnabled ? Math.max(1, parseInt(form.taperDays) || DEFAULT_TAPER_DAYS) : 0,
-        carbLoadDays: form.carbLoadEnabled ? Math.max(1, parseInt(form.carbLoadDays) || CARB_LOAD_DAYS) : 0,
-        notes: form.notes,
-        sourceActivity: form.sourceActivity,
-      };
-      if (editingId) onUpdate(editingId, entry); else onAdd(entry);
-      cancelEdit();
-      return;
-    }
-    if (form.kind === "single") {
-      const entry = {
-        kind: "single",
-        activityType: form.activityType,
-        zone: form.zone,
-        durationMin: parseInt(form.durationMin) || 0,
-        date: form.date,
-        notes: form.notes,
-        sourceActivity: form.sourceActivity,
-      };
-      if (editingId) onUpdate(editingId, entry); else onAdd(entry);
-      cancelEdit();
-      return;
-    }
-    if (form.daysOfWeek.length === 0) { alert("Pick at least one day of the week."); return; }
-    const entry = {
-      kind: "recurring",
-      activityType: form.activityType,
-      zone: form.zone,
-      durationMin: parseInt(form.durationMin) || 0,
-      daysOfWeek: form.daysOfWeek,
-      startDate: form.startDate,
-      endDate: form.ongoing ? null : (form.endDate || null),
-      notes: form.notes,
-      sourceActivity: form.sourceActivity,
-    };
-    if (editingId) onUpdate(editingId, entry); else onAdd(entry);
-    cancelEdit();
+    if (form.kind === "recurring" && form.daysOfWeek.length === 0) { setError("Pick at least one day of the week."); return; }
+    onSave(scheduleEntryFromForm(form));
   }
-
-  // 3 full weeks starting from the most recent Sunday, so the schedule's actual
-  // effect (including any taper/carb-loading a race triggers) is visible as a
-  // calendar before it shows up on the dashboard.
-  const calendarStart = daysAgo(new Date().getDay());
-  const calendarDays = [];
-  for (let i = 0; i < 21; i++) {
-    const d = new Date(calendarStart);
-    d.setDate(d.getDate() + i);
-    const key = toLocalISODate(d);
-    const { sessions, taper } = getEffectiveSessionsForDate(schedule, key);
-    const raceToday = races.find((r) => r.raceDate === key);
-    const carbLoad = getCarbLoadState(schedule, key);
-    const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
-    const dayActuals = actualsByDate[key] || [];
-    const { pairs, extras } = matchDayActivities(plannedItems, dayActuals, matchOverrides[key]);
-
-    // Expected vs actual calories burned that day — expected mirrors the
-    // same MET-based estimate dailyRows uses for a not-yet-happened session
-    // (or a sourceActivity-modeled one); actual sums whatever Strava/
-    // intervals.icu kcal getActivityLibrary already computed. Independent of
-    // the planned/actual matching above — this totals ALL of both sides, not
-    // just the ones the heuristic paired up, so a manually-corrected or
-    // unmatched activity still counts.
-    const weightForDay = weightLog[key] ?? (parseFloat(profile.weightKg) || null);
-    const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay, matchedKcalRates), 0);
-    const actualKcal = dayActuals.reduce((sum, a) => sum + a.kcal, 0);
-
-    calendarDays.push({
-      key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras, dayActuals,
-      expectedKcal, actualKcal,
-    });
-  }
-  const todayKey = toLocalISODate(new Date());
-
   return (
-    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
-      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 10, flexWrap: "wrap" }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
-            <input type="checkbox" checked={showActual}
-              onChange={(e) => setProfile((p) => ({ ...p, scheduleShowActual: e.target.checked }))} />
-            Show actual/matched workouts
-          </label>
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
-            <input type="checkbox" checked={showCalories}
-              onChange={(e) => setProfile((p) => ({ ...p, scheduleShowCalories: e.target.checked }))} />
-            Show expected/actual calories burned
-          </label>
-        </div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <span>Next 3 weeks</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={amber} /> pre-loads the day before</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.gauge} size={10} color={lavender} /> tapering</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.trophy} size={10} color={gold} /> race day</span>
-          {showActual && (
-            <>
-              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>solid = planned, outline = actual <Icon path={ICONS.check} size={10} color={mint} /> matched</span>
-              <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.pencil} size={10} color={dim} /> click to correct a match</span>
-            </>
-          )}
-          {showCalories && (
-            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={{ color: cyan }}>expected</span> / <span style={{ color: amber }}>actual</span> kcal burned
-            </span>
-          )}
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }}>
-          {WEEKDAY_LABELS.map((label) => (
-            <div key={label} style={{ fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 }}>{label}</div>
-          ))}
-          {calendarDays.map((day) => {
-            const isToday = day.key === todayKey;
-            const isPast = day.key < todayKey;
-            const isFirstOfMonth = day.date.getDate() === 1;
-            const clickable = day.sessions.length > 0 || !!day.race;
-
-            function plannedChip(planned, i, isGroup) {
-              if (planned.isRace) {
-                return (
-                  <div key={`p${i}`} title={`Race: ${planned.notes || planned.activityType} · ${planned.durationMin}min${isGroup ? " · matched to multiple activities" : ""}`}
-                    style={{
-                      background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
-                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3, overflow: "hidden",
-                    }}>
-                    <Icon path={ICONS.trophy} size={9} color={ink} />
-                    <span className="cal-chip-text">{planned.notes || planned.activityType}</span>
-                    <span className="cal-chip-emoji">🏆</span>
-                    {isGroup && <Icon path={ICONS.link} size={8} color={ink} />}
-                  </div>
-                );
-              }
-              return (
-                <div key={`p${i}`} title={`${planned.activityType} · ${ZONES[planned.zone - 1].label.split(" · ")[1]} · ${planned.durationMin}min${planned.notes ? ` · ${planned.notes}` : ""}${day.taper ? " · tapered" : ""}${isGroup ? " · matched to multiple activities" : ""}`}
-                  style={{
-                    background: ACTIVITY_COLORS[planned.activityType] || dim,
-                    color: ink,
-                    borderRadius: 3,
-                    padding: "2px 5px",
-                    fontSize: 10.5,
-                    lineHeight: 1.3,
-                    fontWeight: 600,
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 3,
-                    opacity: day.taper ? 0.65 : 1,
-                    overflow: "hidden",
-                  }}>
-                  <span className="cal-chip-text">{planned.activityType} Z{planned.zone} · {planned.durationMin}m</span>
-                  <span className="cal-chip-emoji">{ACTIVITY_EMOJI[planned.activityType] || "🎯"}</span>
-                  {isPreloadWorthy(planned) && <Icon path={ICONS.flame} size={9} color={ink} />}
-                  {isGroup && <Icon path={ICONS.link} size={8} color={ink} />}
-                </div>
-              );
-            }
-            // Outlined rather than filled, so a glance tells "planned" (solid)
-            // apart from "actual" (outline) even before reading either chip —
-            // the checkmark then further distinguishes a real match from an
-            // extra, unscheduled activity that just happens to share a slot.
-            function actualChip(actual, matched, i, manual) {
-              const color = ACTIVITY_COLORS[actual.activityType] || dim;
-              return (
-                <div key={`a${i}`}
-                  title={`${actual.name} · ${actual.activityType} · ${actual.durationMin}min${matched ? " · matched to the plan" : " · not on the schedule"}${manual ? " · manually corrected" : ""}`}
-                  style={{
-                    border: `1px solid ${color}`,
-                    color,
-                    borderRadius: 3,
-                    padding: "2px 5px",
-                    fontSize: 10.5,
-                    lineHeight: 1.3,
-                    fontWeight: 600,
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 3,
-                    overflow: "hidden",
-                  }}>
-                  {matched && <Icon path={ICONS.check} size={9} color={color} />}
-                  <span className="cal-chip-text">{actual.activityType} · {actual.durationMin}m</span>
-                  <span className="cal-chip-emoji">{ACTIVITY_EMOJI[actual.activityType] || "🎯"}</span>
-                  {manual && <Icon path={ICONS.pencil} size={8} color={color} />}
-                </div>
-              );
-            }
-            // A multi-part match (e.g. a "Triathlon" race grouped into its
-            // separate swim/bike/run activities) renders each real activity
-            // as its own normal actualChip, wrapped in a dashed container so
-            // the coupling reads as "these N activities together are the one
-            // planned item," not N unrelated extra activities.
-            function actualChipGroup(actuals, i, manual) {
-              return (
-                <div key={`ag${i}`} style={{
-                  display: "flex", flexDirection: "column", gap: 2,
-                  border: `1px dashed ${dim}`, borderRadius: 4, padding: 2,
-                }}>
-                  {actuals.map((a, j) => actualChip(a, true, `${i}-${j}`, manual))}
-                </div>
-              );
-            }
-
-            return (
-              <div key={day.key} onClick={clickable ? () => jumpToDay(day) : undefined}
-                title={clickable ? "Jump to this session in the listings below" : undefined}
-                style={{
-                background: panel2,
-                border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
-                borderRadius: 5,
-                padding: 6,
-                minHeight: 76,
-                display: "flex",
-                flexDirection: "column",
-                gap: 3,
-                cursor: clickable ? "pointer" : "default",
-                opacity: isPast ? 0.5 : 1,
-              }}>
-                <div style={{ fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 }}>
-                  {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
-                  {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
-                  {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
-                  {showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && (
-                    <button type="button" title="Correct planned/actual matches for this day"
-                      onClick={(e) => { e.stopPropagation(); setEditingMatchDay(day.key); }}
-                      style={{ marginLeft: "auto", background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }}>
-                      <Icon path={ICONS.pencil} size={10} color={dim} />
-                    </button>
-                  )}
-                </div>
-                {showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && (
-                  <div title={`Expected ${Math.round(day.expectedKcal)} kcal · Actual ${Math.round(day.actualKcal)} kcal burned`}
-                    style={{
-                      borderBottom: `1px solid ${line}`, paddingBottom: 4, marginBottom: 1, fontSize: 10,
-                      display: "flex", justifyContent: "space-between", gap: 4,
-                    }}>
-                    <span style={{ color: cyan, fontWeight: 600 }}>{Math.round(day.expectedKcal)}</span>
-                    <span style={{ color: dim }}>/</span>
-                    <span style={{ color: amber, fontWeight: 600 }}>{Math.round(day.actualKcal)}</span>
-                  </div>
-                )}
-                {showActual ? (
-                  <>
-                    {day.pairs.map(({ planned, actual, manual }, i) => {
-                      const isGroup = Array.isArray(actual);
-                      return (
-                        <div key={`pair${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
-                          {plannedChip(planned, i, isGroup)}
-                          {isGroup ? actualChipGroup(actual, i, manual)
-                            : actual ? actualChip(actual, true, i, manual) : (day.key <= todayKey
-                              ? <div style={{ fontSize: 10, color: dim, display: "flex", alignItems: "center" }}>not logged</div>
-                              : null)}
-                        </div>
-                      );
-                    })}
-                    {day.extras.map((actual, i) => (
-                      <div key={`extra${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
-                        <div />
-                        {actualChip(actual, false, i)}
-                      </div>
-                    ))}
-                  </>
-                ) : (
-                  day.pairs.map(({ planned }, i) => plannedChip(planned, i))
-                )}
-              </div>
-            );
-          })}
-        </div>
+    <div onKeyDown={(e) => { if (e.key === "Enter" && e.target.tagName === "INPUT" && e.target.type !== "checkbox") handleSubmit(); }}>
+      <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+        {form.kind === "race"
+          ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days."
+          : form.kind === "single"
+          ? "A single session on one specific date — doesn't repeat, and won't affect any other day."
+          : <>Repeats on the days you pick, within the date range. Projects up to {FORWARD_DAYS} days ahead on the
+            dashboard as an estimate — once a real activity syncs in for that day, it takes over automatically.</>}
       </div>
 
-      {editingMatchDay && (() => {
-        const day = calendarDays.find((d) => d.key === editingMatchDay);
-        if (!day) return null;
-        const dayOverrides = matchOverrides[day.key] || {};
-        return (
-          <div style={{
-            position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 50,
-            display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
-          }} onClick={() => setEditingMatchDay(null)}>
-            <div onClick={(e) => e.stopPropagation()} style={{
-              background: panel2, border: `1px solid ${line}`, borderRadius: 8, padding: 20,
-              width: 420, maxWidth: "100%", maxHeight: "80vh", overflowY: "auto",
-            }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-                <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 14 }}>
-                  {day.date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}
-                </div>
-                <button onClick={() => setEditingMatchDay(null)}
-                  style={{ background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }}>×</button>
-              </div>
-              <div style={{ fontSize: 12, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
-                Correct which logged activity matches each planned session, if the automatic guess got it wrong —
-                or pick more than one to group several activities into one match (e.g. a "Triathlon" race entry
-                that actually shows up on Strava as a separate swim, bike, and run).
-              </div>
-              {day.pairs.length === 0 && (
-                <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>Nothing scheduled this day.</div>
-              )}
-              {day.pairs.map(({ planned, actual }, i) => {
-                const pk = plannedMatchKey(planned);
-                const label = planned.isRace
-                  ? `Race: ${planned.notes || planned.activityType}`
-                  : `${planned.activityType} Z${planned.zone} · ${planned.durationMin}m${planned.notes ? ` · ${planned.notes}` : ""}`;
-                const hasOverride = Object.prototype.hasOwnProperty.call(dayOverrides, pk);
-                const overrideValue = dayOverrides[pk];
-                const mode = !hasOverride ? "auto" : overrideValue === null ? "none" : "custom";
-                const selectedKeys = mode === "custom" ? (Array.isArray(overrideValue) ? overrideValue : [overrideValue]) : [];
-                const actualNames = actual ? (Array.isArray(actual) ? actual.map((a) => a.name) : [actual.name]) : [];
-                return (
-                  <div key={i} style={{ marginBottom: 16 }}>
-                    <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{
-                        width: 8, height: 8, borderRadius: 2,
-                        background: planned.isRace ? gold : (ACTIVITY_COLORS[planned.activityType] || dim),
-                        display: "inline-block",
-                      }} />
-                      {label}
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
-                        <input type="radio" name={`match-mode-${day.key}-${pk}`} checked={mode === "auto"}
-                          onChange={() => onSetMatchOverride(day.key, pk, undefined)} />
-                        Auto (let the app guess)
-                      </label>
-                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
-                        <input type="radio" name={`match-mode-${day.key}-${pk}`} checked={mode === "none"}
-                          onChange={() => onSetMatchOverride(day.key, pk, null)} />
-                        No match
-                      </label>
-                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
-                        <input type="radio" name={`match-mode-${day.key}-${pk}`} checked={mode === "custom"}
-                          onChange={() => onSetMatchOverride(day.key, pk, actual
-                            ? (Array.isArray(actual) ? actual.map((a) => a.key) : [actual.key])
-                            : [])} />
-                        Choose specific activities
-                      </label>
-                      {mode === "custom" && (
-                        <div style={{ marginLeft: 22, display: "flex", flexDirection: "column", gap: 3, marginTop: 2 }}>
-                          {day.dayActuals.length === 0 && (
-                            <div style={{ fontSize: 11, color: dim }}>No activities synced this day.</div>
-                          )}
-                          {day.dayActuals.map((a) => (
-                            <label key={a.key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
-                              <input type="checkbox" checked={selectedKeys.includes(a.key)}
-                                onChange={() => {
-                                  const next = selectedKeys.includes(a.key)
-                                    ? selectedKeys.filter((k) => k !== a.key)
-                                    : [...selectedKeys, a.key];
-                                  onSetMatchOverride(day.key, pk, next);
-                                }} />
-                              {a.activityType} · {a.durationMin}m · {a.name}
-                            </label>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                    {mode === "auto" && (
-                      <div style={{ fontSize: 10.5, color: dim, marginTop: 4 }}>
-                        Auto-detected{actualNames.length ? ` — matched to "${actualNames.join('", "')}"` : " — no match found"}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-              {day.dayActuals.length === 0 && day.pairs.length > 0 && (
-                <div style={{ fontSize: 11, color: dim }}>No Strava/intervals.icu activities synced for this day.</div>
-              )}
-            </div>
-          </div>
-        );
-      })()}
-
-      <div className="card" style={{ padding: 22 }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.upload} size={16} color={cyan} /> Import schedule from file
-        </div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
-          Drop a periodized training-plan export, or a plain list of schedule entries, as a .json file.
-          It's saved under <code>schedule_sources/</code> and re-imported automatically from then on
-          whenever that file's contents change — no need to come back here and re-upload it.
-        </div>
-        <div
-          onDragOver={(e) => { e.preventDefault(); setScheduleDragOver(true); }}
-          onDragLeave={() => setScheduleDragOver(false)}
-          onDrop={(e) => { e.preventDefault(); setScheduleDragOver(false); if (e.dataTransfer.files[0]) onImportFile(e.dataTransfer.files[0]); }}
-          style={{
-            border: `1.5px dashed ${scheduleDragOver ? cyan : line}`, borderRadius: 6, padding: "28px 20px",
-            textAlign: "center", background: scheduleDragOver ? "rgba(79,209,217,0.05)" : "transparent", transition: "all 0.15s",
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}><Icon path={ICONS.upload} size={22} color={dim} /></div>
-          <div style={{ fontSize: 13, marginBottom: 12 }}>Drop a .json schedule file here, or</div>
-          <label className="btn-ghost" style={{ display: "inline-block" }}>
-            Choose file
-            <input type="file" accept=".json,application/json" style={{ display: "none" }}
-              onChange={(e) => { if (e.target.files[0]) onImportFile(e.target.files[0]); e.target.value = ""; }} />
-          </label>
-        </div>
-        {importFileError && <Banner kind="error">{importFileError}</Banner>}
-        {!importFileError && importFileNotice && <Banner kind="success">{importFileNotice}</Banner>}
-      </div>
-
-      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={form.kind === "race" ? ICONS.trophy : ICONS.calendar} size={16} color={cyan} /> {editingId ? "Edit scheduled session" : "Add to schedule"}
-        </div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
-          {form.kind === "race"
-            ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days."
-            : form.kind === "single"
-            ? "A single session on one specific date — doesn't repeat, and won't affect any other day."
-            : <>Repeats on the days you pick, within the date range. Projects up to {FORWARD_DAYS} days ahead on the
-              dashboard as an estimate — once a real activity syncs in for that day, it takes over automatically.</>}
-        </div>
-
-        {!editingId && (
+        {!isEdit && (
           <div style={{ display: "flex", gap: 4, marginBottom: 16 }}>
             <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "recurring" }))}
               style={form.kind === "recurring"
@@ -3938,84 +3871,638 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           </Field>
         </div>
 
+        {form.kind === "recurring" && form.skipDates && form.skipDates.length > 0 && (
+          <div style={{ marginTop: 14, fontSize: 11.5, color: dim, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+            Skipped days:
+            {form.skipDates.slice().sort().map((d) => (
+              <span key={d} style={{ display: "inline-flex", alignItems: "center", gap: 4, border: `1px solid ${line}`, borderRadius: 3, padding: "1px 6px", fontFamily: mono }}>
+                {d}
+                <button type="button" title="Restore this day" onClick={() => setForm((f) => ({ ...f, skipDates: f.skipDates.filter((x) => x !== d) }))}
+                  style={{ background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, fontSize: 13, lineHeight: 1 }}>×</button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        {error && <Banner kind="error">{error}</Banner>}
         <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
-          <button className="btn-primary" onClick={handleSubmit}>{editingId ? "Save changes" : (form.kind === "race" ? "Add race" : "Add to schedule")}</button>
-          {editingId && <button className="btn-ghost" onClick={cancelEdit}>Cancel</button>}
+          <button className="btn-primary" onClick={handleSubmit}>{isEdit ? "Save changes" : (form.kind === "race" ? "Add race" : "Add to schedule")}</button>
+          <button className="btn-ghost" onClick={onCancel}>Cancel</button>
+          {onDelete && (
+            <button className="btn-ghost" onClick={onDelete} style={{ marginLeft: "auto", color: coral, borderColor: coral, display: "flex", alignItems: "center", gap: 6 }}>
+              <Icon path={ICONS.trash} size={13} color={coral} /> Delete
+            </button>
+          )}
+        </div>
+    </div>
+  );
+}
+
+function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData,
+  matchOverrides, onSetMatchOverride,
+  profile, setProfile, weightLog, matchedKcalRates }) {
+  const [editor, setEditor] = useState(null); // null | { id: string|null, form }
+  const [confirmDelete, setConfirmDelete] = useState(null); // null | { planned, dateKey }
+  const [listView, setListView] = useState(null); // null | "races" | "single" | "recurring"
+  const [editingMatchDay, setEditingMatchDay] = useState(null); // date key, or null
+  // Calendar view: "month" (default; 4-week grid from this Sunday) or "week"
+  // (one week as a vertical list, navigable by weekOffset from this week).
+  // The view is a per-browser preference, like panel open state.
+  const [calView, setCalViewState] = useState(() => {
+    // Anything else saved (e.g. the retired "3week" view) falls back to month.
+    try { return localStorage.getItem("schedule-view") === "week" ? "week" : "month"; } catch { return "month"; }
+  });
+  const setCalView = (v) => { setCalViewState(v); try { localStorage.setItem("schedule-view", v); } catch { /* ignore */ } };
+  const [weekOffset, setWeekOffset] = useState(0);
+  const weekListRef = useRef(null);
+  // Bumped when the user opens Week view or presses Today, to bring today's
+  // row into view (the list scrolls with the page, not in its own box).
+  const [scrollTodayTick, setScrollTodayTick] = useState(0);
+  // Both default on (undefined !== false) so existing profiles pick up the
+  // new toggles already enabled — nothing changes until someone opts out.
+  const showActual = profile.scheduleShowActual !== false;
+  const showCalories = profile.scheduleShowCalories !== false;
+
+  const activityLibrary = useMemo(
+    () => getActivityLibrary(stravaData, intervalsData),
+    [stravaData, intervalsData]
+  );
+  const actualsByDate = useMemo(() => {
+    const map = {};
+    for (const a of activityLibrary) (map[a.date] || (map[a.date] = [])).push(a);
+    return map;
+  }, [activityLibrary]);
+
+  const recurring = schedule.filter((s) => s.kind !== "race" && s.kind !== "single");
+  const singles = schedule.filter((s) => s.kind === "single").slice().sort((a, b) => (a.date < b.date ? -1 : 1));
+  const races = getRaces(schedule).slice().sort((a, b) => (a.raceDate < b.raceDate ? -1 : 1));
+
+  // Calendar "+": a single session on that day by default; switching the kind
+  // to recurring/race keeps the day (weekday + start date / race date).
+  function openAdd(dateKey) {
+    const key = dateKey || toLocalISODate(new Date());
+    const weekday = new Date(key + "T00:00:00").getDay();
+    setEditor({ id: null, form: { ...emptyScheduleForm(), kind: "single", date: key, raceDate: key, startDate: key, daysOfWeek: [weekday] } });
+  }
+  // Calendar chips are tapered copies, so always edit the stored entry.
+  function openEdit(id, dateKey = null) {
+    const entry = schedule.find((s) => s.id === id);
+    if (entry) setEditor({ id, dateKey, form: scheduleFormFromEntry(entry) });
+  }
+  function saveEditor(entry) {
+    if (editor.id) onUpdate(editor.id, entry); else onAdd(entry);
+    setEditor(null);
+  }
+  function skipOccurrence(entry, dateKey) {
+    const { id, ...rest } = entry;
+    onUpdate(id, { ...rest, skipDates: Array.from(new Set([...(entry.skipDates || []), dateKey])).sort() });
+  }
+
+  // Full weeks starting from the most recent Sunday (3 by default, 4 in month
+  // view), so the schedule's actual effect (including any taper/carb-loading a
+  // race triggers) is visible as a calendar before it shows up on the
+  // dashboard. Week view shows one Sunday-to-Saturday week, weekOffset weeks
+  // from this one.
+  const calendarStart = daysAgo(new Date().getDay() - (calView === "week" ? weekOffset * 7 : 0));
+  const calendarLength = calView === "week" ? 7 : 28;
+  const calendarDays = [];
+  for (let i = 0; i < calendarLength; i++) {
+    const d = new Date(calendarStart);
+    d.setDate(d.getDate() + i);
+    const key = toLocalISODate(d);
+    const { sessions, taper } = getEffectiveSessionsForDate(schedule, key);
+    const raceToday = races.find((r) => r.raceDate === key);
+    const carbLoad = getCarbLoadState(schedule, key);
+    const plannedItems = raceToday ? [{ ...raceToday, isRace: true }, ...sessions] : sessions;
+    const dayActuals = actualsByDate[key] || [];
+    const { pairs, extras } = matchDayActivities(plannedItems, dayActuals, matchOverrides[key]);
+
+    // Expected vs actual calories burned that day — expected mirrors the
+    // same MET-based estimate dailyRows uses for a not-yet-happened session
+    // (or a sourceActivity-modeled one); actual sums whatever Strava/
+    // intervals.icu kcal getActivityLibrary already computed. Independent of
+    // the planned/actual matching above — this totals ALL of both sides, not
+    // just the ones the heuristic paired up, so a manually-corrected or
+    // unmatched activity still counts.
+    const weightForDay = weightLog[key] ?? (parseFloat(profile.weightKg) || null);
+    const expectedKcal = plannedItems.reduce((sum, p) => sum + estimatePlannedKcal(p, p.durationMin, weightForDay, matchedKcalRates), 0);
+    const actualKcal = dayActuals.reduce((sum, a) => sum + a.kcal, 0);
+
+    calendarDays.push({
+      key, date: d, sessions, taper, race: raceToday, carbLoad, pairs, extras, dayActuals,
+      expectedKcal, actualKcal,
+    });
+  }
+  const todayKey = toLocalISODate(new Date());
+  const isWeekView = calView === "week";
+  const weekRelLabel = weekOffset === 0 ? "This week" : weekOffset === 1 ? "Next week" : weekOffset === -1 ? "Last week"
+    : weekOffset > 0 ? `In ${weekOffset} weeks` : `${-weekOffset} weeks ago`;
+  const rangeLabel = isWeekView ? weekRelLabel : "Next 4 weeks";
+
+  useEffect(() => {
+    if (!scrollTodayTick || !isWeekView) return;
+    const el = weekListRef.current && weekListRef.current.querySelector('[data-today="true"]');
+    if (el) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [scrollTodayTick]);
+
+  return (
+    <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
+      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, display: "flex", alignItems: "center", gap: 7, marginRight: "auto" }}>
+            <Icon path={ICONS.calendar} size={16} color={cyan} /> Calendar
+          </div>
+          <div role="tablist" aria-label="Calendar view" style={{ display: "flex", gap: 4 }}>
+            {[["month", "Month"], ["week", "Week"]].map(([id, label]) => (
+              <button key={id} role="tab" aria-selected={calView === id} className={`subtab ${calView === id ? "active" : ""}`}
+                onClick={() => { setCalView(id); if (id === "week") { setWeekOffset(0); setScrollTodayTick((n) => n + 1); } }} style={{ padding: "6px 11px", fontSize: 12 }}>{label}</button>
+            ))}
+          </div>
+          <button className="btn-primary" onClick={() => openAdd(null)} style={{ padding: "7px 12px", fontSize: 12 }}>
+            <Icon path={ICONS.plus} size={13} color={ink} /> Add
+          </button>
+          <button className="btn-ghost" onClick={() => setListView(races.length ? "races" : singles.length ? "single" : "recurring")}
+            style={{ padding: "7px 12px", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+            <Icon path={ICONS.database} size={13} color={cyan} /> All sessions &amp; races ({schedule.length})
+          </button>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 10, flexWrap: "wrap" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+            <input type="checkbox" checked={showActual}
+              onChange={(e) => setProfile((p) => ({ ...p, scheduleShowActual: e.target.checked }))} />
+            Show actual/matched workouts
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+            <input type="checkbox" checked={showCalories}
+              onChange={(e) => setProfile((p) => ({ ...p, scheduleShowCalories: e.target.checked }))} />
+            Show expected/actual calories burned
+          </label>
+        </div>
+        <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <span>{rangeLabel} · hover a day for <b style={{ color: paper }}>+</b> to add, a session for <Icon path={ICONS.trash} size={10} color={coral} /> to remove, click a session to edit</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={amber} /> pre-loads the day before</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.gauge} size={10} color={lavender} /> tapering</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.trophy} size={10} color={gold} /> race day</span>
+          {showActual && (
+            <>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>solid = planned, outline = actual <Icon path={ICONS.check} size={10} color={mint} /> matched</span>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.pencil} size={10} color={dim} /> correct a match</span>
+            </>
+          )}
+          {showCalories && (
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ color: cyan }}>expected</span> / <span style={{ color: amber }}>actual</span> kcal burned
+            </span>
+          )}
+        </div>
+        {isWeekView && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 12 }}>
+            <button className="btn-ghost" onClick={() => setWeekOffset((o) => o - 1)} aria-label="Previous week" title="Previous week"
+              style={{ padding: "6px 10px", display: "flex" }}><Icon path={ICONS.chevronLeft} size={16} color={paper} /></button>
+            <div style={{ textAlign: "center", minWidth: 190 }}>
+              <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14.5 }}>
+                Week of {calendarDays[0].date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" })}
+              </div>
+              <div style={{ fontSize: 11.5, color: weekOffset === 0 ? cyan : dim }}>{weekRelLabel}</div>
+            </div>
+            <button className="btn-ghost" onClick={() => setWeekOffset((o) => o + 1)} aria-label="Next week" title="Next week"
+              style={{ padding: "6px 10px", display: "flex" }}><Icon path={ICONS.chevronRight} size={16} color={paper} /></button>
+            {weekOffset !== 0 && (
+              <button className="btn-ghost" onClick={() => { setWeekOffset(0); setScrollTodayTick((n) => n + 1); }} style={{ padding: "6px 10px", fontSize: 12 }}>Today</button>
+            )}
+          </div>
+        )}
+        <div ref={weekListRef} className={isWeekView ? "cal-week" : undefined}
+          style={isWeekView
+            ? { display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gridAutoRows: "1fr", gap: 6 }
+            : { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }}>
+          {!isWeekView && WEEKDAY_LABELS.map((label) => (
+            <div key={label} style={{ fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 }}>{label}</div>
+          ))}
+          {calendarDays.map((day) => {
+            const isToday = day.key === todayKey;
+            const isPast = day.key < todayKey;
+            const isFirstOfMonth = day.date.getDate() === 1;
+
+            function plannedChip(planned, i, isGroup) {
+              return (
+                <div key={`p${i}`} className="cal-chip-wrap">
+                  {plannedChipBody(planned, isGroup)}
+                  <button type="button" className="chip-del" aria-label="Remove from schedule"
+                    title={planned.isRace ? "Remove this race" : "Remove this session"}
+                    onClick={(e) => { e.stopPropagation(); setConfirmDelete({ planned, dateKey: day.key }); }}
+                    style={{ position: "absolute", right: 1, top: "50%", transform: "translateY(-50%)", background: panel, border: `1px solid ${line}`, borderRadius: 3, padding: 2, cursor: "pointer", display: "flex", lineHeight: 0 }}>
+                    <Icon path={ICONS.trash} size={9} color={coral} />
+                  </button>
+                </div>
+              );
+            }
+            function plannedChipBody(planned, isGroup) {
+              const onClick = (e) => { e.stopPropagation(); openEdit(planned.id, day.key); };
+              if (planned.isRace) {
+                return (
+                  <div onClick={onClick} title={`Race: ${planned.notes || planned.activityType} · ${planned.durationMin}min${isGroup ? " · matched to multiple activities" : ""} — click to edit`}
+                    style={{ cursor: "pointer",
+                      background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
+                      lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3, overflow: "hidden",
+                    }}>
+                    <Icon path={ICONS.trophy} size={9} color={ink} />
+                    <span className="cal-chip-text">{planned.notes || planned.activityType}</span>
+                    <span className="cal-chip-emoji">🏆</span>
+                    {isGroup && <Icon path={ICONS.link} size={8} color={ink} />}
+                  </div>
+                );
+              }
+              return (
+                <div onClick={onClick} title={`${planned.activityType} · ${ZONES[planned.zone - 1].label.split(" · ")[1]} · ${planned.durationMin}min${planned.notes ? ` · ${planned.notes}` : ""}${day.taper ? " · tapered" : ""}${isGroup ? " · matched to multiple activities" : ""} — click to edit`}
+                  style={{
+                    cursor: "pointer",
+                    background: ACTIVITY_COLORS[planned.activityType] || dim,
+                    color: ink,
+                    borderRadius: 3,
+                    padding: "2px 5px",
+                    fontSize: 10.5,
+                    lineHeight: 1.3,
+                    fontWeight: 600,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 3,
+                    opacity: day.taper ? 0.65 : 1,
+                    overflow: "hidden",
+                  }}>
+                  <span className="cal-chip-text">{planned.activityType} Z{planned.zone} · {planned.durationMin}m</span>
+                  <span className="cal-chip-emoji">{ACTIVITY_EMOJI[planned.activityType] || "🎯"}</span>
+                  {isPreloadWorthy(planned) && <Icon path={ICONS.flame} size={9} color={ink} />}
+                  {isGroup && <Icon path={ICONS.link} size={8} color={ink} />}
+                </div>
+              );
+            }
+            // Outlined rather than filled, so a glance tells "planned" (solid)
+            // apart from "actual" (outline) even before reading either chip —
+            // the checkmark then further distinguishes a real match from an
+            // extra, unscheduled activity that just happens to share a slot.
+            function actualChip(actual, matched, i, manual) {
+              const color = ACTIVITY_COLORS[actual.activityType] || dim;
+              return (
+                <div key={`a${i}`}
+                  title={`${actual.name} · ${actual.activityType} · ${actual.durationMin}min${matched ? " · matched to the plan" : " · not on the schedule"}${manual ? " · manually corrected" : ""}`}
+                  style={{
+                    border: `1px solid ${color}`,
+                    color,
+                    borderRadius: 3,
+                    padding: "2px 5px",
+                    fontSize: 10.5,
+                    lineHeight: 1.3,
+                    fontWeight: 600,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 3,
+                    overflow: "hidden",
+                  }}>
+                  {matched && <Icon path={ICONS.check} size={9} color={color} />}
+                  <span className="cal-chip-text">{actual.activityType} · {actual.durationMin}m</span>
+                  <span className="cal-chip-emoji">{ACTIVITY_EMOJI[actual.activityType] || "🎯"}</span>
+                  {manual && <Icon path={ICONS.pencil} size={8} color={color} />}
+                </div>
+              );
+            }
+            // A multi-part match (e.g. a "Triathlon" race grouped into its
+            // separate swim/bike/run activities) renders each real activity
+            // as its own normal actualChip, wrapped in a dashed container so
+            // the coupling reads as "these N activities together are the one
+            // planned item," not N unrelated extra activities.
+            function actualChipGroup(actuals, i, manual) {
+              return (
+                <div key={`ag${i}`} style={{
+                  display: "flex", flexDirection: "column", gap: 2,
+                  border: `1px dashed ${dim}`, borderRadius: 4, padding: 2,
+                }}>
+                  {actuals.map((a, j) => actualChip(a, true, `${i}-${j}`, manual))}
+                </div>
+              );
+            }
+
+            return (
+              <div key={day.key} className="cal-day" data-today={isToday ? "true" : undefined}
+                style={{
+                background: panel2,
+                border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
+                borderRadius: 5,
+                padding: isWeekView ? "8px 10px" : 6,
+                minHeight: isWeekView ? 56 : 76,
+                flexShrink: 0,
+                display: "flex",
+                flexDirection: "column",
+                gap: 3,
+                opacity: isPast ? 0.5 : 1,
+              }}>
+                <div style={{ fontSize: isWeekView ? 12.5 : 11, color: isToday ? cyan : isWeekView ? paper : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 }}>
+                  {isWeekView
+                    ? <>{day.date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}{isToday && <span style={{ fontSize: 10.5, color: cyan, marginLeft: 4 }}>today</span>}</>
+                    : isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
+                  {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
+                  {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
+                  <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 4 }}>
+                    {showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && (
+                      <button type="button" title="Correct planned/actual matches for this day"
+                        onClick={(e) => { e.stopPropagation(); setEditingMatchDay(day.key); }}
+                        style={{ background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }}>
+                        <Icon path={ICONS.pencil} size={10} color={dim} />
+                      </button>
+                    )}
+                    <button type="button" className="cal-add" title="Add a session or race on this day" aria-label="Add a session or race on this day"
+                      onClick={(e) => { e.stopPropagation(); openAdd(day.key); }}
+                      style={{ background: "none", border: `1px solid ${line}`, borderRadius: 3, color: cyan, cursor: "pointer", padding: 1, display: "flex" }}>
+                      <Icon path={ICONS.plus} size={10} color={cyan} />
+                    </button>
+                  </span>
+                </div>
+                {showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && (
+                  <div title={`Expected ${Math.round(day.expectedKcal)} kcal · Actual ${Math.round(day.actualKcal)} kcal burned`}
+                    style={{
+                      borderBottom: `1px solid ${line}`, paddingBottom: 4, marginBottom: 1, fontSize: isWeekView ? 11 : 10,
+                      display: "flex", justifyContent: isWeekView ? "flex-start" : "space-between", gap: isWeekView ? 6 : 4,
+                    }}>
+                    <span style={{ color: cyan, fontWeight: 600 }}>{Math.round(day.expectedKcal)}</span>
+                    <span style={{ color: dim }}>/</span>
+                    <span style={{ color: amber, fontWeight: 600 }}>{Math.round(day.actualKcal)}</span>
+                  </div>
+                )}
+                <div className="cal-chips" style={{ display: "flex", flexDirection: "column", gap: isWeekView ? 4 : 3, maxWidth: isWeekView ? 640 : undefined }}>
+                {isWeekView && day.pairs.length === 0 && day.extras.length === 0 && (
+                  <div style={{ fontSize: 11.5, color: dim }}>{day.taper ? "Rest · tapering" : "Rest day"}</div>
+                )}
+                {showActual ? (
+                  <>
+                    {day.pairs.map(({ planned, actual, manual }, i) => {
+                      const isGroup = Array.isArray(actual);
+                      return (
+                        <div key={`pair${i}`} className="cal-pair" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
+                          {plannedChip(planned, i, isGroup)}
+                          {isGroup ? actualChipGroup(actual, i, manual)
+                            : actual ? actualChip(actual, true, i, manual) : (day.key <= todayKey
+                              ? <div style={{ fontSize: 10, color: dim, display: "flex", alignItems: "center" }}>not logged</div>
+                              : null)}
+                        </div>
+                      );
+                    })}
+                    {day.extras.map((actual, i) => (
+                      <div key={`extra${i}`} className="cal-pair" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
+                        <div />
+                        {actualChip(actual, false, i)}
+                      </div>
+                    ))}
+                  </>
+                ) : (
+                  day.pairs.map(({ planned }, i) => plannedChip(planned, i))
+                )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
-      {races.length > 0 && (
-        <div className="card" style={{ padding: 22 }}>
-          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", gap: 7 }}>
-            <Icon path={ICONS.trophy} size={16} color={gold} /> Races
-          </div>
-          <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
-            {races.map((s) => (
-              <div key={s.id} ref={(el) => { itemRefs.current[s.id] = el; }} style={scheduleRowStyle(highlightIds.includes(s.id))}>
-                <div style={{ flex: 1 }}>
-                  <b>{s.notes || s.activityType}</b> · {s.activityType} · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
-                  <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
-                    {s.raceDate} · {s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper"}
-                    {" · "}{raceCarbLoadDays(s) > 0 ? `carb-load ${raceCarbLoadDays(s)}d` : "no carb-load"}
-                    {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
-                  </div>
+      {editingMatchDay && (() => {
+        const day = calendarDays.find((d) => d.key === editingMatchDay);
+        if (!day) return null;
+        const dayOverrides = matchOverrides[day.key] || {};
+        return (
+          <div style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 50,
+            display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
+          }} onClick={() => setEditingMatchDay(null)}>
+            <div onClick={(e) => e.stopPropagation()} style={{
+              background: panel2, border: `1px solid ${line}`, borderRadius: 8, padding: 20,
+              width: 420, maxWidth: "100%", maxHeight: "80vh", overflowY: "auto",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 14 }}>
+                  {day.date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}
                 </div>
-                <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
-                <button title="Delete" onClick={() => { if (confirm("Delete this race?")) onDelete(s.id); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
+                <button onClick={() => setEditingMatchDay(null)}
+                  style={{ background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }}>×</button>
               </div>
-            ))}
+              <div style={{ fontSize: 12, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+                Correct which logged activity matches each planned session, if the automatic guess got it wrong —
+                or pick more than one to group several activities into one match (e.g. a "Triathlon" race entry
+                that actually shows up on Strava as a separate swim, bike, and run).
+              </div>
+              {day.pairs.length === 0 && (
+                <div style={{ fontSize: 12.5, color: dim, marginBottom: 16 }}>Nothing scheduled this day.</div>
+              )}
+              {day.pairs.map(({ planned, actual }, i) => {
+                const pk = plannedMatchKey(planned);
+                const label = planned.isRace
+                  ? `Race: ${planned.notes || planned.activityType}`
+                  : `${planned.activityType} Z${planned.zone} · ${planned.durationMin}m${planned.notes ? ` · ${planned.notes}` : ""}`;
+                const hasOverride = Object.prototype.hasOwnProperty.call(dayOverrides, pk);
+                const overrideValue = dayOverrides[pk];
+                const mode = !hasOverride ? "auto" : overrideValue === null ? "none" : "custom";
+                const selectedKeys = mode === "custom" ? (Array.isArray(overrideValue) ? overrideValue : [overrideValue]) : [];
+                const actualNames = actual ? (Array.isArray(actual) ? actual.map((a) => a.name) : [actual.name]) : [];
+                return (
+                  <div key={i} style={{ marginBottom: 16 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{
+                        width: 8, height: 8, borderRadius: 2,
+                        background: planned.isRace ? gold : (ACTIVITY_COLORS[planned.activityType] || dim),
+                        display: "inline-block",
+                      }} />
+                      {label}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                        <input type="radio" name={`match-mode-${day.key}-${pk}`} checked={mode === "auto"}
+                          onChange={() => onSetMatchOverride(day.key, pk, undefined)} />
+                        Auto (let the app guess)
+                      </label>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                        <input type="radio" name={`match-mode-${day.key}-${pk}`} checked={mode === "none"}
+                          onChange={() => onSetMatchOverride(day.key, pk, null)} />
+                        No match
+                      </label>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                        <input type="radio" name={`match-mode-${day.key}-${pk}`} checked={mode === "custom"}
+                          onChange={() => onSetMatchOverride(day.key, pk, actual
+                            ? (Array.isArray(actual) ? actual.map((a) => a.key) : [actual.key])
+                            : [])} />
+                        Choose specific activities
+                      </label>
+                      {mode === "custom" && (
+                        <div style={{ marginLeft: 22, display: "flex", flexDirection: "column", gap: 3, marginTop: 2 }}>
+                          {day.dayActuals.length === 0 && (
+                            <div style={{ fontSize: 11, color: dim }}>No activities synced this day.</div>
+                          )}
+                          {day.dayActuals.map((a) => (
+                            <label key={a.key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+                              <input type="checkbox" checked={selectedKeys.includes(a.key)}
+                                onChange={() => {
+                                  const next = selectedKeys.includes(a.key)
+                                    ? selectedKeys.filter((k) => k !== a.key)
+                                    : [...selectedKeys, a.key];
+                                  onSetMatchOverride(day.key, pk, next);
+                                }} />
+                              {a.activityType} · {a.durationMin}m · {a.name}
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    {mode === "auto" && (
+                      <div style={{ fontSize: 10.5, color: dim, marginTop: 4 }}>
+                        Auto-detected{actualNames.length ? ` — matched to "${actualNames.join('", "')}"` : " — no match found"}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {day.dayActuals.length === 0 && day.pairs.length > 0 && (
+                <div style={{ fontSize: 11, color: dim }}>No Strava/intervals.icu activities synced for this day.</div>
+              )}
+            </div>
           </div>
-        </div>
+        );
+      })()}
+
+
+      {listView && (
+        <Modal title="All sessions & races" onClose={() => setListView(null)} icon={ICONS.calendar} scrollKey={listView}
+          toolbar={(
+            <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+              {[["races", `Races (${races.length})`], ["single", `Single sessions (${singles.length})`], ["recurring", `Recurring (${recurring.length})`]].map(([id, label]) => (
+                <button key={id} className={`subtab ${listView === id ? "active" : ""}`} onClick={() => setListView(id)}>{label}</button>
+              ))}
+              <button className="btn-primary" onClick={() => openAdd(null)} style={{ padding: "7px 12px", fontSize: 12, marginLeft: "auto" }}>
+                <Icon path={ICONS.plus} size={13} color={ink} /> Add
+              </button>
+            </div>
+          )}>
+          <ScheduleEntryList
+            entries={listView === "races" ? races : listView === "single" ? singles : recurring}
+            empty={listView === "races" ? "No races scheduled." : listView === "single" ? "No single sessions scheduled." : "No recurring sessions."}
+            onEdit={(s) => openEdit(s.id)}
+            onDelete={(s) => setConfirmDelete({ planned: { id: s.id }, dateKey: null })} />
+        </Modal>
       )}
 
-      {singles.length > 0 && (
-        <div className="card" style={{ padding: 22 }}>
-          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Single sessions</div>
-          <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
-            {singles.map((s) => (
-              <div key={s.id} ref={(el) => { itemRefs.current[s.id] = el; }} style={scheduleRowStyle(highlightIds.includes(s.id))}>
-                <div style={{ flex: 1 }}>
-                  <b>{s.activityType}</b> · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
-                  <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
-                    {s.date}
-                    {s.notes ? ` · ${s.notes}` : ""}
-                    {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
-                  </div>
-                </div>
-                <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
-                <button title="Delete" onClick={() => { if (confirm("Delete this scheduled session?")) onDelete(s.id); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
-              </div>
-            ))}
-          </div>
-        </div>
+      {editor && (
+        <Modal title={editor.id ? "Edit schedule entry" : "Add to schedule"} onClose={() => setEditor(null)}
+          icon={editor.form.kind === "race" ? ICONS.trophy : ICONS.calendar} maxWidth={720}>
+          <ScheduleEntryEditor initialForm={editor.form} isEdit={!!editor.id} activityLibrary={activityLibrary}
+            onSave={saveEditor} onCancel={() => setEditor(null)}
+            onDelete={editor.id ? () => { setConfirmDelete({ planned: { id: editor.id }, dateKey: editor.dateKey }); setEditor(null); } : null} />
+        </Modal>
       )}
 
-      {recurring.length > 0 && (
-        <div className="card" style={{ padding: 22 }}>
-          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Recurring sessions</div>
-          <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
-            {recurring.map((s) => (
-              <div key={s.id} ref={(el) => { itemRefs.current[s.id] = el; }} style={scheduleRowStyle(highlightIds.includes(s.id))}>
-                <div style={{ flex: 1 }}>
-                  <b>{s.activityType}</b> · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
-                  <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
-                    {s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", ")} · from {s.startDate}{s.endDate ? ` to ${s.endDate}` : " (ongoing)"}
-                    {s.notes ? ` · ${s.notes}` : ""}
-                    {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
-                  </div>
-                </div>
-                <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
-                <button title="Delete" onClick={() => { if (confirm("Delete this scheduled session?")) onDelete(s.id); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      {confirmDelete && (() => {
+        const { planned, dateKey } = confirmDelete;
+        const entry = schedule.find((s) => s.id === planned.id);
+        if (!entry) return null;
+        const isRecurring = entry.kind !== "race" && entry.kind !== "single";
+        const prettyDate = dateKey ? new Date(dateKey + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" }) : null;
+        const close = () => setConfirmDelete(null);
+        return (
+          <Modal title={entry.kind === "race" ? "Remove race?" : "Remove session?"} onClose={close} icon={ICONS.trash} iconColor={coral} maxWidth={460}>
+            <div style={{ fontSize: 13, lineHeight: 1.5, marginBottom: 6 }}><b>{scheduleEntryLabel(entry)}</b></div>
+            <div style={{ fontSize: 12.5, color: dim, lineHeight: 1.5 }}>
+              {isRecurring
+                ? (prettyDate
+                  ? <>This repeats on {entry.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", ")}. Skip just {prettyDate}, or delete every occurrence?</>
+                  : <>This repeats on {entry.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", ")}. Deleting removes every occurrence.</>)
+                : <>Scheduled {entry.kind === "race" ? entry.raceDate : entry.date}. This can't be undone.</>}
+            </div>
+            {entry.source && (
+              <Banner kind="warning">
+                Imported from the <code>{entry.source}</code> training plan — it may come back the next time that plan file changes and is re-imported.
+              </Banner>
+            )}
+            <div style={{ display: "flex", gap: 10, marginTop: 18, flexWrap: "wrap" }}>
+              {isRecurring && dateKey && (
+                <button className="btn-primary" onClick={() => { skipOccurrence(entry, dateKey); close(); }}>Skip this day only</button>
+              )}
+              <button onClick={() => { onDelete(entry.id); close(); }}
+                style={{ padding: "9px 16px", borderRadius: 4, fontWeight: 700, fontSize: 13, cursor: "pointer", border: "none", background: coral, color: ink }}>
+                {isRecurring ? "Delete whole series" : entry.kind === "race" ? "Delete race" : "Delete session"}
+              </button>
+              <button className="btn-ghost" onClick={close}>Cancel</button>
+            </div>
+          </Modal>
+        );
+      })()}
 
     </div>
   );
 }
 
+function ScheduleEntryList({ entries, empty, onEdit, onDelete }) {
+  if (!entries.length) return <div style={{ fontSize: 12.5, color: dim }}>{empty}</div>;
+  const iconBtn = { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim };
+  return (
+    <div style={{ display: "grid", gap: 8 }}>
+      {entries.map((s) => (
+        <div key={s.id} style={scheduleRowStyle(false)}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {s.kind === "race"
+              ? <><b>{s.notes || s.activityType}</b> · {s.activityType} · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min</>
+              : <><b>{s.activityType}</b> · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min</>}
+            <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
+              {s.kind === "race"
+                ? <>{s.raceDate} · {s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper"} · {raceCarbLoadDays(s) > 0 ? `carb-load ${raceCarbLoadDays(s)}d` : "no carb-load"}</>
+                : s.kind === "single"
+                ? <>{s.date}{s.notes ? ` · ${s.notes}` : ""}</>
+                : <>{s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", ")} · from {s.startDate}{s.endDate ? ` to ${s.endDate}` : " (ongoing)"}{s.notes ? ` · ${s.notes}` : ""}{s.skipDates && s.skipDates.length ? ` · ${s.skipDates.length} day${s.skipDates.length === 1 ? "" : "s"} skipped` : ""}</>}
+              {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
+              {s.source && ` · from ${s.source}`}
+            </div>
+          </div>
+          <button title="Edit" onClick={() => onEdit(s)} style={iconBtn}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
+          <button title="Delete" onClick={() => onDelete(s)} style={iconBtn}><Icon path={ICONS.trash} size={13} color={coral} /></button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Dashboard header strip: one "Sync now" for every connected source, with
+// each source's last-sync time and any error from the latest attempt.
+function DashboardSyncBar({ onSync, running, finishedAt, sources, onOpenSetup }) {
+  const connected = sources.filter((s) => s.connected);
+  const missing = sources.filter((s) => !s.connected);
+  const errors = connected.filter((s) => s.error);
+  const fmtTime = (t) => (t ? new Date(t).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "never");
+  return (
+    <div className="card" style={{ padding: "12px 16px", marginBottom: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+        <button className="btn-primary" onClick={onSync} disabled={running || connected.length === 0}
+          title={connected.length ? `Refresh ${connected.map((s) => s.name).join(", ")}` : "Nothing is connected yet"}>
+          <Icon path={ICONS.refresh} size={13} color={ink} /> {running ? "Syncing…" : "Sync now"}
+        </button>
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 11.5, fontFamily: mono, color: dim }}>
+          {connected.map((s) => (
+            <span key={s.name} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <Icon path={s.error ? ICONS.warn : ICONS.check} size={11} color={s.error ? coral : mint} />
+              {s.name} · {fmtTime(s.lastSynced)}
+            </span>
+          ))}
+        </div>
+        {!running && finishedAt && errors.length === 0 && connected.length > 0 && (
+          <span style={{ fontSize: 12, color: mint, display: "flex", alignItems: "center", gap: 5 }}>
+            <Icon path={ICONS.check} size={12} color={mint} /> Synced
+          </span>
+        )}
+        {missing.length > 0 && (
+          <span style={{ fontSize: 11.5, color: dim, marginLeft: "auto" }}>
+            Not connected: {missing.map((s) => s.name).join(", ")} ·{" "}
+            <button onClick={onOpenSetup} style={{ background: "none", border: "none", padding: 0, color: cyan, cursor: "pointer", fontSize: 11.5 }}>Setup</button>
+          </span>
+        )}
+      </div>
+      {errors.map((s) => <Banner key={s.name} kind="error">{s.name}: {s.error}</Banner>)}
+    </div>
+  );
+}
 
 function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units, targetWindowDays, ironmanStatus, imProjection, imProjectionError, imMissingCalibration }) {
   const wUnit = weightUnitLabel(units);

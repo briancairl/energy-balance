@@ -121,16 +121,22 @@ text filter on top that matches panel titles, per-panel `keywords`, and the pane
 per-browser preference in `localStorage` (`panels:setup`, `panels:log`), not the server store.
 - Setup: Athlete profile, Training data (the "days of training data to pull" `rangeDays` selector +
   manual "Pull training data" button), Import schedule (the `.json` plan drop zone that writes into
-  `schedule_sources/`), Strava, intervals.icu, Nutrition logging connection (MacrosFirst status +
-  "Sync now"), Model tuning, Goal, App update.
+  `schedule_sources/`), Training connections (Strava + intervals.icu status in one panel), Nutrition
+  logging connection (MacrosFirst status + "Sync now"), Model tuning, Goal, App update.
 - Log: manual macros, weight, CSV import. The stored nutrition / training / weight
   logs live behind the "Stored data…" button (a modal with one tab each). The training tab is
   read-only: every cached Strava + intervals.icu activity, with intervals.icu rows on Strava days dimmed
   (the model ignores them there).
-- Schedule: the 3-week calendar is the editor. Hovering a day shows **+** (add a session or race there, in a
+- Schedule: the calendar has three views (per-browser `localStorage` key `schedule-view`): **3 weeks**
+  (default grid from this Sunday), **Month** (same grid, 4 weeks) and **Week** (one Sunday–Saturday week
+  as a vertically scrollable list of day rows, with ‹ "Week of …" › navigation and a Today button;
+  `weekOffset` is relative to this week). All three share the same day/chip rendering.
+  The calendar is the editor. Hovering a day shows **+** (add a session or race there, in a
   pop-up `ScheduleEntryEditor`); hovering a planned chip shows a trash icon (confirm dialog); clicking a chip
   opens it for editing (the pop-up also has Delete, which is how phones delete — the chip trash is hidden
-  under 700px). The full Races / Single / Recurring lists live behind "All sessions & races".
+  under 700px, except in Week view). The full Races / Single / Recurring lists live behind "All sessions & races".
+- Pop-outs (`Modal`) are capped at the viewport height: title and sub-tabs (`toolbar` prop) stay fixed and
+  only the body scrolls (table headers are sticky inside it).
   Deleting one occurrence of a recurring session ("Skip this day only") adds the date to the entry's
   `skipDates`, honoured by `getScheduledSessionsForDate` and by `schedule_sync.covered_by_existing`.
 

@@ -797,6 +797,7 @@
     download: "M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3",
     search: "M11 19a8 8 0 100-16 8 8 0 000 16zM21 21l-4.35-4.35",
     chevronRight: "M9 18l6-6-6-6",
+    chevronLeft: "M15 18l-6-6 6-6",
     database: "M12 8c4.97 0 9-1.34 9-3s-4.03-3-9-3-9 1.34-9 3 4.03 3 9 3zM21 12c0 1.66-4 3-9 3s-9-1.34-9-3M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"
   };
   const SEVERITY_COLOR = { low: cyan, medium: amber, high: coral };
@@ -1565,6 +1566,12 @@
         .cal-chip-wrap:hover .chip-del, .chip-del:focus-visible { opacity: 1; }
         @media (hover: none) { .cal-add, .chip-del { opacity: 1; } }
         @media (max-width: 700px) { .chip-del { display: none; } }
+        .modal-body table.data thead th { position: sticky; top: 0; background: ${panel}; z-index: 1; }
+        .cal-week .cal-pair { flex: 0 1 420px; min-width: 0; }
+        .cal-week .cal-chips > .cal-chip-wrap { flex: 0 1 220px; }
+        .cal-week .cal-chip-text { display: inline !important; }
+        .cal-week .cal-chip-emoji { display: none !important; }
+        @media (max-width: 700px) { .cal-week .chip-del { display: flex; } .cal-week .cal-pair { flex-basis: 100%; } }
         .subtab { padding: 7px 14px; border-radius: 4px; font-size: 12.5px; font-weight: 600; cursor: pointer; border: 1px solid ${line}; background: transparent; color: ${dim}; }
         .subtab.active { background: ${panel2}; color: ${cyan}; border-color: ${cyan}; }
         .fieldlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: ${dim}; margin-bottom: 6px; display:block; font-weight:600; }
@@ -1822,9 +1829,13 @@
     }));
   }
   const modalStack = [];
-  function Modal({ title, onClose, children, icon = ICONS.database, iconColor = cyan, maxWidth = 1100 }) {
+  function Modal({ title, onClose, children, icon = ICONS.database, iconColor = cyan, maxWidth = 1100, toolbar = null, scrollKey }) {
     const onCloseRef = useRef(onClose);
     onCloseRef.current = onClose;
+    const bodyRef = useRef(null);
+    useEffect(() => {
+      if (bodyRef.current) bodyRef.current.scrollTop = 0;
+    }, [scrollKey]);
     useEffect(() => {
       const token = {};
       modalStack.push(token);
@@ -1846,7 +1857,7 @@
         onMouseDown: (e) => {
           if (e.target === e.currentTarget) onClose();
         },
-        style: { position: "fixed", inset: 0, zIndex: 100, background: "rgba(0,0,0,0.55)", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: "clamp(8px, 4vh, 48px) clamp(8px, 3vw, 32px)", overflowY: "auto" }
+        style: { position: "fixed", inset: 0, zIndex: 100, background: "rgba(0,0,0,0.55)", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: "clamp(8px, 4vh, 48px) clamp(8px, 3vw, 32px)" }
       },
       /* @__PURE__ */ React.createElement(
         "div",
@@ -1855,10 +1866,10 @@
           "aria-modal": "true",
           "aria-label": title,
           className: "card",
-          style: { width: "100%", maxWidth, padding: 22, boxShadow: "0 18px 48px rgba(0,0,0,0.5)" }
+          style: { width: "100%", maxWidth, maxHeight: "100%", display: "flex", flexDirection: "column", boxShadow: "0 18px 48px rgba(0,0,0,0.5)", overflow: "hidden" }
         },
-        /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 16, display: "flex", alignItems: "center", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: icon, size: 16, color: iconColor }), " ", title), /* @__PURE__ */ React.createElement("button", { onClick: onClose, "aria-label": "Close", style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 } }, "\xD7")),
-        children
+        /* @__PURE__ */ React.createElement("div", { style: { padding: "22px 22px 0", flexShrink: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 16, display: "flex", alignItems: "center", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: icon, size: 16, color: iconColor }), " ", title), /* @__PURE__ */ React.createElement("button", { onClick: onClose, "aria-label": "Close", style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 } }, "\xD7")), toolbar),
+        /* @__PURE__ */ React.createElement("div", { ref: bodyRef, className: "modal-body", style: { overflowY: "auto", overscrollBehavior: "contain", minHeight: 0, flex: "1 1 auto", padding: "0 22px 22px" } }, children)
       )
     );
   }
@@ -1955,21 +1966,12 @@
         content: /* @__PURE__ */ React.createElement(ScheduleImportPanel, { onImportFile: onImportScheduleFile, importFileError: scheduleImportError, importFileNotice: scheduleImportNotice })
       },
       {
-        id: "strava",
-        title: "Strava connection",
-        icon: ICONS.flame,
-        iconColor: amber,
-        keywords: "training calories oauth connect",
-        summary: stravaSummary,
-        content: /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Strava only exposes accurate per-activity ", /* @__PURE__ */ React.createElement("code", null, "calories"), " through an authenticated, server-side call \u2014 this runs through ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " next to this page, which keeps your client secret out of the browser. See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup. Every pull is cached to disk by date server-side, so repeat pulls only ever hit Strava for today \u2014 a fresh nutrition entry also triggers a background sync for just that date."), !stravaStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : stravaStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : stravaStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Server is missing ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " \u2014 copy ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), ", fill in your Strava client_id/secret, and restart ", /* @__PURE__ */ React.createElement("code", null, "server.py"), ".") : stravaStatus.connected ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected", ((_a = stravaStatus.athlete) == null ? void 0 : _a.firstname) ? ` as ${stravaStatus.athlete.firstname} ${stravaStatus.athlete.lastname || ""}` : "")) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? /* @__PURE__ */ React.createElement("a", { className: "btn-primary", href: "/login", style: { textDecoration: "none", width: "fit-content" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 13, color: ink }), " Connect to Strava") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, "Connect from ", /* @__PURE__ */ React.createElement("code", null, "http://localhost:", window.location.port, "/"), " on the computer running ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " \u2014 Strava's OAuth callback only works there. Every device on this network shares that connection automatically once it's made."), stravaLastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "last synced ", new Date(stravaLastFetched).toLocaleString(), " \xB7 ", stravaSyncedCount, " day", stravaSyncedCount === 1 ? "" : "s", " covered"), stravaError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: coral }), /* @__PURE__ */ React.createElement("span", null, stravaError)))
-      },
-      {
-        id: "intervals",
-        title: "intervals.icu connection",
+        id: "training-connections",
+        title: "Training connections",
         icon: ICONS.link,
-        keywords: "optional wellness tsb ctl atl api key",
-        summary: intervalsSummary,
-        content: /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 8 } }, "Optional \u2014 wellness / TSB only."), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Used only for CTL/ATL/TSB (recovery buffer below) and as a calorie fallback on days Strava has no data. Fetched and cached server-side too, the same way as Strava \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "intervals_api_key"), "(and optionally ", /* @__PURE__ */ React.createElement("code", null, "intervals_athlete_id"), ", default ", /* @__PURE__ */ React.createElement("code", null, "0"), ") to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), "and restart ", /* @__PURE__ */ React.createElement("code", null, "server.py"), ". Get the key from intervals.icu \u2192 Settings \u2192 Developer Settings."), !intervalsStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : intervalsStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : intervalsStatus.configured ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Configured \u2014 athlete ", intervalsStatus.athleteId)) : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "intervals_api_key"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server to enable this."), lastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "last synced ", new Date(lastFetched).toLocaleString(), " \xB7 ", intervalsSyncedCount, " day", intervalsSyncedCount === 1 ? "" : "s", " covered"))
+        keywords: "strava intervals.icu intervals training calories oauth connect optional wellness tsb ctl atl api key",
+        summary: `Strava ${stravaSummary} \xB7 intervals.icu ${intervalsSummary}`,
+        content: /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 6, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 15, color: amber }), " Strava"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Strava only exposes accurate per-activity ", /* @__PURE__ */ React.createElement("code", null, "calories"), " through an authenticated, server-side call \u2014 this runs through ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " next to this page, which keeps your client secret out of the browser. See ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), " for setup. Every pull is cached to disk by date server-side, so repeat pulls only ever hit Strava for today \u2014 a fresh nutrition entry also triggers a background sync for just that date."), !stravaStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : stravaStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : stravaStatus.configError ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Server is missing ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " \u2014 copy ", /* @__PURE__ */ React.createElement("code", null, "config.example.json"), ", fill in your Strava client_id/secret, and restart ", /* @__PURE__ */ React.createElement("code", null, "server.py"), ".") : stravaStatus.connected ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Connected", ((_a = stravaStatus.athlete) == null ? void 0 : _a.firstname) ? ` as ${stravaStatus.athlete.firstname} ${stravaStatus.athlete.lastname || ""}` : "")) : ["localhost", "127.0.0.1"].includes(window.location.hostname) ? /* @__PURE__ */ React.createElement("a", { className: "btn-primary", href: "/login", style: { textDecoration: "none", width: "fit-content" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 13, color: ink }), " Connect to Strava") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, "Connect from ", /* @__PURE__ */ React.createElement("code", null, "http://localhost:", window.location.port, "/"), " on the computer running ", /* @__PURE__ */ React.createElement("code", null, "server.py"), " \u2014 Strava's OAuth callback only works there. Every device on this network shares that connection automatically once it's made."), stravaLastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "last synced ", new Date(stravaLastFetched).toLocaleString(), " \xB7 ", stravaSyncedCount, " day", stravaSyncedCount === 1 ? "" : "s", " covered"), stravaError && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, background: "rgba(225,96,77,0.12)", border: `1px solid ${coral}`, borderRadius: 4, padding: "10px 12px", fontSize: 12.5, display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.warn, size: 15, color: coral }), /* @__PURE__ */ React.createElement("span", null, stravaError)), /* @__PURE__ */ React.createElement("div", { style: { borderTop: `1px solid ${line}`, margin: "20px 0 16px" } }), /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 6, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.activity, size: 15, color: cyan }), " intervals.icu ", /* @__PURE__ */ React.createElement("span", { style: { color: dim, fontWeight: 400, fontSize: 12.5 } }, "(optional \u2014 wellness / TSB only)")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, "Used only for CTL/ATL/TSB (recovery buffer below) and as a calorie fallback on days Strava has no data. Fetched and cached server-side too, the same way as Strava \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "intervals_api_key"), "(and optionally ", /* @__PURE__ */ React.createElement("code", null, "intervals_athlete_id"), ", default ", /* @__PURE__ */ React.createElement("code", null, "0"), ") to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), "and restart ", /* @__PURE__ */ React.createElement("code", null, "server.py"), ". Get the key from intervals.icu \u2192 Settings \u2192 Developer Settings."), !intervalsStatus.checked ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Checking connection\u2026") : intervalsStatus.unreachable ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: coral } }, "Can't reach the local server. Make sure you're running this page via ", /* @__PURE__ */ React.createElement("code", null, "python3 server.py"), ", not a plain file server.") : intervalsStatus.configured ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 15, color: mint }), /* @__PURE__ */ React.createElement("span", null, "Configured \u2014 athlete ", intervalsStatus.athleteId)) : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, "Not configured \u2014 add ", /* @__PURE__ */ React.createElement("code", null, "intervals_api_key"), " to ", /* @__PURE__ */ React.createElement("code", null, "config.json"), " and restart the server to enable this."), lastFetched && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono } }, "last synced ", new Date(lastFetched).toLocaleString(), " \xB7 ", intervalsSyncedCount, " day", intervalsSyncedCount === 1 ? "" : "s", " covered"))
       },
       {
         id: "macrosfirst",
@@ -2334,11 +2336,22 @@
       /* @__PURE__ */ React.createElement(Icon, { path: ICONS.database, size: 13, color: cyan }),
       " Stored data\u2026"
     );
-    return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(PanelList, { storageKey: "log", panels, placeholder: "Search log (weight, csv, macros\u2026)", toolbar: storedButton }), storedView && /* @__PURE__ */ React.createElement(Modal, { title: "Stored data", onClose: () => setStoredView(null) }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" } }, [
-      ["nutrition", `Nutrition (${dayCount})`],
-      ["training", `Training (${trainingCount})`],
-      ["weight", `Weight (${weightCount})`]
-    ].map(([id, label]) => /* @__PURE__ */ React.createElement("button", { key: id, className: `subtab ${storedView === id ? "active" : ""}`, onClick: () => setStoredView(id) }, label))), storedView === "nutrition" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 } }, dayCount, " day", dayCount === 1 ? "" : "s", " of intake saved. Click the pencil to edit a day."), dayCount > 0 && /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto" } }, /* @__PURE__ */ React.createElement(NutritionLogTable, { nutrition, onSave: onSaveManualDay, onDelete: onDeleteDay }))), storedView === "training" && /* @__PURE__ */ React.createElement(TrainingLogView, { stravaData, intervalsData, kcalOverrides }), storedView === "weight" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 } }, weightCount, " day", weightCount === 1 ? "" : "s", " of weight saved. Click the pencil to edit a day."), weightCount > 0 && /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto" } }, /* @__PURE__ */ React.createElement(WeightLogTable, { weightLog, onSave: onSaveWeight, onDelete: onDeleteWeight, units })))));
+    return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(PanelList, { storageKey: "log", panels, placeholder: "Search log (weight, csv, macros\u2026)", toolbar: storedButton }), storedView && /* @__PURE__ */ React.createElement(
+      Modal,
+      {
+        title: "Stored data",
+        onClose: () => setStoredView(null),
+        scrollKey: storedView,
+        toolbar: /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" } }, [
+          ["nutrition", `Nutrition (${dayCount})`],
+          ["training", `Training (${trainingCount})`],
+          ["weight", `Weight (${weightCount})`]
+        ].map(([id, label]) => /* @__PURE__ */ React.createElement("button", { key: id, className: `subtab ${storedView === id ? "active" : ""}`, onClick: () => setStoredView(id) }, label)))
+      },
+      storedView === "nutrition" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 } }, dayCount, " day", dayCount === 1 ? "" : "s", " of intake saved. Click the pencil to edit a day."), dayCount > 0 && /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto" } }, /* @__PURE__ */ React.createElement(NutritionLogTable, { nutrition, onSave: onSaveManualDay, onDelete: onDeleteDay }))),
+      storedView === "training" && /* @__PURE__ */ React.createElement(TrainingLogView, { stravaData, intervalsData, kcalOverrides }),
+      storedView === "weight" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: weightCount ? 16 : 0 } }, weightCount, " day", weightCount === 1 ? "" : "s", " of weight saved. Click the pencil to edit a day."), weightCount > 0 && /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto" } }, /* @__PURE__ */ React.createElement(WeightLogTable, { weightLog, onSave: onSaveWeight, onDelete: onDeleteWeight, units })))
+    ));
   }
   function TrainingLogView({ stravaData, intervalsData, kcalOverrides }) {
     const [filter, setFilter] = useState("");
@@ -2864,6 +2877,22 @@
     const [confirmDelete, setConfirmDelete] = useState(null);
     const [listView, setListView] = useState(null);
     const [editingMatchDay, setEditingMatchDay] = useState(null);
+    const [calView, setCalViewState] = useState(() => {
+      try {
+        return localStorage.getItem("schedule-view") || "3week";
+      } catch {
+        return "3week";
+      }
+    });
+    const setCalView = (v) => {
+      setCalViewState(v);
+      try {
+        localStorage.setItem("schedule-view", v);
+      } catch {
+      }
+    };
+    const [weekOffset, setWeekOffset] = useState(0);
+    const weekListRef = useRef(null);
     const showActual = profile.scheduleShowActual !== false;
     const showCalories = profile.scheduleShowCalories !== false;
     const activityLibrary = useMemo(
@@ -2896,9 +2925,10 @@
       const { id, ...rest } = entry;
       onUpdate(id, { ...rest, skipDates: Array.from(/* @__PURE__ */ new Set([...entry.skipDates || [], dateKey])).sort() });
     }
-    const calendarStart = daysAgo((/* @__PURE__ */ new Date()).getDay());
+    const calendarStart = daysAgo((/* @__PURE__ */ new Date()).getDay() - (calView === "week" ? weekOffset * 7 : 0));
+    const calendarLength = calView === "week" ? 7 : calView === "month" ? 28 : 21;
     const calendarDays = [];
-    for (let i = 0; i < 21; i++) {
+    for (let i = 0; i < calendarLength; i++) {
       const d = new Date(calendarStart);
       d.setDate(d.getDate() + i);
       const key = toLocalISODate(d);
@@ -2926,7 +2956,33 @@
       });
     }
     const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, display: "flex", alignItems: "center", gap: 7, marginRight: "auto" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: () => openAdd(null), style: { padding: "7px 12px", fontSize: 12 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 13, color: ink }), " Add"), /* @__PURE__ */ React.createElement(
+    const isWeekView = calView === "week";
+    const weekRelLabel = weekOffset === 0 ? "This week" : weekOffset === 1 ? "Next week" : weekOffset === -1 ? "Last week" : weekOffset > 0 ? `In ${weekOffset} weeks` : `${-weekOffset} weeks ago`;
+    const rangeLabel = isWeekView ? weekRelLabel : calView === "month" ? "Next 4 weeks" : "Next 3 weeks";
+    useEffect(() => {
+      if (!isWeekView || weekOffset !== 0) return;
+      const list = weekListRef.current;
+      const el = list && list.querySelector('[data-today="true"]');
+      if (!el) return;
+      const top = el.offsetTop - list.offsetTop;
+      const overflow = top + el.offsetHeight - list.clientHeight;
+      if (overflow > 0) list.scrollTop = Math.min(top - 4, overflow + 4);
+    }, [isWeekView, weekOffset]);
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, display: "flex", alignItems: "center", gap: 7, marginRight: "auto" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Calendar"), /* @__PURE__ */ React.createElement("div", { role: "tablist", "aria-label": "Calendar view", style: { display: "flex", gap: 4 } }, [["3week", "3 weeks"], ["month", "Month"], ["week", "Week"]].map(([id, label]) => /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        key: id,
+        role: "tab",
+        "aria-selected": calView === id,
+        className: `subtab ${calView === id ? "active" : ""}`,
+        onClick: () => {
+          setCalView(id);
+          if (id === "week") setWeekOffset(0);
+        },
+        style: { padding: "6px 11px", fontSize: 12 }
+      },
+      label
+    ))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: () => openAdd(null), style: { padding: "7px 12px", fontSize: 12 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 13, color: ink }), " Add"), /* @__PURE__ */ React.createElement(
       "button",
       {
         className: "btn-ghost",
@@ -2951,191 +3007,222 @@
         checked: showCalories,
         onChange: (e) => setProfile((p) => ({ ...p, scheduleShowCalories: e.target.checked }))
       }
-    ), "Show expected/actual calories burned")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "Next 3 weeks \xB7 hover a day for ", /* @__PURE__ */ React.createElement("b", { style: { color: paper } }, "+"), " to add, a session for ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 10, color: coral }), " to remove, click a session to edit"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day"), showActual && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, "solid = planned, outline = actual ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 10, color: mint }), " matched"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim }), " correct a match")), showCalories && /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { color: cyan } }, "expected"), " / ", /* @__PURE__ */ React.createElement("span", { style: { color: amber } }, "actual"), " kcal burned")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
-      const isToday = day.key === todayKey;
-      const isPast = day.key < todayKey;
-      const isFirstOfMonth = day.date.getDate() === 1;
-      function plannedChip(planned, i, isGroup) {
-        return /* @__PURE__ */ React.createElement("div", { key: `p${i}`, className: "cal-chip-wrap" }, plannedChipBody(planned, isGroup), /* @__PURE__ */ React.createElement(
-          "button",
-          {
-            type: "button",
-            className: "chip-del",
-            "aria-label": "Remove from schedule",
-            title: planned.isRace ? "Remove this race" : "Remove this session",
-            onClick: (e) => {
-              e.stopPropagation();
-              setConfirmDelete({ planned, dateKey: day.key });
+    ), "Show expected/actual calories burned")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, rangeLabel, " \xB7 hover a day for ", /* @__PURE__ */ React.createElement("b", { style: { color: paper } }, "+"), " to add, a session for ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 10, color: coral }), " to remove, click a session to edit"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day"), showActual && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, "solid = planned, outline = actual ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 10, color: mint }), " matched"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim }), " correct a match")), showCalories && /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { color: cyan } }, "expected"), " / ", /* @__PURE__ */ React.createElement("span", { style: { color: amber } }, "actual"), " kcal burned")), isWeekView && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 12 } }, /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        className: "btn-ghost",
+        onClick: () => setWeekOffset((o) => o - 1),
+        "aria-label": "Previous week",
+        title: "Previous week",
+        style: { padding: "6px 10px", display: "flex" }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.chevronLeft, size: 16, color: paper })
+    ), /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", minWidth: 190 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 14.5 } }, "Week of ", calendarDays[0].date.toLocaleDateString(void 0, { weekday: "short", month: "short", day: "numeric", year: "numeric" })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: weekOffset === 0 ? cyan : dim } }, weekRelLabel)), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        className: "btn-ghost",
+        onClick: () => setWeekOffset((o) => o + 1),
+        "aria-label": "Next week",
+        title: "Next week",
+        style: { padding: "6px 10px", display: "flex" }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.chevronRight, size: 16, color: paper })
+    ), weekOffset !== 0 && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: () => setWeekOffset(0), style: { padding: "6px 10px", fontSize: 12 } }, "Today")), /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        ref: weekListRef,
+        className: isWeekView ? "cal-week" : void 0,
+        style: isWeekView ? { display: "flex", flexDirection: "column", gap: 6, maxHeight: "min(70vh, 900px)", overflowY: "auto", paddingRight: 4 } : { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }
+      },
+      !isWeekView && WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)),
+      calendarDays.map((day) => {
+        const isToday = day.key === todayKey;
+        const isPast = day.key < todayKey;
+        const isFirstOfMonth = day.date.getDate() === 1;
+        function plannedChip(planned, i, isGroup) {
+          return /* @__PURE__ */ React.createElement("div", { key: `p${i}`, className: "cal-chip-wrap" }, plannedChipBody(planned, isGroup), /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              className: "chip-del",
+              "aria-label": "Remove from schedule",
+              title: planned.isRace ? "Remove this race" : "Remove this session",
+              onClick: (e) => {
+                e.stopPropagation();
+                setConfirmDelete({ planned, dateKey: day.key });
+              },
+              style: { position: "absolute", right: 1, top: "50%", transform: "translateY(-50%)", background: panel, border: `1px solid ${line}`, borderRadius: 3, padding: 2, cursor: "pointer", display: "flex", lineHeight: 0 }
             },
-            style: { position: "absolute", right: 1, top: "50%", transform: "translateY(-50%)", background: panel, border: `1px solid ${line}`, borderRadius: 3, padding: 2, cursor: "pointer", display: "flex", lineHeight: 0 }
-          },
-          /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 9, color: coral })
-        ));
-      }
-      function plannedChipBody(planned, isGroup) {
-        const onClick = (e) => {
-          e.stopPropagation();
-          openEdit(planned.id, day.key);
-        };
-        if (planned.isRace) {
+            /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 9, color: coral })
+          ));
+        }
+        function plannedChipBody(planned, isGroup) {
+          const onClick = (e) => {
+            e.stopPropagation();
+            openEdit(planned.id, day.key);
+          };
+          if (planned.isRace) {
+            return /* @__PURE__ */ React.createElement(
+              "div",
+              {
+                onClick,
+                title: `Race: ${planned.notes || planned.activityType} \xB7 ${planned.durationMin}min${isGroup ? " \xB7 matched to multiple activities" : ""} \u2014 click to edit`,
+                style: {
+                  cursor: "pointer",
+                  background: gold,
+                  color: ink,
+                  borderRadius: 3,
+                  padding: "2px 5px",
+                  fontSize: 10.5,
+                  lineHeight: 1.3,
+                  fontWeight: 700,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 3,
+                  overflow: "hidden"
+                }
+              },
+              /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 9, color: ink }),
+              /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, planned.notes || planned.activityType),
+              /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, "\u{1F3C6}"),
+              isGroup && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 8, color: ink })
+            );
+          }
           return /* @__PURE__ */ React.createElement(
             "div",
             {
               onClick,
-              title: `Race: ${planned.notes || planned.activityType} \xB7 ${planned.durationMin}min${isGroup ? " \xB7 matched to multiple activities" : ""} \u2014 click to edit`,
+              title: `${planned.activityType} \xB7 ${ZONES[planned.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${planned.durationMin}min${planned.notes ? ` \xB7 ${planned.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}${isGroup ? " \xB7 matched to multiple activities" : ""} \u2014 click to edit`,
               style: {
                 cursor: "pointer",
-                background: gold,
+                background: ACTIVITY_COLORS[planned.activityType] || dim,
                 color: ink,
                 borderRadius: 3,
                 padding: "2px 5px",
                 fontSize: 10.5,
                 lineHeight: 1.3,
-                fontWeight: 700,
+                fontWeight: 600,
+                display: "flex",
+                alignItems: "center",
+                gap: 3,
+                opacity: day.taper ? 0.65 : 1,
+                overflow: "hidden"
+              }
+            },
+            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, planned.activityType, " Z", planned.zone, " \xB7 ", planned.durationMin, "m"),
+            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[planned.activityType] || "\u{1F3AF}"),
+            isPreloadWorthy(planned) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink }),
+            isGroup && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 8, color: ink })
+          );
+        }
+        function actualChip(actual, matched, i, manual) {
+          const color = ACTIVITY_COLORS[actual.activityType] || dim;
+          return /* @__PURE__ */ React.createElement(
+            "div",
+            {
+              key: `a${i}`,
+              title: `${actual.name} \xB7 ${actual.activityType} \xB7 ${actual.durationMin}min${matched ? " \xB7 matched to the plan" : " \xB7 not on the schedule"}${manual ? " \xB7 manually corrected" : ""}`,
+              style: {
+                border: `1px solid ${color}`,
+                color,
+                borderRadius: 3,
+                padding: "2px 5px",
+                fontSize: 10.5,
+                lineHeight: 1.3,
+                fontWeight: 600,
                 display: "flex",
                 alignItems: "center",
                 gap: 3,
                 overflow: "hidden"
               }
             },
-            /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 9, color: ink }),
-            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, planned.notes || planned.activityType),
-            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, "\u{1F3C6}"),
-            isGroup && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 8, color: ink })
+            matched && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 9, color }),
+            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, actual.activityType, " \xB7 ", actual.durationMin, "m"),
+            /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[actual.activityType] || "\u{1F3AF}"),
+            manual && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 8, color })
           );
+        }
+        function actualChipGroup(actuals, i, manual) {
+          return /* @__PURE__ */ React.createElement("div", { key: `ag${i}`, style: {
+            display: "flex",
+            flexDirection: "column",
+            gap: 2,
+            border: `1px dashed ${dim}`,
+            borderRadius: 4,
+            padding: 2
+          } }, actuals.map((a, j) => actualChip(a, true, `${i}-${j}`, manual)));
         }
         return /* @__PURE__ */ React.createElement(
           "div",
           {
-            onClick,
-            title: `${planned.activityType} \xB7 ${ZONES[planned.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${planned.durationMin}min${planned.notes ? ` \xB7 ${planned.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}${isGroup ? " \xB7 matched to multiple activities" : ""} \u2014 click to edit`,
+            key: day.key,
+            className: "cal-day",
+            "data-today": isToday ? "true" : void 0,
             style: {
-              cursor: "pointer",
-              background: ACTIVITY_COLORS[planned.activityType] || dim,
-              color: ink,
-              borderRadius: 3,
-              padding: "2px 5px",
-              fontSize: 10.5,
-              lineHeight: 1.3,
-              fontWeight: 600,
+              background: panel2,
+              border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
+              borderRadius: 5,
+              padding: isWeekView ? "8px 10px" : 6,
+              minHeight: isWeekView ? 56 : 76,
+              flexShrink: 0,
               display: "flex",
-              alignItems: "center",
+              flexDirection: "column",
               gap: 3,
-              opacity: day.taper ? 0.65 : 1,
-              overflow: "hidden"
+              opacity: isPast ? 0.5 : 1
             }
           },
-          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, planned.activityType, " Z", planned.zone, " \xB7 ", planned.durationMin, "m"),
-          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[planned.activityType] || "\u{1F3AF}"),
-          isPreloadWorthy(planned) && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: ink }),
-          isGroup && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.link, size: 8, color: ink })
-        );
-      }
-      function actualChip(actual, matched, i, manual) {
-        const color = ACTIVITY_COLORS[actual.activityType] || dim;
-        return /* @__PURE__ */ React.createElement(
-          "div",
-          {
-            key: `a${i}`,
-            title: `${actual.name} \xB7 ${actual.activityType} \xB7 ${actual.durationMin}min${matched ? " \xB7 matched to the plan" : " \xB7 not on the schedule"}${manual ? " \xB7 manually corrected" : ""}`,
-            style: {
-              border: `1px solid ${color}`,
-              color,
-              borderRadius: 3,
-              padding: "2px 5px",
-              fontSize: 10.5,
-              lineHeight: 1.3,
-              fontWeight: 600,
-              display: "flex",
-              alignItems: "center",
-              gap: 3,
-              overflow: "hidden"
-            }
-          },
-          matched && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 9, color }),
-          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-text" }, actual.activityType, " \xB7 ", actual.durationMin, "m"),
-          /* @__PURE__ */ React.createElement("span", { className: "cal-chip-emoji" }, ACTIVITY_EMOJI[actual.activityType] || "\u{1F3AF}"),
-          manual && /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 8, color })
-        );
-      }
-      function actualChipGroup(actuals, i, manual) {
-        return /* @__PURE__ */ React.createElement("div", { key: `ag${i}`, style: {
-          display: "flex",
-          flexDirection: "column",
-          gap: 2,
-          border: `1px dashed ${dim}`,
-          borderRadius: 4,
-          padding: 2
-        } }, actuals.map((a, j) => actualChip(a, true, `${i}-${j}`, manual)));
-      }
-      return /* @__PURE__ */ React.createElement(
-        "div",
-        {
-          key: day.key,
-          className: "cal-day",
-          style: {
-            background: panel2,
-            border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
-            borderRadius: 5,
-            padding: 6,
-            minHeight: 76,
-            display: "flex",
-            flexDirection: "column",
-            gap: 3,
-            opacity: isPast ? 0.5 : 1
-          }
-        },
-        /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold })), /* @__PURE__ */ React.createElement("span", { style: { marginLeft: "auto", display: "flex", alignItems: "center", gap: 4 } }, showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && /* @__PURE__ */ React.createElement(
-          "button",
-          {
-            type: "button",
-            title: "Correct planned/actual matches for this day",
-            onClick: (e) => {
-              e.stopPropagation();
-              setEditingMatchDay(day.key);
+          /* @__PURE__ */ React.createElement("div", { style: { fontSize: isWeekView ? 12.5 : 11, color: isToday ? cyan : isWeekView ? paper : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isWeekView ? /* @__PURE__ */ React.createElement(React.Fragment, null, day.date.toLocaleDateString(void 0, { weekday: "long", month: "short", day: "numeric" }), isToday && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10.5, color: cyan, marginLeft: 4 } }, "today")) : isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold })), /* @__PURE__ */ React.createElement("span", { style: { marginLeft: "auto", display: "flex", alignItems: "center", gap: 4 } }, showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              title: "Correct planned/actual matches for this day",
+              onClick: (e) => {
+                e.stopPropagation();
+                setEditingMatchDay(day.key);
+              },
+              style: { background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }
             },
-            style: { background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }
-          },
-          /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim })
-        ), /* @__PURE__ */ React.createElement(
-          "button",
-          {
-            type: "button",
-            className: "cal-add",
-            title: "Add a session or race on this day",
-            "aria-label": "Add a session or race on this day",
-            onClick: (e) => {
-              e.stopPropagation();
-              openAdd(day.key);
+            /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim })
+          ), /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              className: "cal-add",
+              title: "Add a session or race on this day",
+              "aria-label": "Add a session or race on this day",
+              onClick: (e) => {
+                e.stopPropagation();
+                openAdd(day.key);
+              },
+              style: { background: "none", border: `1px solid ${line}`, borderRadius: 3, color: cyan, cursor: "pointer", padding: 1, display: "flex" }
             },
-            style: { background: "none", border: `1px solid ${line}`, borderRadius: 3, color: cyan, cursor: "pointer", padding: 1, display: "flex" }
-          },
-          /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 10, color: cyan })
-        ))),
-        showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && /* @__PURE__ */ React.createElement(
-          "div",
-          {
-            title: `Expected ${Math.round(day.expectedKcal)} kcal \xB7 Actual ${Math.round(day.actualKcal)} kcal burned`,
-            style: {
-              borderBottom: `1px solid ${line}`,
-              paddingBottom: 4,
-              marginBottom: 1,
-              fontSize: 10,
-              display: "flex",
-              justifyContent: "space-between",
-              gap: 4
-            }
-          },
-          /* @__PURE__ */ React.createElement("span", { style: { color: cyan, fontWeight: 600 } }, Math.round(day.expectedKcal)),
-          /* @__PURE__ */ React.createElement("span", { style: { color: dim } }, "/"),
-          /* @__PURE__ */ React.createElement("span", { style: { color: amber, fontWeight: 600 } }, Math.round(day.actualKcal))
-        ),
-        showActual ? /* @__PURE__ */ React.createElement(React.Fragment, null, day.pairs.map(({ planned, actual, manual }, i) => {
-          const isGroup = Array.isArray(actual);
-          return /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i, isGroup), isGroup ? actualChipGroup(actual, i, manual) : actual ? actualChip(actual, true, i, manual) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null);
-        }), day.extras.map((actual, i) => /* @__PURE__ */ React.createElement("div", { key: `extra${i}`, style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, /* @__PURE__ */ React.createElement("div", null), actualChip(actual, false, i)))) : day.pairs.map(({ planned }, i) => plannedChip(planned, i))
-      );
-    }))), editingMatchDay && (() => {
+            /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 10, color: cyan })
+          ))),
+          showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && /* @__PURE__ */ React.createElement(
+            "div",
+            {
+              title: `Expected ${Math.round(day.expectedKcal)} kcal \xB7 Actual ${Math.round(day.actualKcal)} kcal burned`,
+              style: {
+                borderBottom: `1px solid ${line}`,
+                paddingBottom: 4,
+                marginBottom: 1,
+                fontSize: isWeekView ? 11 : 10,
+                display: "flex",
+                justifyContent: isWeekView ? "flex-start" : "space-between",
+                gap: isWeekView ? 6 : 4
+              }
+            },
+            /* @__PURE__ */ React.createElement("span", { style: { color: cyan, fontWeight: 600 } }, Math.round(day.expectedKcal)),
+            /* @__PURE__ */ React.createElement("span", { style: { color: dim } }, "/"),
+            /* @__PURE__ */ React.createElement("span", { style: { color: amber, fontWeight: 600 } }, Math.round(day.actualKcal))
+          ),
+          /* @__PURE__ */ React.createElement("div", { className: "cal-chips", style: { display: "flex", flexDirection: isWeekView ? "row" : "column", flexWrap: isWeekView ? "wrap" : "nowrap", gap: isWeekView ? 6 : 3 } }, isWeekView && day.pairs.length === 0 && day.extras.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: dim } }, day.taper ? "Rest \xB7 tapering" : "Rest day"), showActual ? /* @__PURE__ */ React.createElement(React.Fragment, null, day.pairs.map(({ planned, actual, manual }, i) => {
+            const isGroup = Array.isArray(actual);
+            return /* @__PURE__ */ React.createElement("div", { key: `pair${i}`, className: "cal-pair", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, plannedChip(planned, i, isGroup), isGroup ? actualChipGroup(actual, i, manual) : actual ? actualChip(actual, true, i, manual) : day.key <= todayKey ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: dim, display: "flex", alignItems: "center" } }, "not logged") : null);
+          }), day.extras.map((actual, i) => /* @__PURE__ */ React.createElement("div", { key: `extra${i}`, className: "cal-pair", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 } }, /* @__PURE__ */ React.createElement("div", null), actualChip(actual, false, i)))) : day.pairs.map(({ planned }, i) => plannedChip(planned, i)))
+        );
+      })
+    )), editingMatchDay && (() => {
       const day = calendarDays.find((d) => d.key === editingMatchDay);
       if (!day) return null;
       const dayOverrides = matchOverrides[day.key] || {};
@@ -3214,15 +3301,25 @@
           }
         ), a.activityType, " \xB7 ", a.durationMin, "m \xB7 ", a.name)))), mode === "auto" && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: dim, marginTop: 4 } }, "Auto-detected", actualNames.length ? ` \u2014 matched to "${actualNames.join('", "')}"` : " \u2014 no match found"));
       }), day.dayActuals.length === 0 && day.pairs.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim } }, "No Strava/intervals.icu activities synced for this day.")));
-    })(), listView && /* @__PURE__ */ React.createElement(Modal, { title: "All sessions & races", onClose: () => setListView(null), icon: ICONS.calendar }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" } }, [["races", `Races (${races.length})`], ["single", `Single sessions (${singles.length})`], ["recurring", `Recurring (${recurring.length})`]].map(([id, label]) => /* @__PURE__ */ React.createElement("button", { key: id, className: `subtab ${listView === id ? "active" : ""}`, onClick: () => setListView(id) }, label)), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: () => openAdd(null), style: { padding: "7px 12px", fontSize: 12, marginLeft: "auto" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 13, color: ink }), " Add")), /* @__PURE__ */ React.createElement(
-      ScheduleEntryList,
+    })(), listView && /* @__PURE__ */ React.createElement(
+      Modal,
       {
-        entries: listView === "races" ? races : listView === "single" ? singles : recurring,
-        empty: listView === "races" ? "No races scheduled." : listView === "single" ? "No single sessions scheduled." : "No recurring sessions.",
-        onEdit: (s) => openEdit(s.id),
-        onDelete: (s) => setConfirmDelete({ planned: { id: s.id }, dateKey: null })
-      }
-    )), editor && /* @__PURE__ */ React.createElement(
+        title: "All sessions & races",
+        onClose: () => setListView(null),
+        icon: ICONS.calendar,
+        scrollKey: listView,
+        toolbar: /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" } }, [["races", `Races (${races.length})`], ["single", `Single sessions (${singles.length})`], ["recurring", `Recurring (${recurring.length})`]].map(([id, label]) => /* @__PURE__ */ React.createElement("button", { key: id, className: `subtab ${listView === id ? "active" : ""}`, onClick: () => setListView(id) }, label)), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: () => openAdd(null), style: { padding: "7px 12px", fontSize: 12, marginLeft: "auto" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 13, color: ink }), " Add"))
+      },
+      /* @__PURE__ */ React.createElement(
+        ScheduleEntryList,
+        {
+          entries: listView === "races" ? races : listView === "single" ? singles : recurring,
+          empty: listView === "races" ? "No races scheduled." : listView === "single" ? "No single sessions scheduled." : "No recurring sessions.",
+          onEdit: (s) => openEdit(s.id),
+          onDelete: (s) => setConfirmDelete({ planned: { id: s.id }, dateKey: null })
+        }
+      )
+    ), editor && /* @__PURE__ */ React.createElement(
       Modal,
       {
         title: editor.id ? "Edit schedule entry" : "Add to schedule",

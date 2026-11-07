@@ -1074,6 +1074,7 @@ const ICONS = {
   download: "M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3",
   search: "M11 19a8 8 0 100-16 8 8 0 000 16zM21 21l-4.35-4.35",
   chevronRight: "M9 18l6-6-6-6",
+  chevronLeft: "M15 18l-6-6 6-6",
   database: "M12 8c4.97 0 9-1.34 9-3s-4.03-3-9-3-9 1.34-9 3 4.03 3 9 3zM21 12c0 1.66-4 3-9 3s-9-1.34-9-3M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5",
 };
 
@@ -2104,6 +2105,12 @@ function App() {
         .cal-chip-wrap:hover .chip-del, .chip-del:focus-visible { opacity: 1; }
         @media (hover: none) { .cal-add, .chip-del { opacity: 1; } }
         @media (max-width: 700px) { .chip-del { display: none; } }
+        .modal-body table.data thead th { position: sticky; top: 0; background: ${panel}; z-index: 1; }
+        .cal-week .cal-pair { flex: 0 1 420px; min-width: 0; }
+        .cal-week .cal-chips > .cal-chip-wrap { flex: 0 1 220px; }
+        .cal-week .cal-chip-text { display: inline !important; }
+        .cal-week .cal-chip-emoji { display: none !important; }
+        @media (max-width: 700px) { .cal-week .chip-del { display: flex; } .cal-week .cal-pair { flex-basis: 100%; } }
         .subtab { padding: 7px 14px; border-radius: 4px; font-size: 12.5px; font-weight: 600; cursor: pointer; border: 1px solid ${line}; background: transparent; color: ${dim}; }
         .subtab.active { background: ${panel2}; color: ${cyan}; border-color: ${cyan}; }
         .fieldlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: ${dim}; margin-bottom: 6px; display:block; font-weight:600; }
@@ -2344,9 +2351,15 @@ function PanelList({ storageKey, panels, placeholder = "Filter panels…", toolb
 // Full-screen-ish overlay for the "advanced" stored-data views. Closes on
 // Escape or a click on the backdrop.
 const modalStack = [];
-function Modal({ title, onClose, children, icon = ICONS.database, iconColor = cyan, maxWidth = 1100 }) {
+// The pop-out is capped at the viewport height: its title (and optional
+// `toolbar`, e.g. sub-tabs) stay put while only the body scrolls, so long
+// lists never push the header off-screen. `scrollKey` resets the body to the
+// top when it changes (e.g. switching tabs).
+function Modal({ title, onClose, children, icon = ICONS.database, iconColor = cyan, maxWidth = 1100, toolbar = null, scrollKey }) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const bodyRef = useRef(null);
+  useEffect(() => { if (bodyRef.current) bodyRef.current.scrollTop = 0; }, [scrollKey]);
   useEffect(() => {
     // Modals can stack (e.g. the editor opened from the schedule list), so
     // Escape only closes the topmost one.
@@ -2364,16 +2377,21 @@ function Modal({ title, onClose, children, icon = ICONS.database, iconColor = cy
   }, []);
   return (
     <div onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
-      style={{ position: "fixed", inset: 0, zIndex: 100, background: "rgba(0,0,0,0.55)", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: "clamp(8px, 4vh, 48px) clamp(8px, 3vw, 32px)", overflowY: "auto" }}>
+      style={{ position: "fixed", inset: 0, zIndex: 100, background: "rgba(0,0,0,0.55)", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: "clamp(8px, 4vh, 48px) clamp(8px, 3vw, 32px)" }}>
       <div role="dialog" aria-modal="true" aria-label={title} className="card"
-        style={{ width: "100%", maxWidth, padding: 22, boxShadow: "0 18px 48px rgba(0,0,0,0.5)" }}>
+        style={{ width: "100%", maxWidth, maxHeight: "100%", display: "flex", flexDirection: "column", boxShadow: "0 18px 48px rgba(0,0,0,0.5)", overflow: "hidden" }}>
+        <div style={{ padding: "22px 22px 0", flexShrink: 0 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12 }}>
           <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 16, display: "flex", alignItems: "center", gap: 8 }}>
             <Icon path={icon} size={16} color={iconColor} /> {title}
           </div>
           <button onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 }}>×</button>
         </div>
-        {children}
+        {toolbar}
+        </div>
+        <div ref={bodyRef} className="modal-body" style={{ overflowY: "auto", overscrollBehavior: "contain", minHeight: 0, flex: "1 1 auto", padding: "0 22px 22px" }}>
+          {children}
+        </div>
       </div>
     </div>
   );
@@ -2484,10 +2502,13 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
       summary: scheduleImportError ? "import failed" : null,
       content: <ScheduleImportPanel onImportFile={onImportScheduleFile} importFileError={scheduleImportError} importFileNotice={scheduleImportNotice} /> },
 
-    { id: "strava", title: "Strava connection", icon: ICONS.flame, iconColor: amber,
-      keywords: "training calories oauth connect",
-      summary: stravaSummary,
+    { id: "training-connections", title: "Training connections", icon: ICONS.link,
+      keywords: "strava intervals.icu intervals training calories oauth connect optional wellness tsb ctl atl api key",
+      summary: `Strava ${stravaSummary} · intervals.icu ${intervalsSummary}`,
       content: (<>
+        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 6, display: "flex", alignItems: "center", gap: 7 }}>
+          <Icon path={ICONS.flame} size={15} color={amber} /> Strava
+        </div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
           Strava only exposes accurate per-activity <code>calories</code> through an authenticated,
           server-side call — this runs through <code>server.py</code> next to this page, which keeps your
@@ -2523,13 +2544,11 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
             <span>{stravaError}</span>
           </div>
         )}
-      </>) },
 
-    { id: "intervals", title: "intervals.icu connection", icon: ICONS.link,
-      keywords: "optional wellness tsb ctl atl api key",
-      summary: intervalsSummary,
-      content: (<>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: 8 }}>Optional — wellness / TSB only.</div>
+        <div style={{ borderTop: `1px solid ${line}`, margin: "20px 0 16px" }} />
+        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14, marginBottom: 6, display: "flex", alignItems: "center", gap: 7 }}>
+          <Icon path={ICONS.activity} size={15} color={cyan} /> intervals.icu <span style={{ color: dim, fontWeight: 400, fontSize: 12.5 }}>(optional — wellness / TSB only)</span>
+        </div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
           Used only for CTL/ATL/TSB (recovery buffer below) and as a calorie fallback on days Strava has no
           data. Fetched and cached server-side too, the same way as Strava — add <code>intervals_api_key</code>
@@ -3031,16 +3050,18 @@ function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition,
     <>
       <PanelList storageKey="log" panels={panels} placeholder="Search log (weight, csv, macros…)" toolbar={storedButton} />
       {storedView && (
-        <Modal title="Stored data" onClose={() => setStoredView(null)}>
-          <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
-            {[
-              ["nutrition", `Nutrition (${dayCount})`],
-              ["training", `Training (${trainingCount})`],
-              ["weight", `Weight (${weightCount})`],
-            ].map(([id, label]) => (
-              <button key={id} className={`subtab ${storedView === id ? "active" : ""}`} onClick={() => setStoredView(id)}>{label}</button>
-            ))}
-          </div>
+        <Modal title="Stored data" onClose={() => setStoredView(null)} scrollKey={storedView}
+          toolbar={(
+            <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
+              {[
+                ["nutrition", `Nutrition (${dayCount})`],
+                ["training", `Training (${trainingCount})`],
+                ["weight", `Weight (${weightCount})`],
+              ].map(([id, label]) => (
+                <button key={id} className={`subtab ${storedView === id ? "active" : ""}`} onClick={() => setStoredView(id)}>{label}</button>
+              ))}
+            </div>
+          )}>
           {storedView === "nutrition" && (
             <>
               <div style={{ fontSize: 12.5, color: dim, marginBottom: dayCount ? 16 : 0 }}>{dayCount} day{dayCount === 1 ? "" : "s"} of intake saved. Click the pencil to edit a day.</div>
@@ -3838,6 +3859,15 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
   const [confirmDelete, setConfirmDelete] = useState(null); // null | { planned, dateKey }
   const [listView, setListView] = useState(null); // null | "races" | "single" | "recurring"
   const [editingMatchDay, setEditingMatchDay] = useState(null); // date key, or null
+  // Calendar view: "3week" (default grid), "month" (4-week grid) or "week"
+  // (one week as a vertical list, navigable by weekOffset from this week).
+  // The view is a per-browser preference, like panel open state.
+  const [calView, setCalViewState] = useState(() => {
+    try { return localStorage.getItem("schedule-view") || "3week"; } catch { return "3week"; }
+  });
+  const setCalView = (v) => { setCalViewState(v); try { localStorage.setItem("schedule-view", v); } catch { /* ignore */ } };
+  const [weekOffset, setWeekOffset] = useState(0);
+  const weekListRef = useRef(null);
   // Both default on (undefined !== false) so existing profiles pick up the
   // new toggles already enabled — nothing changes until someone opts out.
   const showActual = profile.scheduleShowActual !== false;
@@ -3878,12 +3908,15 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
     onUpdate(id, { ...rest, skipDates: Array.from(new Set([...(entry.skipDates || []), dateKey])).sort() });
   }
 
-  // 3 full weeks starting from the most recent Sunday, so the schedule's actual
-  // effect (including any taper/carb-loading a race triggers) is visible as a
-  // calendar before it shows up on the dashboard.
-  const calendarStart = daysAgo(new Date().getDay());
+  // Full weeks starting from the most recent Sunday (3 by default, 4 in month
+  // view), so the schedule's actual effect (including any taper/carb-loading a
+  // race triggers) is visible as a calendar before it shows up on the
+  // dashboard. Week view shows one Sunday-to-Saturday week, weekOffset weeks
+  // from this one.
+  const calendarStart = daysAgo(new Date().getDay() - (calView === "week" ? weekOffset * 7 : 0));
+  const calendarLength = calView === "week" ? 7 : calView === "month" ? 28 : 21;
   const calendarDays = [];
-  for (let i = 0; i < 21; i++) {
+  for (let i = 0; i < calendarLength; i++) {
     const d = new Date(calendarStart);
     d.setDate(d.getDate() + i);
     const key = toLocalISODate(d);
@@ -3911,13 +3944,35 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
     });
   }
   const todayKey = toLocalISODate(new Date());
+  const isWeekView = calView === "week";
+  const weekRelLabel = weekOffset === 0 ? "This week" : weekOffset === 1 ? "Next week" : weekOffset === -1 ? "Last week"
+    : weekOffset > 0 ? `In ${weekOffset} weeks` : `${-weekOffset} weeks ago`;
+  const rangeLabel = isWeekView ? weekRelLabel : calView === "month" ? "Next 4 weeks" : "Next 3 weeks";
+
+  // Week view: when the shown week contains today, scroll today's row into
+  // view inside the list.
+  useEffect(() => {
+    if (!isWeekView || weekOffset !== 0) return;
+    const list = weekListRef.current;
+    const el = list && list.querySelector('[data-today="true"]');
+    if (!el) return;
+    const top = el.offsetTop - list.offsetTop;
+    const overflow = top + el.offsetHeight - list.clientHeight;
+    if (overflow > 0) list.scrollTop = Math.min(top - 4, overflow + 4);
+  }, [isWeekView, weekOffset]);
 
   return (
     <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
       <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
           <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, display: "flex", alignItems: "center", gap: 7, marginRight: "auto" }}>
-            <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
+            <Icon path={ICONS.calendar} size={16} color={cyan} /> Calendar
+          </div>
+          <div role="tablist" aria-label="Calendar view" style={{ display: "flex", gap: 4 }}>
+            {[["3week", "3 weeks"], ["month", "Month"], ["week", "Week"]].map(([id, label]) => (
+              <button key={id} role="tab" aria-selected={calView === id} className={`subtab ${calView === id ? "active" : ""}`}
+                onClick={() => { setCalView(id); if (id === "week") setWeekOffset(0); }} style={{ padding: "6px 11px", fontSize: 12 }}>{label}</button>
+            ))}
           </div>
           <button className="btn-primary" onClick={() => openAdd(null)} style={{ padding: "7px 12px", fontSize: 12 }}>
             <Icon path={ICONS.plus} size={13} color={ink} /> Add
@@ -3940,7 +3995,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           </label>
         </div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <span>Next 3 weeks · hover a day for <b style={{ color: paper }}>+</b> to add, a session for <Icon path={ICONS.trash} size={10} color={coral} /> to remove, click a session to edit</span>
+          <span>{rangeLabel} · hover a day for <b style={{ color: paper }}>+</b> to add, a session for <Icon path={ICONS.trash} size={10} color={coral} /> to remove, click a session to edit</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={amber} /> pre-loads the day before</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.gauge} size={10} color={lavender} /> tapering</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
@@ -3957,8 +4012,28 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
             </span>
           )}
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }}>
-          {WEEKDAY_LABELS.map((label) => (
+        {isWeekView && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 12 }}>
+            <button className="btn-ghost" onClick={() => setWeekOffset((o) => o - 1)} aria-label="Previous week" title="Previous week"
+              style={{ padding: "6px 10px", display: "flex" }}><Icon path={ICONS.chevronLeft} size={16} color={paper} /></button>
+            <div style={{ textAlign: "center", minWidth: 190 }}>
+              <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 14.5 }}>
+                Week of {calendarDays[0].date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" })}
+              </div>
+              <div style={{ fontSize: 11.5, color: weekOffset === 0 ? cyan : dim }}>{weekRelLabel}</div>
+            </div>
+            <button className="btn-ghost" onClick={() => setWeekOffset((o) => o + 1)} aria-label="Next week" title="Next week"
+              style={{ padding: "6px 10px", display: "flex" }}><Icon path={ICONS.chevronRight} size={16} color={paper} /></button>
+            {weekOffset !== 0 && (
+              <button className="btn-ghost" onClick={() => setWeekOffset(0)} style={{ padding: "6px 10px", fontSize: 12 }}>Today</button>
+            )}
+          </div>
+        )}
+        <div ref={weekListRef} className={isWeekView ? "cal-week" : undefined}
+          style={isWeekView
+            ? { display: "flex", flexDirection: "column", gap: 6, maxHeight: "min(70vh, 900px)", overflowY: "auto", paddingRight: 4 }
+            : { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }}>
+          {!isWeekView && WEEKDAY_LABELS.map((label) => (
             <div key={label} style={{ fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 }}>{label}</div>
           ))}
           {calendarDays.map((day) => {
@@ -4065,20 +4140,23 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
             }
 
             return (
-              <div key={day.key} className="cal-day"
+              <div key={day.key} className="cal-day" data-today={isToday ? "true" : undefined}
                 style={{
                 background: panel2,
                 border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
                 borderRadius: 5,
-                padding: 6,
-                minHeight: 76,
+                padding: isWeekView ? "8px 10px" : 6,
+                minHeight: isWeekView ? 56 : 76,
+                flexShrink: 0,
                 display: "flex",
                 flexDirection: "column",
                 gap: 3,
                 opacity: isPast ? 0.5 : 1,
               }}>
-                <div style={{ fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 }}>
-                  {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
+                <div style={{ fontSize: isWeekView ? 12.5 : 11, color: isToday ? cyan : isWeekView ? paper : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 }}>
+                  {isWeekView
+                    ? <>{day.date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}{isToday && <span style={{ fontSize: 10.5, color: cyan, marginLeft: 4 }}>today</span>}</>
+                    : isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
                   {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
                   {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
                   <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 4 }}>
@@ -4099,20 +4177,24 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                 {showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && (
                   <div title={`Expected ${Math.round(day.expectedKcal)} kcal · Actual ${Math.round(day.actualKcal)} kcal burned`}
                     style={{
-                      borderBottom: `1px solid ${line}`, paddingBottom: 4, marginBottom: 1, fontSize: 10,
-                      display: "flex", justifyContent: "space-between", gap: 4,
+                      borderBottom: `1px solid ${line}`, paddingBottom: 4, marginBottom: 1, fontSize: isWeekView ? 11 : 10,
+                      display: "flex", justifyContent: isWeekView ? "flex-start" : "space-between", gap: isWeekView ? 6 : 4,
                     }}>
                     <span style={{ color: cyan, fontWeight: 600 }}>{Math.round(day.expectedKcal)}</span>
                     <span style={{ color: dim }}>/</span>
                     <span style={{ color: amber, fontWeight: 600 }}>{Math.round(day.actualKcal)}</span>
                   </div>
                 )}
+                <div className="cal-chips" style={{ display: "flex", flexDirection: isWeekView ? "row" : "column", flexWrap: isWeekView ? "wrap" : "nowrap", gap: isWeekView ? 6 : 3 }}>
+                {isWeekView && day.pairs.length === 0 && day.extras.length === 0 && (
+                  <div style={{ fontSize: 11.5, color: dim }}>{day.taper ? "Rest · tapering" : "Rest day"}</div>
+                )}
                 {showActual ? (
                   <>
                     {day.pairs.map(({ planned, actual, manual }, i) => {
                       const isGroup = Array.isArray(actual);
                       return (
-                        <div key={`pair${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
+                        <div key={`pair${i}`} className="cal-pair" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
                           {plannedChip(planned, i, isGroup)}
                           {isGroup ? actualChipGroup(actual, i, manual)
                             : actual ? actualChip(actual, true, i, manual) : (day.key <= todayKey
@@ -4122,7 +4204,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                       );
                     })}
                     {day.extras.map((actual, i) => (
-                      <div key={`extra${i}`} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
+                      <div key={`extra${i}`} className="cal-pair" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
                         <div />
                         {actualChip(actual, false, i)}
                       </div>
@@ -4131,6 +4213,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                 ) : (
                   day.pairs.map(({ planned }, i) => plannedChip(planned, i))
                 )}
+                </div>
               </div>
             );
           })}
@@ -4241,15 +4324,17 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
 
 
       {listView && (
-        <Modal title="All sessions & races" onClose={() => setListView(null)} icon={ICONS.calendar}>
-          <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
-            {[["races", `Races (${races.length})`], ["single", `Single sessions (${singles.length})`], ["recurring", `Recurring (${recurring.length})`]].map(([id, label]) => (
-              <button key={id} className={`subtab ${listView === id ? "active" : ""}`} onClick={() => setListView(id)}>{label}</button>
-            ))}
-            <button className="btn-primary" onClick={() => openAdd(null)} style={{ padding: "7px 12px", fontSize: 12, marginLeft: "auto" }}>
-              <Icon path={ICONS.plus} size={13} color={ink} /> Add
-            </button>
-          </div>
+        <Modal title="All sessions & races" onClose={() => setListView(null)} icon={ICONS.calendar} scrollKey={listView}
+          toolbar={(
+            <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+              {[["races", `Races (${races.length})`], ["single", `Single sessions (${singles.length})`], ["recurring", `Recurring (${recurring.length})`]].map(([id, label]) => (
+                <button key={id} className={`subtab ${listView === id ? "active" : ""}`} onClick={() => setListView(id)}>{label}</button>
+              ))}
+              <button className="btn-primary" onClick={() => openAdd(null)} style={{ padding: "7px 12px", fontSize: 12, marginLeft: "auto" }}>
+                <Icon path={ICONS.plus} size={13} color={ink} /> Add
+              </button>
+            </div>
+          )}>
           <ScheduleEntryList
             entries={listView === "races" ? races : listView === "single" ? singles : recurring}
             empty={listView === "races" ? "No races scheduled." : listView === "single" ? "No single sessions scheduled." : "No recurring sessions."}

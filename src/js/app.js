@@ -390,6 +390,7 @@
       if (!s.daysOfWeek.includes(weekday)) return false;
       if (dateStr < s.startDate) return false;
       if (s.endDate && dateStr > s.endDate) return false;
+      if (Array.isArray(s.skipDates) && s.skipDates.includes(dateStr)) return false;
       return true;
     });
   }
@@ -1557,6 +1558,13 @@
         .panel-head:hover { background: ${panel2}; }
         .panel-head:focus-visible { outline: 2px solid ${cyan}; outline-offset: -2px; }
         .panel-summary { margin-left: auto; font-size: 11.5px; color: ${dim}; font-family: ${mono}; }
+        .cal-day { position: relative; }
+        .cal-add, .chip-del { opacity: 0; transition: opacity 0.12s; }
+        .cal-day:hover .cal-add, .cal-add:focus-visible { opacity: 1; }
+        .cal-chip-wrap { position: relative; min-width: 0; }
+        .cal-chip-wrap:hover .chip-del, .chip-del:focus-visible { opacity: 1; }
+        @media (hover: none) { .cal-add, .chip-del { opacity: 1; } }
+        @media (max-width: 700px) { .chip-del { display: none; } }
         .subtab { padding: 7px 14px; border-radius: 4px; font-size: 12.5px; font-weight: 600; cursor: pointer; border: 1px solid ${line}; background: transparent; color: ${dim}; }
         .subtab.active { background: ${panel2}; color: ${cyan}; border-color: ${cyan}; }
         .fieldlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: ${dim}; margin-bottom: 6px; display:block; font-weight:600; }
@@ -1813,18 +1821,22 @@
       }, style: { display: open ? "block" : "none", padding: "2px 22px 22px" } }, p.content));
     }));
   }
-  function Modal({ title, onClose, children }) {
+  const modalStack = [];
+  function Modal({ title, onClose, children, icon = ICONS.database, iconColor = cyan, maxWidth = 1100 }) {
     const onCloseRef = useRef(onClose);
     onCloseRef.current = onClose;
     useEffect(() => {
+      const token = {};
+      modalStack.push(token);
       const onKey = (e) => {
-        if (e.key === "Escape") onCloseRef.current();
+        if (e.key === "Escape" && modalStack[modalStack.length - 1] === token) onCloseRef.current();
       };
       window.addEventListener("keydown", onKey);
       const prevOverflow = document.body.style.overflow;
       document.body.style.overflow = "hidden";
       return () => {
         window.removeEventListener("keydown", onKey);
+        modalStack.splice(modalStack.indexOf(token), 1);
         document.body.style.overflow = prevOverflow;
       };
     }, []);
@@ -1843,9 +1855,9 @@
           "aria-modal": "true",
           "aria-label": title,
           className: "card",
-          style: { width: "100%", maxWidth: 1100, padding: 22, boxShadow: "0 18px 48px rgba(0,0,0,0.5)" }
+          style: { width: "100%", maxWidth, padding: 22, boxShadow: "0 18px 48px rgba(0,0,0,0.5)" }
         },
-        /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 16, display: "flex", alignItems: "center", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.database, size: 16, color: cyan }), " ", title), /* @__PURE__ */ React.createElement("button", { onClick: onClose, "aria-label": "Close", style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 } }, "\xD7")),
+        /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 700, fontSize: 16, display: "flex", alignItems: "center", gap: 8 } }, /* @__PURE__ */ React.createElement(Icon, { path: icon, size: 16, color: iconColor }), " ", title), /* @__PURE__ */ React.createElement("button", { onClick: onClose, "aria-label": "Close", style: { background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 } }, "\xD7")),
         children
       )
     );
@@ -2599,6 +2611,192 @@
       transition: "background 0.3s, border-color 0.3s"
     };
   }
+  function scheduleEntryFromForm(form) {
+    const base = {
+      activityType: form.activityType,
+      zone: form.zone,
+      durationMin: parseInt(form.durationMin) || 0,
+      notes: form.notes,
+      sourceActivity: form.sourceActivity
+    };
+    if (form.kind === "race") {
+      return {
+        kind: "race",
+        ...base,
+        raceDate: form.raceDate,
+        taperDays: form.taperEnabled ? Math.max(1, parseInt(form.taperDays) || DEFAULT_TAPER_DAYS) : 0,
+        carbLoadDays: form.carbLoadEnabled ? Math.max(1, parseInt(form.carbLoadDays) || CARB_LOAD_DAYS) : 0
+      };
+    }
+    if (form.kind === "single") return { kind: "single", ...base, date: form.date };
+    return {
+      kind: "recurring",
+      ...base,
+      daysOfWeek: form.daysOfWeek,
+      startDate: form.startDate,
+      endDate: form.ongoing ? null : form.endDate || null,
+      ...form.skipDates && form.skipDates.length ? { skipDates: form.skipDates } : {}
+    };
+  }
+  function scheduleFormFromEntry(s) {
+    var _a;
+    const common = {
+      ...emptyScheduleForm(),
+      activityType: s.activityType,
+      zone: s.zone,
+      durationMin: String(s.durationMin),
+      notes: s.notes || "",
+      sourceActivity: s.sourceActivity || null
+    };
+    if (s.kind === "race") {
+      return {
+        ...common,
+        kind: "race",
+        raceDate: s.raceDate,
+        taperEnabled: ((_a = s.taperDays) != null ? _a : DEFAULT_TAPER_DAYS) > 0,
+        taperDays: String(s.taperDays || DEFAULT_TAPER_DAYS),
+        carbLoadEnabled: raceCarbLoadDays(s) > 0,
+        carbLoadDays: String(raceCarbLoadDays(s) || CARB_LOAD_DAYS)
+      };
+    }
+    if (s.kind === "single") return { ...common, kind: "single", date: s.date };
+    return {
+      ...common,
+      kind: "recurring",
+      daysOfWeek: s.daysOfWeek,
+      startDate: s.startDate,
+      endDate: s.endDate || "",
+      ongoing: !s.endDate,
+      skipDates: s.skipDates || []
+    };
+  }
+  function scheduleEntryLabel(s) {
+    if (s.kind === "race") return s.notes || `${s.activityType} race`;
+    return `${s.activityType} Z${s.zone} \xB7 ${s.durationMin} min${s.notes ? ` \xB7 ${s.notes}` : ""}`;
+  }
+  function ScheduleEntryEditor({ initialForm, isEdit, activityLibrary, onSave, onCancel, onDelete }) {
+    var _a;
+    const [form, setForm] = useState(initialForm);
+    const [error, setError] = useState(null);
+    function applySourceActivity(key) {
+      const src = activityLibrary.find((a) => a.key === key);
+      if (!src) {
+        setForm((f) => ({ ...f, sourceActivity: null }));
+        return;
+      }
+      setForm((f) => ({
+        ...f,
+        activityType: src.activityType,
+        zone: src.zone,
+        durationMin: String(src.durationMin),
+        sourceActivity: { key: src.key, date: src.date, name: src.name, durationMin: src.durationMin, kcal: src.kcal, intensityFactor: src.intensityFactor }
+      }));
+    }
+    function toggleDay(n) {
+      setForm((f) => ({
+        ...f,
+        daysOfWeek: f.daysOfWeek.includes(n) ? f.daysOfWeek.filter((d) => d !== n) : [...f.daysOfWeek, n].sort()
+      }));
+    }
+    function handleSubmit() {
+      if (form.kind === "recurring" && form.daysOfWeek.length === 0) {
+        setError("Pick at least one day of the week.");
+        return;
+      }
+      onSave(scheduleEntryFromForm(form));
+    }
+    return /* @__PURE__ */ React.createElement("div", { onKeyDown: (e) => {
+      if (e.key === "Enter" && e.target.tagName === "INPUT" && e.target.type !== "checkbox") handleSubmit();
+    } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, form.kind === "race" ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days." : form.kind === "single" ? "A single session on one specific date \u2014 doesn't repeat, and won't affect any other day." : /* @__PURE__ */ React.createElement(React.Fragment, null, "Repeats on the days you pick, within the date range. Projects up to ", FORWARD_DAYS, " days ahead on the dashboard as an estimate \u2014 once a real activity syncs in for that day, it takes over automatically.")), !isEdit && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4, marginBottom: 16 } }, /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        onClick: () => setForm((f) => ({ ...f, kind: "recurring" })),
+        style: form.kind === "recurring" ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 } : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 13, color: form.kind === "recurring" ? ink : dim }),
+      " Recurring session"
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        onClick: () => setForm((f) => ({ ...f, kind: "single" })),
+        style: form.kind === "single" ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 } : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 13, color: form.kind === "single" ? ink : dim }),
+      " Single session"
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        onClick: () => setForm((f) => ({ ...f, kind: "race" })),
+        style: form.kind === "race" ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 } : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 13, color: form.kind === "race" ? ink : dim }),
+      " Race"
+    )), /* @__PURE__ */ React.createElement("div", { style: { marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Model demand on" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: ((_a = form.sourceActivity) == null ? void 0 : _a.key) || "", onChange: (e) => applySourceActivity(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Manual (MET estimate from activity type / zone / duration below)"), activityLibrary.map((a) => /* @__PURE__ */ React.createElement("option", { key: a.key, value: a.key }, sourceActivityLabel(a)))), form.sourceActivity ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Demand estimate will scale from this session's actual ", fmt(form.sourceActivity.kcal / form.sourceActivity.durationMin, 1), " kcal/min \u2014 activity type/zone below were pre-filled from it, and duration can still be adjusted.") : activityLibrary.length === 0 ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "No synced Strava/intervals.icu activities in the last ", ACTIVITY_LIBRARY_DAYS, " days yet.") : null)), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Activity type" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: form.activityType, onChange: (e) => setForm((f) => ({ ...f, activityType: e.target.value })) }, ACTIVITY_TYPES.map((t) => /* @__PURE__ */ React.createElement("option", { key: t, value: t }, t)))), /* @__PURE__ */ React.createElement(Field, { label: form.kind === "race" ? "Expected finish time (min)" : "Duration (min)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "1", value: form.durationMin, onChange: (e) => setForm((f) => ({ ...f, durationMin: e.target.value })) }))), /* @__PURE__ */ React.createElement(Field, { label: "Intensity zone" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, ZONES.map((z) => /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        key: z.n,
+        type: "button",
+        onClick: () => setForm((f) => ({ ...f, zone: z.n })),
+        title: z.hrPct,
+        style: form.zone === z.n ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12, cursor: "pointer", border: "none", background: cyan, color: ink } : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }
+      },
+      "Z",
+      z.n
+    ))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, ZONES[form.zone - 1].label, " \xB7 ", ZONES[form.zone - 1].hrPct)), form.kind === "race" ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Race date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.raceDate, onChange: (e) => setForm((f) => ({ ...f, raceDate: e.target.value })) }))), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Taper starts (days before race)" }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        className: "inp",
+        type: "number",
+        min: "1",
+        value: form.taperDays,
+        disabled: !form.taperEnabled,
+        onChange: (e) => setForm((f) => ({ ...f, taperDays: e.target.value })),
+        style: { opacity: form.taperEnabled ? 1 : 0.5 }
+      }
+    ))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.taperEnabled, onChange: (e) => setForm((f) => ({ ...f, taperEnabled: e.target.checked })) }), "Enable tapering"), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Carb-load starts (days before race)" }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        className: "inp",
+        type: "number",
+        min: "1",
+        value: form.carbLoadDays,
+        disabled: !form.carbLoadEnabled,
+        onChange: (e) => setForm((f) => ({ ...f, carbLoadDays: e.target.value })),
+        style: { opacity: form.carbLoadEnabled ? 1 : 0.5 }
+      }
+    ))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.carbLoadEnabled, onChange: (e) => setForm((f) => ({ ...f, carbLoadEnabled: e.target.checked })) }), "Enable carb-loading"), form.carbLoadEnabled && (parseInt(form.durationMin) || 0) < CARB_LOAD_MIN_DURATION && /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 100%", fontSize: 11, color: dim } }, "Carb-loading only kicks in for races of ", CARB_LOAD_MIN_DURATION, "+ min \u2014 shorter efforts don't deplete enough glycogen to benefit.")) : form.kind === "single" ? /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.date, onChange: (e) => setForm((f) => ({ ...f, date: e.target.value })) }))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement("span", { className: "fieldlabel" }, "Days of week"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, WEEKDAY_LABELS.map((label, n) => /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        key: n,
+        type: "button",
+        onClick: () => toggleDay(n),
+        style: form.daysOfWeek.includes(n) ? { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 700, fontSize: 11.5, cursor: "pointer", border: "none", background: amber, color: ink } : { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 600, fontSize: 11.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }
+      },
+      label
+    )))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 140px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Start date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.startDate, onChange: (e) => setForm((f) => ({ ...f, startDate: e.target.value })) }))), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 140px" } }, /* @__PURE__ */ React.createElement(Field, { label: "End date" }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        className: "inp",
+        type: "date",
+        value: form.endDate,
+        disabled: form.ongoing,
+        onChange: (e) => setForm((f) => ({ ...f, endDate: e.target.value })),
+        style: { opacity: form.ongoing ? 0.5 : 1 }
+      }
+    ))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.ongoing, onChange: (e) => setForm((f) => ({ ...f, ongoing: e.target.checked })) }), "Ongoing"))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Notes (optional)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: form.notes, onChange: (e) => setForm((f) => ({ ...f, notes: e.target.value })), placeholder: form.kind === "race" ? "e.g. Boston Marathon" : "e.g. track intervals" }))), form.kind === "recurring" && form.skipDates && form.skipDates.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14, fontSize: 11.5, color: dim, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 } }, "Skipped days:", form.skipDates.slice().sort().map((d) => /* @__PURE__ */ React.createElement("span", { key: d, style: { display: "inline-flex", alignItems: "center", gap: 4, border: `1px solid ${line}`, borderRadius: 3, padding: "1px 6px", fontFamily: mono } }, d, /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        title: "Restore this day",
+        onClick: () => setForm((f) => ({ ...f, skipDates: f.skipDates.filter((x) => x !== d) })),
+        style: { background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, fontSize: 13, lineHeight: 1 }
+      },
+      "\xD7"
+    )))), error && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, error), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 18 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSubmit }, isEdit ? "Save changes" : form.kind === "race" ? "Add race" : "Add to schedule"), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: onCancel }, "Cancel"), onDelete && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: onDelete, style: { marginLeft: "auto", color: coral, borderColor: coral, display: "flex", alignItems: "center", gap: 6 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral }), " Delete")));
+  }
   function ScheduleTab({
     schedule,
     onAdd,
@@ -2616,13 +2814,12 @@
     weightLog,
     matchedKcalRates
   }) {
-    var _a, _b;
-    const [form, setForm] = useState(emptyScheduleForm());
-    const [editingId, setEditingId] = useState(null);
-    const [highlightIds, setHighlightIds] = useState([]);
+    var _a;
+    const [editor, setEditor] = useState(null);
+    const [confirmDelete, setConfirmDelete] = useState(null);
+    const [listView, setListView] = useState(null);
     const [scheduleDragOver, setScheduleDragOver] = useState(false);
     const [editingMatchDay, setEditingMatchDay] = useState(null);
-    const itemRefs = useRef({});
     const showActual = profile.scheduleShowActual !== false;
     const showCalories = profile.scheduleShowCalories !== false;
     const activityLibrary = useMemo(
@@ -2634,138 +2831,26 @@
       for (const a of activityLibrary) (map[a.date] || (map[a.date] = [])).push(a);
       return map;
     }, [activityLibrary]);
-    function applySourceActivity(key) {
-      const src = activityLibrary.find((a) => a.key === key);
-      if (!src) {
-        setForm((f) => ({ ...f, sourceActivity: null }));
-        return;
-      }
-      setForm((f) => ({
-        ...f,
-        activityType: src.activityType,
-        zone: src.zone,
-        durationMin: String(src.durationMin),
-        sourceActivity: { key: src.key, date: src.date, name: src.name, durationMin: src.durationMin, kcal: src.kcal, intensityFactor: src.intensityFactor }
-      }));
-    }
-    function jumpToDay(day) {
-      const ids = day.sessions.map((s) => s.id).concat(day.race ? [day.race.id] : []);
-      if (!ids.length) return;
-      setHighlightIds(ids);
-      const firstEl = itemRefs.current[ids[0]];
-      if (firstEl) firstEl.scrollIntoView({ behavior: "smooth", block: "center" });
-      window.clearTimeout(jumpToDay._t);
-      jumpToDay._t = window.setTimeout(() => setHighlightIds([]), 2e3);
-    }
     const recurring = schedule.filter((s) => s.kind !== "race" && s.kind !== "single");
     const singles = schedule.filter((s) => s.kind === "single").slice().sort((a, b) => a.date < b.date ? -1 : 1);
     const races = getRaces(schedule).slice().sort((a, b) => a.raceDate < b.raceDate ? -1 : 1);
-    function toggleDay(n) {
-      setForm((f) => ({
-        ...f,
-        daysOfWeek: f.daysOfWeek.includes(n) ? f.daysOfWeek.filter((d) => d !== n) : [...f.daysOfWeek, n].sort()
-      }));
+    function openAdd(dateKey) {
+      const key = dateKey || toLocalISODate(/* @__PURE__ */ new Date());
+      const weekday = (/* @__PURE__ */ new Date(key + "T00:00:00")).getDay();
+      setEditor({ id: null, form: { ...emptyScheduleForm(), kind: "single", date: key, raceDate: key, startDate: key, daysOfWeek: [weekday] } });
     }
-    function startEdit(s) {
-      var _a2;
-      setEditingId(s.id);
-      if (s.kind === "race") {
-        setForm({
-          ...emptyScheduleForm(),
-          kind: "race",
-          activityType: s.activityType,
-          zone: s.zone,
-          durationMin: String(s.durationMin),
-          raceDate: s.raceDate,
-          taperEnabled: ((_a2 = s.taperDays) != null ? _a2 : DEFAULT_TAPER_DAYS) > 0,
-          taperDays: String(s.taperDays || DEFAULT_TAPER_DAYS),
-          carbLoadEnabled: raceCarbLoadDays(s) > 0,
-          carbLoadDays: String(raceCarbLoadDays(s) || CARB_LOAD_DAYS),
-          notes: s.notes || "",
-          sourceActivity: s.sourceActivity || null
-        });
-      } else if (s.kind === "single") {
-        setForm({
-          ...emptyScheduleForm(),
-          kind: "single",
-          activityType: s.activityType,
-          zone: s.zone,
-          durationMin: String(s.durationMin),
-          date: s.date,
-          notes: s.notes || "",
-          sourceActivity: s.sourceActivity || null
-        });
-      } else {
-        setForm({
-          ...emptyScheduleForm(),
-          kind: "recurring",
-          activityType: s.activityType,
-          zone: s.zone,
-          durationMin: String(s.durationMin),
-          daysOfWeek: s.daysOfWeek,
-          startDate: s.startDate,
-          endDate: s.endDate || "",
-          ongoing: !s.endDate,
-          notes: s.notes || "",
-          sourceActivity: s.sourceActivity || null
-        });
-      }
+    function openEdit(id, dateKey = null) {
+      const entry = schedule.find((s) => s.id === id);
+      if (entry) setEditor({ id, dateKey, form: scheduleFormFromEntry(entry) });
     }
-    function cancelEdit() {
-      setEditingId(null);
-      setForm(emptyScheduleForm());
-    }
-    function handleSubmit() {
-      if (form.kind === "race") {
-        const entry2 = {
-          kind: "race",
-          activityType: form.activityType,
-          zone: form.zone,
-          durationMin: parseInt(form.durationMin) || 0,
-          raceDate: form.raceDate,
-          taperDays: form.taperEnabled ? Math.max(1, parseInt(form.taperDays) || DEFAULT_TAPER_DAYS) : 0,
-          carbLoadDays: form.carbLoadEnabled ? Math.max(1, parseInt(form.carbLoadDays) || CARB_LOAD_DAYS) : 0,
-          notes: form.notes,
-          sourceActivity: form.sourceActivity
-        };
-        if (editingId) onUpdate(editingId, entry2);
-        else onAdd(entry2);
-        cancelEdit();
-        return;
-      }
-      if (form.kind === "single") {
-        const entry2 = {
-          kind: "single",
-          activityType: form.activityType,
-          zone: form.zone,
-          durationMin: parseInt(form.durationMin) || 0,
-          date: form.date,
-          notes: form.notes,
-          sourceActivity: form.sourceActivity
-        };
-        if (editingId) onUpdate(editingId, entry2);
-        else onAdd(entry2);
-        cancelEdit();
-        return;
-      }
-      if (form.daysOfWeek.length === 0) {
-        alert("Pick at least one day of the week.");
-        return;
-      }
-      const entry = {
-        kind: "recurring",
-        activityType: form.activityType,
-        zone: form.zone,
-        durationMin: parseInt(form.durationMin) || 0,
-        daysOfWeek: form.daysOfWeek,
-        startDate: form.startDate,
-        endDate: form.ongoing ? null : form.endDate || null,
-        notes: form.notes,
-        sourceActivity: form.sourceActivity
-      };
-      if (editingId) onUpdate(editingId, entry);
+    function saveEditor(entry) {
+      if (editor.id) onUpdate(editor.id, entry);
       else onAdd(entry);
-      cancelEdit();
+      setEditor(null);
+    }
+    function skipOccurrence(entry, dateKey) {
+      const { id, ...rest } = entry;
+      onUpdate(id, { ...rest, skipDates: Array.from(/* @__PURE__ */ new Set([...entry.skipDates || [], dateKey])).sort() });
     }
     const calendarStart = daysAgo((/* @__PURE__ */ new Date()).getDay());
     const calendarDays = [];
@@ -2797,7 +2882,18 @@
       });
     }
     const todayKey = toLocalISODate(/* @__PURE__ */ new Date());
-    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 16, marginBottom: 10, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, display: "flex", alignItems: "center", gap: 7, marginRight: "auto" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 16, color: cyan }), " Upcoming"), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: () => openAdd(null), style: { padding: "7px 12px", fontSize: 12 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 13, color: ink }), " Add"), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        className: "btn-ghost",
+        onClick: () => setListView(races.length ? "races" : singles.length ? "single" : "recurring"),
+        style: { padding: "7px 12px", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.database, size: 13, color: cyan }),
+      " All sessions & races (",
+      schedule.length,
+      ")"
+    )), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 16, marginBottom: 10, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" } }, /* @__PURE__ */ React.createElement(
       "input",
       {
         type: "checkbox",
@@ -2811,19 +2907,40 @@
         checked: showCalories,
         onChange: (e) => setProfile((p) => ({ ...p, scheduleShowCalories: e.target.checked }))
       }
-    ), "Show expected/actual calories burned")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "Next 3 weeks"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day"), showActual && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, "solid = planned, outline = actual ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 10, color: mint }), " matched"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim }), " click to correct a match")), showCalories && /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { color: cyan } }, "expected"), " / ", /* @__PURE__ */ React.createElement("span", { style: { color: amber } }, "actual"), " kcal burned")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
+    ), "Show expected/actual calories burned")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "Next 3 weeks \xB7 hover a day for ", /* @__PURE__ */ React.createElement("b", { style: { color: paper } }, "+"), " to add, a session for ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 10, color: coral }), " to remove, click a session to edit"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: amber }), " pre-loads the day before"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 10, color: lavender }), " tapering"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 10, color: gold }), " carb-loading"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 10, color: gold }), " race day"), showActual && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, "solid = planned, outline = actual ", /* @__PURE__ */ React.createElement(Icon, { path: ICONS.check, size: 10, color: mint }), " matched"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim }), " correct a match")), showCalories && /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { color: cyan } }, "expected"), " / ", /* @__PURE__ */ React.createElement("span", { style: { color: amber } }, "actual"), " kcal burned")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 } }, WEEKDAY_LABELS.map((label) => /* @__PURE__ */ React.createElement("div", { key: label, style: { fontSize: 11, color: dim, textAlign: "center", paddingBottom: 2 } }, label)), calendarDays.map((day) => {
       const isToday = day.key === todayKey;
       const isPast = day.key < todayKey;
       const isFirstOfMonth = day.date.getDate() === 1;
-      const clickable = day.sessions.length > 0 || !!day.race;
       function plannedChip(planned, i, isGroup) {
+        return /* @__PURE__ */ React.createElement("div", { key: `p${i}`, className: "cal-chip-wrap" }, plannedChipBody(planned, isGroup), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            className: "chip-del",
+            "aria-label": "Remove from schedule",
+            title: planned.isRace ? "Remove this race" : "Remove this session",
+            onClick: (e) => {
+              e.stopPropagation();
+              setConfirmDelete({ planned, dateKey: day.key });
+            },
+            style: { position: "absolute", right: 1, top: "50%", transform: "translateY(-50%)", background: panel, border: `1px solid ${line}`, borderRadius: 3, padding: 2, cursor: "pointer", display: "flex", lineHeight: 0 }
+          },
+          /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 9, color: coral })
+        ));
+      }
+      function plannedChipBody(planned, isGroup) {
+        const onClick = (e) => {
+          e.stopPropagation();
+          openEdit(planned.id, day.key);
+        };
         if (planned.isRace) {
           return /* @__PURE__ */ React.createElement(
             "div",
             {
-              key: `p${i}`,
-              title: `Race: ${planned.notes || planned.activityType} \xB7 ${planned.durationMin}min${isGroup ? " \xB7 matched to multiple activities" : ""}`,
+              onClick,
+              title: `Race: ${planned.notes || planned.activityType} \xB7 ${planned.durationMin}min${isGroup ? " \xB7 matched to multiple activities" : ""} \u2014 click to edit`,
               style: {
+                cursor: "pointer",
                 background: gold,
                 color: ink,
                 borderRadius: 3,
@@ -2846,9 +2963,10 @@
         return /* @__PURE__ */ React.createElement(
           "div",
           {
-            key: `p${i}`,
-            title: `${planned.activityType} \xB7 ${ZONES[planned.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${planned.durationMin}min${planned.notes ? ` \xB7 ${planned.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}${isGroup ? " \xB7 matched to multiple activities" : ""}`,
+            onClick,
+            title: `${planned.activityType} \xB7 ${ZONES[planned.zone - 1].label.split(" \xB7 ")[1]} \xB7 ${planned.durationMin}min${planned.notes ? ` \xB7 ${planned.notes}` : ""}${day.taper ? " \xB7 tapered" : ""}${isGroup ? " \xB7 matched to multiple activities" : ""} \u2014 click to edit`,
             style: {
+              cursor: "pointer",
               background: ACTIVITY_COLORS[planned.activityType] || dim,
               color: ink,
               borderRadius: 3,
@@ -2910,8 +3028,7 @@
         "div",
         {
           key: day.key,
-          onClick: clickable ? () => jumpToDay(day) : void 0,
-          title: clickable ? "Jump to this session in the listings below" : void 0,
+          className: "cal-day",
           style: {
             background: panel2,
             border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
@@ -2921,11 +3038,10 @@
             display: "flex",
             flexDirection: "column",
             gap: 3,
-            cursor: clickable ? "pointer" : "default",
             opacity: isPast ? 0.5 : 1
           }
         },
-        /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold })), showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && /* @__PURE__ */ React.createElement(
+        /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 } }, isFirstOfMonth ? day.date.toLocaleDateString(void 0, { month: "short", day: "numeric" }) : day.date.getDate(), day.taper && /* @__PURE__ */ React.createElement("span", { title: `Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d \u2014 ~${Math.round(day.taper.volumeFactor * 100)}% volume` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.gauge, size: 9, color: lavender })), day.carbLoad && /* @__PURE__ */ React.createElement("span", { title: `Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d` }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.flame, size: 9, color: gold })), /* @__PURE__ */ React.createElement("span", { style: { marginLeft: "auto", display: "flex", alignItems: "center", gap: 4 } }, showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && /* @__PURE__ */ React.createElement(
           "button",
           {
             type: "button",
@@ -2934,10 +3050,24 @@
               e.stopPropagation();
               setEditingMatchDay(day.key);
             },
-            style: { marginLeft: "auto", background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }
+            style: { background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }
           },
           /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 10, color: dim })
-        )),
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            className: "cal-add",
+            title: "Add a session or race on this day",
+            "aria-label": "Add a session or race on this day",
+            onClick: (e) => {
+              e.stopPropagation();
+              openAdd(day.key);
+            },
+            style: { background: "none", border: `1px solid ${line}`, borderRadius: 3, color: cyan, cursor: "pointer", padding: 1, display: "flex" }
+          },
+          /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 10, color: cyan })
+        ))),
         showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && /* @__PURE__ */ React.createElement(
           "div",
           {
@@ -3076,98 +3206,63 @@
           }
         }
       ))
-    ), importFileError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, importFileError), !importFileError && importFileNotice && /* @__PURE__ */ React.createElement(Banner, { kind: "success" }, importFileNotice)), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22, gridColumn: "1 / -1" } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: form.kind === "race" ? ICONS.trophy : ICONS.calendar, size: 16, color: cyan }), " ", editingId ? "Edit scheduled session" : "Add to schedule"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 } }, form.kind === "race" ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days." : form.kind === "single" ? "A single session on one specific date \u2014 doesn't repeat, and won't affect any other day." : /* @__PURE__ */ React.createElement(React.Fragment, null, "Repeats on the days you pick, within the date range. Projects up to ", FORWARD_DAYS, " days ahead on the dashboard as an estimate \u2014 once a real activity syncs in for that day, it takes over automatically.")), !editingId && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4, marginBottom: 16 } }, /* @__PURE__ */ React.createElement(
-      "button",
+    ), importFileError && /* @__PURE__ */ React.createElement(Banner, { kind: "error" }, importFileError), !importFileError && importFileNotice && /* @__PURE__ */ React.createElement(Banner, { kind: "success" }, importFileNotice)), listView && /* @__PURE__ */ React.createElement(Modal, { title: "All sessions & races", onClose: () => setListView(null), icon: ICONS.calendar }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" } }, [["races", `Races (${races.length})`], ["single", `Single sessions (${singles.length})`], ["recurring", `Recurring (${recurring.length})`]].map(([id, label]) => /* @__PURE__ */ React.createElement("button", { key: id, className: `subtab ${listView === id ? "active" : ""}`, onClick: () => setListView(id) }, label)), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: () => openAdd(null), style: { padding: "7px 12px", fontSize: 12, marginLeft: "auto" } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.plus, size: 13, color: ink }), " Add")), /* @__PURE__ */ React.createElement(
+      ScheduleEntryList,
       {
-        type: "button",
-        onClick: () => setForm((f) => ({ ...f, kind: "recurring" })),
-        style: form.kind === "recurring" ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 } : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
-      },
-      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 13, color: form.kind === "recurring" ? ink : dim }),
-      " Recurring session"
-    ), /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        type: "button",
-        onClick: () => setForm((f) => ({ ...f, kind: "single" })),
-        style: form.kind === "single" ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 } : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
-      },
-      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.calendar, size: 13, color: form.kind === "single" ? ink : dim }),
-      " Single session"
-    ), /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        type: "button",
-        onClick: () => setForm((f) => ({ ...f, kind: "race" })),
-        style: form.kind === "race" ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 } : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
-      },
-      /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 13, color: form.kind === "race" ? ink : dim }),
-      " Race"
-    )), /* @__PURE__ */ React.createElement("div", { style: { marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Model demand on" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: ((_b = form.sourceActivity) == null ? void 0 : _b.key) || "", onChange: (e) => applySourceActivity(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Manual (MET estimate from activity type / zone / duration below)"), activityLibrary.map((a) => /* @__PURE__ */ React.createElement("option", { key: a.key, value: a.key }, sourceActivityLabel(a)))), form.sourceActivity ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Demand estimate will scale from this session's actual ", fmt(form.sourceActivity.kcal / form.sourceActivity.durationMin, 1), " kcal/min \u2014 activity type/zone below were pre-filled from it, and duration can still be adjusted.") : activityLibrary.length === 0 ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "No synced Strava/intervals.icu activities in the last ", ACTIVITY_LIBRARY_DAYS, " days yet.") : null)), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Activity type" }, /* @__PURE__ */ React.createElement("select", { className: "inp", value: form.activityType, onChange: (e) => setForm((f) => ({ ...f, activityType: e.target.value })) }, ACTIVITY_TYPES.map((t) => /* @__PURE__ */ React.createElement("option", { key: t, value: t }, t)))), /* @__PURE__ */ React.createElement(Field, { label: form.kind === "race" ? "Expected finish time (min)" : "Duration (min)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "number", min: "1", value: form.durationMin, onChange: (e) => setForm((f) => ({ ...f, durationMin: e.target.value })) }))), /* @__PURE__ */ React.createElement(Field, { label: "Intensity zone" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, ZONES.map((z) => /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        key: z.n,
-        type: "button",
-        onClick: () => setForm((f) => ({ ...f, zone: z.n })),
-        title: z.hrPct,
-        style: form.zone === z.n ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12, cursor: "pointer", border: "none", background: cyan, color: ink } : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }
-      },
-      "Z",
-      z.n
-    ))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, ZONES[form.zone - 1].label, " \xB7 ", ZONES[form.zone - 1].hrPct)), form.kind === "race" ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Race date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.raceDate, onChange: (e) => setForm((f) => ({ ...f, raceDate: e.target.value })) }))), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Taper starts (days before race)" }, /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        className: "inp",
-        type: "number",
-        min: "1",
-        value: form.taperDays,
-        disabled: !form.taperEnabled,
-        onChange: (e) => setForm((f) => ({ ...f, taperDays: e.target.value })),
-        style: { opacity: form.taperEnabled ? 1 : 0.5 }
+        entries: listView === "races" ? races : listView === "single" ? singles : recurring,
+        empty: listView === "races" ? "No races scheduled." : listView === "single" ? "No single sessions scheduled." : "No recurring sessions.",
+        onEdit: (s) => openEdit(s.id),
+        onDelete: (s) => setConfirmDelete({ planned: { id: s.id }, dateKey: null })
       }
-    ))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.taperEnabled, onChange: (e) => setForm((f) => ({ ...f, taperEnabled: e.target.checked })) }), "Enable tapering"), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 150px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Carb-load starts (days before race)" }, /* @__PURE__ */ React.createElement(
-      "input",
+    )), editor && /* @__PURE__ */ React.createElement(
+      Modal,
       {
-        className: "inp",
-        type: "number",
-        min: "1",
-        value: form.carbLoadDays,
-        disabled: !form.carbLoadEnabled,
-        onChange: (e) => setForm((f) => ({ ...f, carbLoadDays: e.target.value })),
-        style: { opacity: form.carbLoadEnabled ? 1 : 0.5 }
-      }
-    ))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.carbLoadEnabled, onChange: (e) => setForm((f) => ({ ...f, carbLoadEnabled: e.target.checked })) }), "Enable carb-loading"), form.carbLoadEnabled && (parseInt(form.durationMin) || 0) < CARB_LOAD_MIN_DURATION && /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 100%", fontSize: 11, color: dim } }, "Carb-loading only kicks in for races of ", CARB_LOAD_MIN_DURATION, "+ min \u2014 shorter efforts don't deplete enough glycogen to benefit.")) : form.kind === "single" ? /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.date, onChange: (e) => setForm((f) => ({ ...f, date: e.target.value })) }))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement("span", { className: "fieldlabel" }, "Days of week"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4 } }, WEEKDAY_LABELS.map((label, n) => /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        key: n,
-        type: "button",
-        onClick: () => toggleDay(n),
-        style: form.daysOfWeek.includes(n) ? { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 700, fontSize: 11.5, cursor: "pointer", border: "none", background: amber, color: ink } : { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 600, fontSize: 11.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }
+        title: editor.id ? "Edit schedule entry" : "Add to schedule",
+        onClose: () => setEditor(null),
+        icon: editor.form.kind === "race" ? ICONS.trophy : ICONS.calendar,
+        maxWidth: 720
       },
-      label
-    )))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 140px" } }, /* @__PURE__ */ React.createElement(Field, { label: "Start date" }, /* @__PURE__ */ React.createElement("input", { className: "inp", type: "date", value: form.startDate, onChange: (e) => setForm((f) => ({ ...f, startDate: e.target.value })) }))), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 140px" } }, /* @__PURE__ */ React.createElement(Field, { label: "End date" }, /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        className: "inp",
-        type: "date",
-        value: form.endDate,
-        disabled: form.ongoing,
-        onChange: (e) => setForm((f) => ({ ...f, endDate: e.target.value })),
-        style: { opacity: form.ongoing ? 0.5 : 1 }
-      }
-    ))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: form.ongoing, onChange: (e) => setForm((f) => ({ ...f, ongoing: e.target.checked })) }), "Ongoing"))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 14 } }, /* @__PURE__ */ React.createElement(Field, { label: "Notes (optional)" }, /* @__PURE__ */ React.createElement("input", { className: "inp", value: form.notes, onChange: (e) => setForm((f) => ({ ...f, notes: e.target.value })), placeholder: form.kind === "race" ? "e.g. Boston Marathon" : "e.g. track intervals" }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 18 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: handleSubmit }, editingId ? "Save changes" : form.kind === "race" ? "Add race" : "Add to schedule"), editingId && /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: cancelEdit }, "Cancel"))), races.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", gap: 7 } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trophy, size: 16, color: gold }), " Races"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 } }, races.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, ref: (el) => {
-      itemRefs.current[s.id] = el;
-    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.notes || s.activityType), " \xB7 ", s.activityType, " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.raceDate, " \xB7 ", s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper", " \xB7 ", raceCarbLoadDays(s) > 0 ? `carb-load ${raceCarbLoadDays(s)}d` : "no carb-load", s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
-      if (confirm("Delete this race?")) onDelete(s.id);
-    }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))), singles.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 } }, "Single sessions"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 } }, singles.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, ref: (el) => {
-      itemRefs.current[s.id] = el;
-    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.date, s.notes ? ` \xB7 ${s.notes}` : "", s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
-      if (confirm("Delete this scheduled session?")) onDelete(s.id);
-    }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))), recurring.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 } }, "Recurring sessions"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 } }, recurring.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, ref: (el) => {
-      itemRefs.current[s.id] = el;
-    }, style: scheduleRowStyle(highlightIds.includes(s.id)) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min", /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", "), " \xB7 from ", s.startDate, s.endDate ? ` to ${s.endDate}` : " (ongoing)", s.notes ? ` \xB7 ${s.notes}` : "", s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => startEdit(s), style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => {
-      if (confirm("Delete this scheduled session?")) onDelete(s.id);
-    }, style: { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim } }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))))));
+      /* @__PURE__ */ React.createElement(
+        ScheduleEntryEditor,
+        {
+          initialForm: editor.form,
+          isEdit: !!editor.id,
+          activityLibrary,
+          onSave: saveEditor,
+          onCancel: () => setEditor(null),
+          onDelete: editor.id ? () => {
+            setConfirmDelete({ planned: { id: editor.id }, dateKey: editor.dateKey });
+            setEditor(null);
+          } : null
+        }
+      )
+    ), confirmDelete && (() => {
+      const { planned, dateKey } = confirmDelete;
+      const entry = schedule.find((s) => s.id === planned.id);
+      if (!entry) return null;
+      const isRecurring = entry.kind !== "race" && entry.kind !== "single";
+      const prettyDate = dateKey ? (/* @__PURE__ */ new Date(dateKey + "T00:00:00")).toLocaleDateString(void 0, { weekday: "long", month: "short", day: "numeric" }) : null;
+      const close = () => setConfirmDelete(null);
+      return /* @__PURE__ */ React.createElement(Modal, { title: entry.kind === "race" ? "Remove race?" : "Remove session?", onClose: close, icon: ICONS.trash, iconColor: coral, maxWidth: 460 }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, lineHeight: 1.5, marginBottom: 6 } }, /* @__PURE__ */ React.createElement("b", null, scheduleEntryLabel(entry))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim, lineHeight: 1.5 } }, isRecurring ? prettyDate ? /* @__PURE__ */ React.createElement(React.Fragment, null, "This repeats on ", entry.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", "), ". Skip just ", prettyDate, ", or delete every occurrence?") : /* @__PURE__ */ React.createElement(React.Fragment, null, "This repeats on ", entry.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", "), ". Deleting removes every occurrence.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "Scheduled ", entry.kind === "race" ? entry.raceDate : entry.date, ". This can't be undone.")), entry.source && /* @__PURE__ */ React.createElement(Banner, { kind: "warning" }, "Imported from the ", /* @__PURE__ */ React.createElement("code", null, entry.source), " training plan \u2014 it may come back the next time that plan file changes and is re-imported."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 18, flexWrap: "wrap" } }, isRecurring && dateKey && /* @__PURE__ */ React.createElement("button", { className: "btn-primary", onClick: () => {
+        skipOccurrence(entry, dateKey);
+        close();
+      } }, "Skip this day only"), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => {
+            onDelete(entry.id);
+            close();
+          },
+          style: { padding: "9px 16px", borderRadius: 4, fontWeight: 700, fontSize: 13, cursor: "pointer", border: "none", background: coral, color: ink }
+        },
+        isRecurring ? "Delete whole series" : entry.kind === "race" ? "Delete race" : "Delete session"
+      ), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", onClick: close }, "Cancel")));
+    })());
+  }
+  function ScheduleEntryList({ entries, empty, onEdit, onDelete }) {
+    if (!entries.length) return /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: dim } }, empty);
+    const iconBtn = { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim };
+    return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8 } }, entries.map((s) => /* @__PURE__ */ React.createElement("div", { key: s.id, style: scheduleRowStyle(false) }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, s.kind === "race" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("b", null, s.notes || s.activityType), " \xB7 ", s.activityType, " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("b", null, s.activityType), " \xB7 ", ZONES[s.zone - 1].label.split(" \xB7 ")[1], " \xB7 ", s.durationMin, "min"), /* @__PURE__ */ React.createElement("div", { style: { color: dim, fontSize: 11, marginTop: 2 } }, s.kind === "race" ? /* @__PURE__ */ React.createElement(React.Fragment, null, s.raceDate, " \xB7 ", s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper", " \xB7 ", raceCarbLoadDays(s) > 0 ? `carb-load ${raceCarbLoadDays(s)}d` : "no carb-load") : s.kind === "single" ? /* @__PURE__ */ React.createElement(React.Fragment, null, s.date, s.notes ? ` \xB7 ${s.notes}` : "") : /* @__PURE__ */ React.createElement(React.Fragment, null, s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", "), " \xB7 from ", s.startDate, s.endDate ? ` to ${s.endDate}` : " (ongoing)", s.notes ? ` \xB7 ${s.notes}` : "", s.skipDates && s.skipDates.length ? ` \xB7 ${s.skipDates.length} day${s.skipDates.length === 1 ? "" : "s"} skipped` : ""), s.sourceActivity && ` \xB7 modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`, s.source && ` \xB7 from ${s.source}`)), /* @__PURE__ */ React.createElement("button", { title: "Edit", onClick: () => onEdit(s), style: iconBtn }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.pencil, size: 13, color: dim })), /* @__PURE__ */ React.createElement("button", { title: "Delete", onClick: () => onDelete(s), style: iconBtn }, /* @__PURE__ */ React.createElement(Icon, { path: ICONS.trash, size: 13, color: coral })))));
   }
   function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units, targetWindowDays, ironmanStatus, imProjection, imProjectionError, imMissingCalibration }) {
     var _a;

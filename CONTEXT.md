@@ -125,6 +125,12 @@ per-browser preference in `localStorage` (`panels:setup`, `panels:log`), not the
   logs live behind the "Stored data…" button (a modal with one tab each). The training tab is
   read-only: every cached Strava + intervals.icu activity, with intervals.icu rows on Strava days dimmed
   (the model ignores them there).
+- Schedule: the 3-week calendar is the editor. Hovering a day shows **+** (add a session or race there, in a
+  pop-up `ScheduleEntryEditor`); hovering a planned chip shows a trash icon (confirm dialog); clicking a chip
+  opens it for editing (the pop-up also has Delete, which is how phones delete — the chip trash is hidden
+  under 700px). The full Races / Single / Recurring lists live behind "All sessions & races".
+  Deleting one occurrence of a recurring session ("Skip this day only") adds the date to the entry's
+  `skipDates`, honoured by `getScheduledSessionsForDate` and by `schedule_sync.covered_by_existing`.
 
 ## Data model — things that aren't obvious from a schema alone
 

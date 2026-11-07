@@ -466,6 +466,8 @@ function getScheduledSessionsForDate(schedule, dateStr) {
     if (!s.daysOfWeek.includes(weekday)) return false;
     if (dateStr < s.startDate) return false;
     if (s.endDate && dateStr > s.endDate) return false;
+    // Occurrences removed one at a time from the calendar ("skip this day").
+    if (Array.isArray(s.skipDates) && s.skipDates.includes(dateStr)) return false;
     return true;
   });
 }
@@ -2095,6 +2097,13 @@ function App() {
         .panel-head:hover { background: ${panel2}; }
         .panel-head:focus-visible { outline: 2px solid ${cyan}; outline-offset: -2px; }
         .panel-summary { margin-left: auto; font-size: 11.5px; color: ${dim}; font-family: ${mono}; }
+        .cal-day { position: relative; }
+        .cal-add, .chip-del { opacity: 0; transition: opacity 0.12s; }
+        .cal-day:hover .cal-add, .cal-add:focus-visible { opacity: 1; }
+        .cal-chip-wrap { position: relative; min-width: 0; }
+        .cal-chip-wrap:hover .chip-del, .chip-del:focus-visible { opacity: 1; }
+        @media (hover: none) { .cal-add, .chip-del { opacity: 1; } }
+        @media (max-width: 700px) { .chip-del { display: none; } }
         .subtab { padding: 7px 14px; border-radius: 4px; font-size: 12.5px; font-weight: 600; cursor: pointer; border: 1px solid ${line}; background: transparent; color: ${dim}; }
         .subtab.active { background: ${panel2}; color: ${cyan}; border-color: ${cyan}; }
         .fieldlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: ${dim}; margin-bottom: 6px; display:block; font-weight:600; }
@@ -2332,24 +2341,33 @@ function PanelList({ storageKey, panels, placeholder = "Filter panels…", toolb
 
 // Full-screen-ish overlay for the "advanced" stored-data views. Closes on
 // Escape or a click on the backdrop.
-function Modal({ title, onClose, children }) {
+const modalStack = [];
+function Modal({ title, onClose, children, icon = ICONS.database, iconColor = cyan, maxWidth = 1100 }) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
   useEffect(() => {
-    const onKey = (e) => { if (e.key === "Escape") onCloseRef.current(); };
+    // Modals can stack (e.g. the editor opened from the schedule list), so
+    // Escape only closes the topmost one.
+    const token = {};
+    modalStack.push(token);
+    const onKey = (e) => { if (e.key === "Escape" && modalStack[modalStack.length - 1] === token) onCloseRef.current(); };
     window.addEventListener("keydown", onKey);
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
-    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prevOverflow; };
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      modalStack.splice(modalStack.indexOf(token), 1);
+      document.body.style.overflow = prevOverflow;
+    };
   }, []);
   return (
     <div onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
       style={{ position: "fixed", inset: 0, zIndex: 100, background: "rgba(0,0,0,0.55)", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: "clamp(8px, 4vh, 48px) clamp(8px, 3vw, 32px)", overflowY: "auto" }}>
       <div role="dialog" aria-modal="true" aria-label={title} className="card"
-        style={{ width: "100%", maxWidth: 1100, padding: 22, boxShadow: "0 18px 48px rgba(0,0,0,0.5)" }}>
+        style={{ width: "100%", maxWidth, padding: 22, boxShadow: "0 18px 48px rgba(0,0,0,0.5)" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12 }}>
           <div style={{ fontFamily: grotesk, fontWeight: 700, fontSize: 16, display: "flex", alignItems: "center", gap: 8 }}>
-            <Icon path={ICONS.database} size={16} color={cyan} /> {title}
+            <Icon path={icon} size={16} color={iconColor} /> {title}
           </div>
           <button onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", color: dim, cursor: "pointer", fontSize: 22, lineHeight: 1, padding: 0 }}>×</button>
         </div>
@@ -3515,8 +3533,7 @@ function sourceActivityLabel(src) {
   return `${src.date} · ${src.name} · ${src.durationMin}min · ${src.kcal}kcal`;
 }
 
-// Shared look for a schedule-listing row, with a temporary highlight state
-// used when jumping in from the "Upcoming" calendar (see jumpToDay below).
+// Shared look for a schedule-listing row (optionally highlighted).
 function scheduleRowStyle(highlighted) {
   return {
     display: "flex", alignItems: "center", gap: 12, padding: "10px 12px",
@@ -3527,15 +3544,260 @@ function scheduleRowStyle(highlighted) {
   };
 }
 
+function scheduleEntryFromForm(form) {
+  const base = {
+    activityType: form.activityType,
+    zone: form.zone,
+    durationMin: parseInt(form.durationMin) || 0,
+    notes: form.notes,
+    sourceActivity: form.sourceActivity,
+  };
+  if (form.kind === "race") {
+    return { kind: "race", ...base, raceDate: form.raceDate,
+      taperDays: form.taperEnabled ? Math.max(1, parseInt(form.taperDays) || DEFAULT_TAPER_DAYS) : 0,
+      carbLoadDays: form.carbLoadEnabled ? Math.max(1, parseInt(form.carbLoadDays) || CARB_LOAD_DAYS) : 0 };
+  }
+  if (form.kind === "single") return { kind: "single", ...base, date: form.date };
+  return { kind: "recurring", ...base, daysOfWeek: form.daysOfWeek, startDate: form.startDate,
+    endDate: form.ongoing ? null : (form.endDate || null),
+    ...(form.skipDates && form.skipDates.length ? { skipDates: form.skipDates } : {}) };
+}
+function scheduleFormFromEntry(s) {
+  const common = { ...emptyScheduleForm(), activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
+    notes: s.notes || "", sourceActivity: s.sourceActivity || null };
+  if (s.kind === "race") {
+    return { ...common, kind: "race", raceDate: s.raceDate,
+      taperEnabled: (s.taperDays ?? DEFAULT_TAPER_DAYS) > 0, taperDays: String(s.taperDays || DEFAULT_TAPER_DAYS),
+      carbLoadEnabled: raceCarbLoadDays(s) > 0, carbLoadDays: String(raceCarbLoadDays(s) || CARB_LOAD_DAYS) };
+  }
+  if (s.kind === "single") return { ...common, kind: "single", date: s.date };
+  return { ...common, kind: "recurring", daysOfWeek: s.daysOfWeek, startDate: s.startDate, endDate: s.endDate || "",
+    ongoing: !s.endDate, skipDates: s.skipDates || [] };
+}
+function scheduleEntryLabel(s) {
+  if (s.kind === "race") return s.notes || `${s.activityType} race`;
+  return `${s.activityType} Z${s.zone} · ${s.durationMin} min${s.notes ? ` · ${s.notes}` : ""}`;
+}
+
+// Add/edit form for one schedule entry (recurring session, single session or
+// race), shown in a pop-up. Owns its own draft so cancelling discards it.
+function ScheduleEntryEditor({ initialForm, isEdit, activityLibrary, onSave, onCancel, onDelete }) {
+  const [form, setForm] = useState(initialForm);
+  const [error, setError] = useState(null);
+  function applySourceActivity(key) {
+    const src = activityLibrary.find((a) => a.key === key);
+    if (!src) { setForm((f) => ({ ...f, sourceActivity: null })); return; }
+    setForm((f) => ({
+      ...f,
+      activityType: src.activityType,
+      zone: src.zone,
+      durationMin: String(src.durationMin),
+      sourceActivity: { key: src.key, date: src.date, name: src.name, durationMin: src.durationMin, kcal: src.kcal, intensityFactor: src.intensityFactor },
+    }));
+  }
+  function toggleDay(n) {
+    setForm((f) => ({
+      ...f,
+      daysOfWeek: f.daysOfWeek.includes(n) ? f.daysOfWeek.filter((d) => d !== n) : [...f.daysOfWeek, n].sort(),
+    }));
+  }
+  function handleSubmit() {
+    if (form.kind === "recurring" && form.daysOfWeek.length === 0) { setError("Pick at least one day of the week."); return; }
+    onSave(scheduleEntryFromForm(form));
+  }
+  return (
+    <div onKeyDown={(e) => { if (e.key === "Enter" && e.target.tagName === "INPUT" && e.target.type !== "checkbox") handleSubmit(); }}>
+      <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
+        {form.kind === "race"
+          ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days."
+          : form.kind === "single"
+          ? "A single session on one specific date — doesn't repeat, and won't affect any other day."
+          : <>Repeats on the days you pick, within the date range. Projects up to {FORWARD_DAYS} days ahead on the
+            dashboard as an estimate — once a real activity syncs in for that day, it takes over automatically.</>}
+      </div>
+
+        {!isEdit && (
+          <div style={{ display: "flex", gap: 4, marginBottom: 16 }}>
+            <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "recurring" }))}
+              style={form.kind === "recurring"
+                ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+                : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Icon path={ICONS.calendar} size={13} color={form.kind === "recurring" ? ink : dim} /> Recurring session
+            </button>
+            <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "single" }))}
+              style={form.kind === "single"
+                ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+                : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Icon path={ICONS.calendar} size={13} color={form.kind === "single" ? ink : dim} /> Single session
+            </button>
+            <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "race" }))}
+              style={form.kind === "race"
+                ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
+                : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Icon path={ICONS.trophy} size={13} color={form.kind === "race" ? ink : dim} /> Race
+            </button>
+          </div>
+        )}
+
+        <div style={{ marginBottom: 14 }}>
+          <Field label="Model demand on">
+            <select className="inp" value={form.sourceActivity?.key || ""} onChange={(e) => applySourceActivity(e.target.value)}>
+              <option value="">Manual (MET estimate from activity type / zone / duration below)</option>
+              {activityLibrary.map((a) => (
+                <option key={a.key} value={a.key}>{sourceActivityLabel(a)}</option>
+              ))}
+            </select>
+            {form.sourceActivity ? (
+              <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
+                Demand estimate will scale from this session's actual {fmt(form.sourceActivity.kcal / form.sourceActivity.durationMin, 1)} kcal/min —
+                activity type/zone below were pre-filled from it, and duration can still be adjusted.
+              </div>
+            ) : activityLibrary.length === 0 ? (
+              <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>No synced Strava/intervals.icu activities in the last {ACTIVITY_LIBRARY_DAYS} days yet.</div>
+            ) : null}
+          </Field>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginBottom: 14 }}>
+          <Field label="Activity type">
+            <select className="inp" value={form.activityType} onChange={(e) => setForm((f) => ({ ...f, activityType: e.target.value }))}>
+              {ACTIVITY_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </Field>
+          <Field label={form.kind === "race" ? "Expected finish time (min)" : "Duration (min)"}>
+            <input className="inp" type="number" min="1" value={form.durationMin} onChange={(e) => setForm((f) => ({ ...f, durationMin: e.target.value }))} />
+          </Field>
+        </div>
+
+        <Field label="Intensity zone">
+          <div style={{ display: "flex", gap: 4 }}>
+            {ZONES.map((z) => (
+              <button key={z.n} type="button" onClick={() => setForm((f) => ({ ...f, zone: z.n }))}
+                title={z.hrPct}
+                style={form.zone === z.n
+                  ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12, cursor: "pointer", border: "none", background: cyan, color: ink }
+                  : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }}>
+                Z{z.n}
+              </button>
+            ))}
+          </div>
+          <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>{ZONES[form.zone - 1].label} · {ZONES[form.zone - 1].hrPct}</div>
+        </Field>
+
+        {form.kind === "race" ? (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" }}>
+            <div style={{ flex: "1 1 150px" }}>
+              <Field label="Race date">
+                <input className="inp" type="date" value={form.raceDate} onChange={(e) => setForm((f) => ({ ...f, raceDate: e.target.value }))} />
+              </Field>
+            </div>
+            <div style={{ flex: "1 1 150px" }}>
+              <Field label="Taper starts (days before race)">
+                <input className="inp" type="number" min="1" value={form.taperDays} disabled={!form.taperEnabled}
+                  onChange={(e) => setForm((f) => ({ ...f, taperDays: e.target.value }))} style={{ opacity: form.taperEnabled ? 1 : 0.5 }} />
+              </Field>
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
+              <input type="checkbox" checked={form.taperEnabled} onChange={(e) => setForm((f) => ({ ...f, taperEnabled: e.target.checked }))} />
+              Enable tapering
+            </label>
+            <div style={{ flex: "1 1 150px" }}>
+              <Field label="Carb-load starts (days before race)">
+                <input className="inp" type="number" min="1" value={form.carbLoadDays} disabled={!form.carbLoadEnabled}
+                  onChange={(e) => setForm((f) => ({ ...f, carbLoadDays: e.target.value }))} style={{ opacity: form.carbLoadEnabled ? 1 : 0.5 }} />
+              </Field>
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
+              <input type="checkbox" checked={form.carbLoadEnabled} onChange={(e) => setForm((f) => ({ ...f, carbLoadEnabled: e.target.checked }))} />
+              Enable carb-loading
+            </label>
+            {form.carbLoadEnabled && (parseInt(form.durationMin) || 0) < CARB_LOAD_MIN_DURATION && (
+              <div style={{ flex: "1 1 100%", fontSize: 11, color: dim }}>Carb-loading only kicks in for races of {CARB_LOAD_MIN_DURATION}+ min — shorter efforts don't deplete enough glycogen to benefit.</div>
+            )}
+          </div>
+        ) : form.kind === "single" ? (
+          <div style={{ marginTop: 14 }}>
+            <Field label="Date">
+              <input className="inp" type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} />
+            </Field>
+          </div>
+        ) : (
+          <>
+            <div style={{ marginTop: 14 }}>
+              <span className="fieldlabel">Days of week</span>
+              <div style={{ display: "flex", gap: 4 }}>
+                {WEEKDAY_LABELS.map((label, n) => (
+                  <button key={n} type="button" onClick={() => toggleDay(n)}
+                    style={form.daysOfWeek.includes(n)
+                      ? { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 700, fontSize: 11.5, cursor: "pointer", border: "none", background: amber, color: ink }
+                      : { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 600, fontSize: 11.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" }}>
+              <div style={{ flex: "1 1 140px" }}>
+                <Field label="Start date">
+                  <input className="inp" type="date" value={form.startDate} onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value }))} />
+                </Field>
+              </div>
+              <div style={{ flex: "1 1 140px" }}>
+                <Field label="End date">
+                  <input className="inp" type="date" value={form.endDate} disabled={form.ongoing}
+                    onChange={(e) => setForm((f) => ({ ...f, endDate: e.target.value }))} style={{ opacity: form.ongoing ? 0.5 : 1 }} />
+                </Field>
+              </div>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
+                <input type="checkbox" checked={form.ongoing} onChange={(e) => setForm((f) => ({ ...f, ongoing: e.target.checked }))} />
+                Ongoing
+              </label>
+            </div>
+          </>
+        )}
+
+        <div style={{ marginTop: 14 }}>
+          <Field label="Notes (optional)">
+            <input className="inp" value={form.notes} onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} placeholder={form.kind === "race" ? "e.g. Boston Marathon" : "e.g. track intervals"} />
+          </Field>
+        </div>
+
+        {form.kind === "recurring" && form.skipDates && form.skipDates.length > 0 && (
+          <div style={{ marginTop: 14, fontSize: 11.5, color: dim, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+            Skipped days:
+            {form.skipDates.slice().sort().map((d) => (
+              <span key={d} style={{ display: "inline-flex", alignItems: "center", gap: 4, border: `1px solid ${line}`, borderRadius: 3, padding: "1px 6px", fontFamily: mono }}>
+                {d}
+                <button type="button" title="Restore this day" onClick={() => setForm((f) => ({ ...f, skipDates: f.skipDates.filter((x) => x !== d) }))}
+                  style={{ background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, fontSize: 13, lineHeight: 1 }}>×</button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        {error && <Banner kind="error">{error}</Banner>}
+        <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+          <button className="btn-primary" onClick={handleSubmit}>{isEdit ? "Save changes" : (form.kind === "race" ? "Add race" : "Add to schedule")}</button>
+          <button className="btn-ghost" onClick={onCancel}>Cancel</button>
+          {onDelete && (
+            <button className="btn-ghost" onClick={onDelete} style={{ marginLeft: "auto", color: coral, borderColor: coral, display: "flex", alignItems: "center", gap: 6 }}>
+              <Icon path={ICONS.trash} size={13} color={coral} /> Delete
+            </button>
+          )}
+        </div>
+    </div>
+  );
+}
+
 function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, intervalsData,
   onImportFile, importFileError, importFileNotice, matchOverrides, onSetMatchOverride,
   profile, setProfile, weightLog, matchedKcalRates }) {
-  const [form, setForm] = useState(emptyScheduleForm());
-  const [editingId, setEditingId] = useState(null);
-  const [highlightIds, setHighlightIds] = useState([]);
+  const [editor, setEditor] = useState(null); // null | { id: string|null, form }
+  const [confirmDelete, setConfirmDelete] = useState(null); // null | { planned, dateKey }
+  const [listView, setListView] = useState(null); // null | "races" | "single" | "recurring"
   const [scheduleDragOver, setScheduleDragOver] = useState(false);
   const [editingMatchDay, setEditingMatchDay] = useState(null); // date key, or null
-  const itemRefs = useRef({});
   // Both default on (undefined !== false) so existing profiles pick up the
   // new toggles already enabled — nothing changes until someone opts out.
   const showActual = profile.scheduleShowActual !== false;
@@ -3550,118 +3812,30 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
     for (const a of activityLibrary) (map[a.date] || (map[a.date] = [])).push(a);
     return map;
   }, [activityLibrary]);
-  function applySourceActivity(key) {
-    const src = activityLibrary.find((a) => a.key === key);
-    if (!src) { setForm((f) => ({ ...f, sourceActivity: null })); return; }
-    setForm((f) => ({
-      ...f,
-      activityType: src.activityType,
-      zone: src.zone,
-      durationMin: String(src.durationMin),
-      sourceActivity: { key: src.key, date: src.date, name: src.name, durationMin: src.durationMin, kcal: src.kcal, intensityFactor: src.intensityFactor },
-    }));
-  }
-
-  // Scrolls the listing card(s) below to the session(s)/race scheduled on the
-  // clicked calendar day, and flashes them briefly so they're easy to spot.
-  function jumpToDay(day) {
-    const ids = day.sessions.map((s) => s.id).concat(day.race ? [day.race.id] : []);
-    if (!ids.length) return;
-    setHighlightIds(ids);
-    const firstEl = itemRefs.current[ids[0]];
-    if (firstEl) firstEl.scrollIntoView({ behavior: "smooth", block: "center" });
-    window.clearTimeout(jumpToDay._t);
-    jumpToDay._t = window.setTimeout(() => setHighlightIds([]), 2000);
-  }
 
   const recurring = schedule.filter((s) => s.kind !== "race" && s.kind !== "single");
   const singles = schedule.filter((s) => s.kind === "single").slice().sort((a, b) => (a.date < b.date ? -1 : 1));
   const races = getRaces(schedule).slice().sort((a, b) => (a.raceDate < b.raceDate ? -1 : 1));
 
-  function toggleDay(n) {
-    setForm((f) => ({
-      ...f,
-      daysOfWeek: f.daysOfWeek.includes(n) ? f.daysOfWeek.filter((d) => d !== n) : [...f.daysOfWeek, n].sort(),
-    }));
+  // Calendar "+": a single session on that day by default; switching the kind
+  // to recurring/race keeps the day (weekday + start date / race date).
+  function openAdd(dateKey) {
+    const key = dateKey || toLocalISODate(new Date());
+    const weekday = new Date(key + "T00:00:00").getDay();
+    setEditor({ id: null, form: { ...emptyScheduleForm(), kind: "single", date: key, raceDate: key, startDate: key, daysOfWeek: [weekday] } });
   }
-
-  function startEdit(s) {
-    setEditingId(s.id);
-    if (s.kind === "race") {
-      setForm({
-        ...emptyScheduleForm(),
-        kind: "race", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
-        raceDate: s.raceDate, taperEnabled: (s.taperDays ?? DEFAULT_TAPER_DAYS) > 0,
-        taperDays: String(s.taperDays || DEFAULT_TAPER_DAYS),
-        carbLoadEnabled: raceCarbLoadDays(s) > 0,
-        carbLoadDays: String(raceCarbLoadDays(s) || CARB_LOAD_DAYS), notes: s.notes || "",
-        sourceActivity: s.sourceActivity || null,
-      });
-    } else if (s.kind === "single") {
-      setForm({
-        ...emptyScheduleForm(),
-        kind: "single", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
-        date: s.date, notes: s.notes || "", sourceActivity: s.sourceActivity || null,
-      });
-    } else {
-      setForm({
-        ...emptyScheduleForm(),
-        kind: "recurring", activityType: s.activityType, zone: s.zone, durationMin: String(s.durationMin),
-        daysOfWeek: s.daysOfWeek, startDate: s.startDate, endDate: s.endDate || "",
-        ongoing: !s.endDate, notes: s.notes || "", sourceActivity: s.sourceActivity || null,
-      });
-    }
+  // Calendar chips are tapered copies, so always edit the stored entry.
+  function openEdit(id, dateKey = null) {
+    const entry = schedule.find((s) => s.id === id);
+    if (entry) setEditor({ id, dateKey, form: scheduleFormFromEntry(entry) });
   }
-  function cancelEdit() {
-    setEditingId(null);
-    setForm(emptyScheduleForm());
+  function saveEditor(entry) {
+    if (editor.id) onUpdate(editor.id, entry); else onAdd(entry);
+    setEditor(null);
   }
-
-  function handleSubmit() {
-    if (form.kind === "race") {
-      const entry = {
-        kind: "race",
-        activityType: form.activityType,
-        zone: form.zone,
-        durationMin: parseInt(form.durationMin) || 0,
-        raceDate: form.raceDate,
-        taperDays: form.taperEnabled ? Math.max(1, parseInt(form.taperDays) || DEFAULT_TAPER_DAYS) : 0,
-        carbLoadDays: form.carbLoadEnabled ? Math.max(1, parseInt(form.carbLoadDays) || CARB_LOAD_DAYS) : 0,
-        notes: form.notes,
-        sourceActivity: form.sourceActivity,
-      };
-      if (editingId) onUpdate(editingId, entry); else onAdd(entry);
-      cancelEdit();
-      return;
-    }
-    if (form.kind === "single") {
-      const entry = {
-        kind: "single",
-        activityType: form.activityType,
-        zone: form.zone,
-        durationMin: parseInt(form.durationMin) || 0,
-        date: form.date,
-        notes: form.notes,
-        sourceActivity: form.sourceActivity,
-      };
-      if (editingId) onUpdate(editingId, entry); else onAdd(entry);
-      cancelEdit();
-      return;
-    }
-    if (form.daysOfWeek.length === 0) { alert("Pick at least one day of the week."); return; }
-    const entry = {
-      kind: "recurring",
-      activityType: form.activityType,
-      zone: form.zone,
-      durationMin: parseInt(form.durationMin) || 0,
-      daysOfWeek: form.daysOfWeek,
-      startDate: form.startDate,
-      endDate: form.ongoing ? null : (form.endDate || null),
-      notes: form.notes,
-      sourceActivity: form.sourceActivity,
-    };
-    if (editingId) onUpdate(editingId, entry); else onAdd(entry);
-    cancelEdit();
+  function skipOccurrence(entry, dateKey) {
+    const { id, ...rest } = entry;
+    onUpdate(id, { ...rest, skipDates: Array.from(new Set([...(entry.skipDates || []), dateKey])).sort() });
   }
 
   // 3 full weeks starting from the most recent Sunday, so the schedule's actual
@@ -3701,8 +3875,17 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
   return (
     <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(min(420px, 100%), 1fr))", alignItems: "start", gridAutoFlow: "dense" }}>
       <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, display: "flex", alignItems: "center", gap: 7, marginRight: "auto" }}>
+            <Icon path={ICONS.calendar} size={16} color={cyan} /> Upcoming
+          </div>
+          <button className="btn-primary" onClick={() => openAdd(null)} style={{ padding: "7px 12px", fontSize: 12 }}>
+            <Icon path={ICONS.plus} size={13} color={ink} /> Add
+          </button>
+          <button className="btn-ghost" onClick={() => setListView(races.length ? "races" : singles.length ? "single" : "recurring")}
+            style={{ padding: "7px 12px", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+            <Icon path={ICONS.database} size={13} color={cyan} /> All sessions &amp; races ({schedule.length})
+          </button>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 10, flexWrap: "wrap" }}>
           <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
@@ -3717,7 +3900,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           </label>
         </div>
         <div style={{ fontSize: 12.5, color: dim, marginBottom: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <span>Next 3 weeks</span>
+          <span>Next 3 weeks · hover a day for <b style={{ color: paper }}>+</b> to add, a session for <Icon path={ICONS.trash} size={10} color={coral} /> to remove, click a session to edit</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={amber} /> pre-loads the day before</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.gauge} size={10} color={lavender} /> tapering</span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.flame} size={10} color={gold} /> carb-loading</span>
@@ -3725,7 +3908,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
           {showActual && (
             <>
               <span style={{ display: "flex", alignItems: "center", gap: 4 }}>solid = planned, outline = actual <Icon path={ICONS.check} size={10} color={mint} /> matched</span>
-              <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.pencil} size={10} color={dim} /> click to correct a match</span>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon path={ICONS.pencil} size={10} color={dim} /> correct a match</span>
             </>
           )}
           {showCalories && (
@@ -3742,13 +3925,26 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
             const isToday = day.key === todayKey;
             const isPast = day.key < todayKey;
             const isFirstOfMonth = day.date.getDate() === 1;
-            const clickable = day.sessions.length > 0 || !!day.race;
 
             function plannedChip(planned, i, isGroup) {
+              return (
+                <div key={`p${i}`} className="cal-chip-wrap">
+                  {plannedChipBody(planned, isGroup)}
+                  <button type="button" className="chip-del" aria-label="Remove from schedule"
+                    title={planned.isRace ? "Remove this race" : "Remove this session"}
+                    onClick={(e) => { e.stopPropagation(); setConfirmDelete({ planned, dateKey: day.key }); }}
+                    style={{ position: "absolute", right: 1, top: "50%", transform: "translateY(-50%)", background: panel, border: `1px solid ${line}`, borderRadius: 3, padding: 2, cursor: "pointer", display: "flex", lineHeight: 0 }}>
+                    <Icon path={ICONS.trash} size={9} color={coral} />
+                  </button>
+                </div>
+              );
+            }
+            function plannedChipBody(planned, isGroup) {
+              const onClick = (e) => { e.stopPropagation(); openEdit(planned.id, day.key); };
               if (planned.isRace) {
                 return (
-                  <div key={`p${i}`} title={`Race: ${planned.notes || planned.activityType} · ${planned.durationMin}min${isGroup ? " · matched to multiple activities" : ""}`}
-                    style={{
+                  <div onClick={onClick} title={`Race: ${planned.notes || planned.activityType} · ${planned.durationMin}min${isGroup ? " · matched to multiple activities" : ""} — click to edit`}
+                    style={{ cursor: "pointer",
                       background: gold, color: ink, borderRadius: 3, padding: "2px 5px", fontSize: 10.5,
                       lineHeight: 1.3, fontWeight: 700, display: "flex", alignItems: "center", gap: 3, overflow: "hidden",
                     }}>
@@ -3760,8 +3956,9 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                 );
               }
               return (
-                <div key={`p${i}`} title={`${planned.activityType} · ${ZONES[planned.zone - 1].label.split(" · ")[1]} · ${planned.durationMin}min${planned.notes ? ` · ${planned.notes}` : ""}${day.taper ? " · tapered" : ""}${isGroup ? " · matched to multiple activities" : ""}`}
+                <div onClick={onClick} title={`${planned.activityType} · ${ZONES[planned.zone - 1].label.split(" · ")[1]} · ${planned.durationMin}min${planned.notes ? ` · ${planned.notes}` : ""}${day.taper ? " · tapered" : ""}${isGroup ? " · matched to multiple activities" : ""} — click to edit`}
                   style={{
+                    cursor: "pointer",
                     background: ACTIVITY_COLORS[planned.activityType] || dim,
                     color: ink,
                     borderRadius: 3,
@@ -3828,8 +4025,7 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
             }
 
             return (
-              <div key={day.key} onClick={clickable ? () => jumpToDay(day) : undefined}
-                title={clickable ? "Jump to this session in the listings below" : undefined}
+              <div key={day.key} className="cal-day"
                 style={{
                 background: panel2,
                 border: isToday ? `2px solid ${cyan}` : day.race ? `1px solid ${gold}` : `1px solid ${line}`,
@@ -3839,20 +4035,26 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
                 display: "flex",
                 flexDirection: "column",
                 gap: 3,
-                cursor: clickable ? "pointer" : "default",
                 opacity: isPast ? 0.5 : 1,
               }}>
                 <div style={{ fontSize: 11, color: isToday ? cyan : dim, fontWeight: isToday ? 700 : 600, display: "flex", alignItems: "center", gap: 4 }}>
                   {isFirstOfMonth ? day.date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : day.date.getDate()}
                   {day.taper && <span title={`Tapering for ${day.taper.race.notes || day.taper.race.activityType} in ${day.taper.daysToRace}d — ~${Math.round(day.taper.volumeFactor * 100)}% volume`}><Icon path={ICONS.gauge} size={9} color={lavender} /></span>}
                   {day.carbLoad && <span title={`Carb-loading ahead of ${day.carbLoad.race.notes || day.carbLoad.race.activityType} in ${day.carbLoad.daysToRace}d`}><Icon path={ICONS.flame} size={9} color={gold} /></span>}
-                  {showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && (
-                    <button type="button" title="Correct planned/actual matches for this day"
-                      onClick={(e) => { e.stopPropagation(); setEditingMatchDay(day.key); }}
-                      style={{ marginLeft: "auto", background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }}>
-                      <Icon path={ICONS.pencil} size={10} color={dim} />
+                  <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 4 }}>
+                    {showActual && (day.pairs.length > 0 || day.dayActuals.length > 0) && (
+                      <button type="button" title="Correct planned/actual matches for this day"
+                        onClick={(e) => { e.stopPropagation(); setEditingMatchDay(day.key); }}
+                        style={{ background: "none", border: "none", color: dim, cursor: "pointer", padding: 0, display: "flex" }}>
+                        <Icon path={ICONS.pencil} size={10} color={dim} />
+                      </button>
+                    )}
+                    <button type="button" className="cal-add" title="Add a session or race on this day" aria-label="Add a session or race on this day"
+                      onClick={(e) => { e.stopPropagation(); openAdd(day.key); }}
+                      style={{ background: "none", border: `1px solid ${line}`, borderRadius: 3, color: cyan, cursor: "pointer", padding: 1, display: "flex" }}>
+                      <Icon path={ICONS.plus} size={10} color={cyan} />
                     </button>
-                  )}
+                  </span>
                 </div>
                 {showCalories && (day.expectedKcal > 0 || day.actualKcal > 0) && (
                   <div title={`Expected ${Math.round(day.expectedKcal)} kcal · Actual ${Math.round(day.actualKcal)} kcal burned`}
@@ -4027,244 +4229,101 @@ function ScheduleTab({ schedule, onAdd, onUpdate, onDelete, stravaData, interval
         {!importFileError && importFileNotice && <Banner kind="success">{importFileNotice}</Banner>}
       </div>
 
-      <div className="card" style={{ padding: 22, gridColumn: "1 / -1" }}>
-        <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 4, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon path={form.kind === "race" ? ICONS.trophy : ICONS.calendar} size={16} color={cyan} /> {editingId ? "Edit scheduled session" : "Add to schedule"}
-        </div>
-        <div style={{ fontSize: 12.5, color: dim, marginBottom: 16, lineHeight: 1.5 }}>
-          {form.kind === "race"
-            ? "A one-off event on a specific date. Training in the taper window before it is automatically scaled down, and carbs load up in the final days."
-            : form.kind === "single"
-            ? "A single session on one specific date — doesn't repeat, and won't affect any other day."
-            : <>Repeats on the days you pick, within the date range. Projects up to {FORWARD_DAYS} days ahead on the
-              dashboard as an estimate — once a real activity syncs in for that day, it takes over automatically.</>}
-        </div>
-
-        {!editingId && (
-          <div style={{ display: "flex", gap: 4, marginBottom: 16 }}>
-            <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "recurring" }))}
-              style={form.kind === "recurring"
-                ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
-                : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-              <Icon path={ICONS.calendar} size={13} color={form.kind === "recurring" ? ink : dim} /> Recurring session
-            </button>
-            <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "single" }))}
-              style={form.kind === "single"
-                ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
-                : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-              <Icon path={ICONS.calendar} size={13} color={form.kind === "single" ? ink : dim} /> Single session
-            </button>
-            <button type="button" onClick={() => setForm((f) => ({ ...f, kind: "race" }))}
-              style={form.kind === "race"
-                ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12.5, cursor: "pointer", border: "none", background: cyan, color: ink, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }
-                : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-              <Icon path={ICONS.trophy} size={13} color={form.kind === "race" ? ink : dim} /> Race
-            </button>
-          </div>
-        )}
-
-        <div style={{ marginBottom: 14 }}>
-          <Field label="Model demand on">
-            <select className="inp" value={form.sourceActivity?.key || ""} onChange={(e) => applySourceActivity(e.target.value)}>
-              <option value="">Manual (MET estimate from activity type / zone / duration below)</option>
-              {activityLibrary.map((a) => (
-                <option key={a.key} value={a.key}>{sourceActivityLabel(a)}</option>
-              ))}
-            </select>
-            {form.sourceActivity ? (
-              <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>
-                Demand estimate will scale from this session's actual {fmt(form.sourceActivity.kcal / form.sourceActivity.durationMin, 1)} kcal/min —
-                activity type/zone below were pre-filled from it, and duration can still be adjusted.
-              </div>
-            ) : activityLibrary.length === 0 ? (
-              <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>No synced Strava/intervals.icu activities in the last {ACTIVITY_LIBRARY_DAYS} days yet.</div>
-            ) : null}
-          </Field>
-        </div>
-
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginBottom: 14 }}>
-          <Field label="Activity type">
-            <select className="inp" value={form.activityType} onChange={(e) => setForm((f) => ({ ...f, activityType: e.target.value }))}>
-              {ACTIVITY_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
-            </select>
-          </Field>
-          <Field label={form.kind === "race" ? "Expected finish time (min)" : "Duration (min)"}>
-            <input className="inp" type="number" min="1" value={form.durationMin} onChange={(e) => setForm((f) => ({ ...f, durationMin: e.target.value }))} />
-          </Field>
-        </div>
-
-        <Field label="Intensity zone">
-          <div style={{ display: "flex", gap: 4 }}>
-            {ZONES.map((z) => (
-              <button key={z.n} type="button" onClick={() => setForm((f) => ({ ...f, zone: z.n }))}
-                title={z.hrPct}
-                style={form.zone === z.n
-                  ? { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 700, fontSize: 12, cursor: "pointer", border: "none", background: cyan, color: ink }
-                  : { flex: 1, padding: "9px 6px", borderRadius: 4, fontWeight: 600, fontSize: 12, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }}>
-                Z{z.n}
-              </button>
+      {listView && (
+        <Modal title="All sessions & races" onClose={() => setListView(null)} icon={ICONS.calendar}>
+          <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+            {[["races", `Races (${races.length})`], ["single", `Single sessions (${singles.length})`], ["recurring", `Recurring (${recurring.length})`]].map(([id, label]) => (
+              <button key={id} className={`subtab ${listView === id ? "active" : ""}`} onClick={() => setListView(id)}>{label}</button>
             ))}
+            <button className="btn-primary" onClick={() => openAdd(null)} style={{ padding: "7px 12px", fontSize: 12, marginLeft: "auto" }}>
+              <Icon path={ICONS.plus} size={13} color={ink} /> Add
+            </button>
           </div>
-          <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>{ZONES[form.zone - 1].label} · {ZONES[form.zone - 1].hrPct}</div>
-        </Field>
+          <ScheduleEntryList
+            entries={listView === "races" ? races : listView === "single" ? singles : recurring}
+            empty={listView === "races" ? "No races scheduled." : listView === "single" ? "No single sessions scheduled." : "No recurring sessions."}
+            onEdit={(s) => openEdit(s.id)}
+            onDelete={(s) => setConfirmDelete({ planned: { id: s.id }, dateKey: null })} />
+        </Modal>
+      )}
 
-        {form.kind === "race" ? (
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" }}>
-            <div style={{ flex: "1 1 150px" }}>
-              <Field label="Race date">
-                <input className="inp" type="date" value={form.raceDate} onChange={(e) => setForm((f) => ({ ...f, raceDate: e.target.value }))} />
-              </Field>
+      {editor && (
+        <Modal title={editor.id ? "Edit schedule entry" : "Add to schedule"} onClose={() => setEditor(null)}
+          icon={editor.form.kind === "race" ? ICONS.trophy : ICONS.calendar} maxWidth={720}>
+          <ScheduleEntryEditor initialForm={editor.form} isEdit={!!editor.id} activityLibrary={activityLibrary}
+            onSave={saveEditor} onCancel={() => setEditor(null)}
+            onDelete={editor.id ? () => { setConfirmDelete({ planned: { id: editor.id }, dateKey: editor.dateKey }); setEditor(null); } : null} />
+        </Modal>
+      )}
+
+      {confirmDelete && (() => {
+        const { planned, dateKey } = confirmDelete;
+        const entry = schedule.find((s) => s.id === planned.id);
+        if (!entry) return null;
+        const isRecurring = entry.kind !== "race" && entry.kind !== "single";
+        const prettyDate = dateKey ? new Date(dateKey + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" }) : null;
+        const close = () => setConfirmDelete(null);
+        return (
+          <Modal title={entry.kind === "race" ? "Remove race?" : "Remove session?"} onClose={close} icon={ICONS.trash} iconColor={coral} maxWidth={460}>
+            <div style={{ fontSize: 13, lineHeight: 1.5, marginBottom: 6 }}><b>{scheduleEntryLabel(entry)}</b></div>
+            <div style={{ fontSize: 12.5, color: dim, lineHeight: 1.5 }}>
+              {isRecurring
+                ? (prettyDate
+                  ? <>This repeats on {entry.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", ")}. Skip just {prettyDate}, or delete every occurrence?</>
+                  : <>This repeats on {entry.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", ")}. Deleting removes every occurrence.</>)
+                : <>Scheduled {entry.kind === "race" ? entry.raceDate : entry.date}. This can't be undone.</>}
             </div>
-            <div style={{ flex: "1 1 150px" }}>
-              <Field label="Taper starts (days before race)">
-                <input className="inp" type="number" min="1" value={form.taperDays} disabled={!form.taperEnabled}
-                  onChange={(e) => setForm((f) => ({ ...f, taperDays: e.target.value }))} style={{ opacity: form.taperEnabled ? 1 : 0.5 }} />
-              </Field>
-            </div>
-            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
-              <input type="checkbox" checked={form.taperEnabled} onChange={(e) => setForm((f) => ({ ...f, taperEnabled: e.target.checked }))} />
-              Enable tapering
-            </label>
-            <div style={{ flex: "1 1 150px" }}>
-              <Field label="Carb-load starts (days before race)">
-                <input className="inp" type="number" min="1" value={form.carbLoadDays} disabled={!form.carbLoadEnabled}
-                  onChange={(e) => setForm((f) => ({ ...f, carbLoadDays: e.target.value }))} style={{ opacity: form.carbLoadEnabled ? 1 : 0.5 }} />
-              </Field>
-            </div>
-            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
-              <input type="checkbox" checked={form.carbLoadEnabled} onChange={(e) => setForm((f) => ({ ...f, carbLoadEnabled: e.target.checked }))} />
-              Enable carb-loading
-            </label>
-            {form.carbLoadEnabled && (parseInt(form.durationMin) || 0) < CARB_LOAD_MIN_DURATION && (
-              <div style={{ flex: "1 1 100%", fontSize: 11, color: dim }}>Carb-loading only kicks in for races of {CARB_LOAD_MIN_DURATION}+ min — shorter efforts don't deplete enough glycogen to benefit.</div>
+            {entry.source && (
+              <Banner kind="warning">
+                Imported from the <code>{entry.source}</code> training plan — it may come back the next time that plan file changes and is re-imported.
+              </Banner>
             )}
-          </div>
-        ) : form.kind === "single" ? (
-          <div style={{ marginTop: 14 }}>
-            <Field label="Date">
-              <input className="inp" type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} />
-            </Field>
-          </div>
-        ) : (
-          <>
-            <div style={{ marginTop: 14 }}>
-              <span className="fieldlabel">Days of week</span>
-              <div style={{ display: "flex", gap: 4 }}>
-                {WEEKDAY_LABELS.map((label, n) => (
-                  <button key={n} type="button" onClick={() => toggleDay(n)}
-                    style={form.daysOfWeek.includes(n)
-                      ? { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 700, fontSize: 11.5, cursor: "pointer", border: "none", background: amber, color: ink }
-                      : { flex: 1, padding: "8px 4px", borderRadius: 4, fontWeight: 600, fontSize: 11.5, cursor: "pointer", border: `1px solid ${line}`, background: "transparent", color: dim }}>
-                    {label}
-                  </button>
-                ))}
-              </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 18, flexWrap: "wrap" }}>
+              {isRecurring && dateKey && (
+                <button className="btn-primary" onClick={() => { skipOccurrence(entry, dateKey); close(); }}>Skip this day only</button>
+              )}
+              <button onClick={() => { onDelete(entry.id); close(); }}
+                style={{ padding: "9px 16px", borderRadius: 4, fontWeight: 700, fontSize: 13, cursor: "pointer", border: "none", background: coral, color: ink }}>
+                {isRecurring ? "Delete whole series" : entry.kind === "race" ? "Delete race" : "Delete session"}
+              </button>
+              <button className="btn-ghost" onClick={close}>Cancel</button>
             </div>
-
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, alignItems: "end" }}>
-              <div style={{ flex: "1 1 140px" }}>
-                <Field label="Start date">
-                  <input className="inp" type="date" value={form.startDate} onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value }))} />
-                </Field>
-              </div>
-              <div style={{ flex: "1 1 140px" }}>
-                <Field label="End date">
-                  <input className="inp" type="date" value={form.endDate} disabled={form.ongoing}
-                    onChange={(e) => setForm((f) => ({ ...f, endDate: e.target.value }))} style={{ opacity: form.ongoing ? 0.5 : 1 }} />
-                </Field>
-              </div>
-              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 10, cursor: "pointer", whiteSpace: "nowrap" }}>
-                <input type="checkbox" checked={form.ongoing} onChange={(e) => setForm((f) => ({ ...f, ongoing: e.target.checked }))} />
-                Ongoing
-              </label>
-            </div>
-          </>
-        )}
-
-        <div style={{ marginTop: 14 }}>
-          <Field label="Notes (optional)">
-            <input className="inp" value={form.notes} onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} placeholder={form.kind === "race" ? "e.g. Boston Marathon" : "e.g. track intervals"} />
-          </Field>
-        </div>
-
-        <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
-          <button className="btn-primary" onClick={handleSubmit}>{editingId ? "Save changes" : (form.kind === "race" ? "Add race" : "Add to schedule")}</button>
-          {editingId && <button className="btn-ghost" onClick={cancelEdit}>Cancel</button>}
-        </div>
-      </div>
-
-      {races.length > 0 && (
-        <div className="card" style={{ padding: 22 }}>
-          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", gap: 7 }}>
-            <Icon path={ICONS.trophy} size={16} color={gold} /> Races
-          </div>
-          <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
-            {races.map((s) => (
-              <div key={s.id} ref={(el) => { itemRefs.current[s.id] = el; }} style={scheduleRowStyle(highlightIds.includes(s.id))}>
-                <div style={{ flex: 1 }}>
-                  <b>{s.notes || s.activityType}</b> · {s.activityType} · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
-                  <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
-                    {s.raceDate} · {s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper"}
-                    {" · "}{raceCarbLoadDays(s) > 0 ? `carb-load ${raceCarbLoadDays(s)}d` : "no carb-load"}
-                    {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
-                  </div>
-                </div>
-                <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
-                <button title="Delete" onClick={() => { if (confirm("Delete this race?")) onDelete(s.id); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {singles.length > 0 && (
-        <div className="card" style={{ padding: 22 }}>
-          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Single sessions</div>
-          <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
-            {singles.map((s) => (
-              <div key={s.id} ref={(el) => { itemRefs.current[s.id] = el; }} style={scheduleRowStyle(highlightIds.includes(s.id))}>
-                <div style={{ flex: 1 }}>
-                  <b>{s.activityType}</b> · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
-                  <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
-                    {s.date}
-                    {s.notes ? ` · ${s.notes}` : ""}
-                    {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
-                  </div>
-                </div>
-                <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
-                <button title="Delete" onClick={() => { if (confirm("Delete this scheduled session?")) onDelete(s.id); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {recurring.length > 0 && (
-        <div className="card" style={{ padding: 22 }}>
-          <div style={{ fontFamily: grotesk, fontWeight: 600, fontSize: 15, marginBottom: 14 }}>Recurring sessions</div>
-          <div style={{ display: "grid", gap: 8, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
-            {recurring.map((s) => (
-              <div key={s.id} ref={(el) => { itemRefs.current[s.id] = el; }} style={scheduleRowStyle(highlightIds.includes(s.id))}>
-                <div style={{ flex: 1 }}>
-                  <b>{s.activityType}</b> · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min
-                  <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
-                    {s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", ")} · from {s.startDate}{s.endDate ? ` to ${s.endDate}` : " (ongoing)"}
-                    {s.notes ? ` · ${s.notes}` : ""}
-                    {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
-                  </div>
-                </div>
-                <button title="Edit" onClick={() => startEdit(s)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
-                <button title="Delete" onClick={() => { if (confirm("Delete this scheduled session?")) onDelete(s.id); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: dim }}><Icon path={ICONS.trash} size={13} color={coral} /></button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+          </Modal>
+        );
+      })()}
 
     </div>
   );
 }
 
+function ScheduleEntryList({ entries, empty, onEdit, onDelete }) {
+  if (!entries.length) return <div style={{ fontSize: 12.5, color: dim }}>{empty}</div>;
+  const iconBtn = { background: "none", border: "none", cursor: "pointer", padding: 4, color: dim };
+  return (
+    <div style={{ display: "grid", gap: 8 }}>
+      {entries.map((s) => (
+        <div key={s.id} style={scheduleRowStyle(false)}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {s.kind === "race"
+              ? <><b>{s.notes || s.activityType}</b> · {s.activityType} · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min</>
+              : <><b>{s.activityType}</b> · {ZONES[s.zone - 1].label.split(" · ")[1]} · {s.durationMin}min</>}
+            <div style={{ color: dim, fontSize: 11, marginTop: 2 }}>
+              {s.kind === "race"
+                ? <>{s.raceDate} · {s.taperDays > 0 ? `taper starts ${s.taperDays}d out` : "no taper"} · {raceCarbLoadDays(s) > 0 ? `carb-load ${raceCarbLoadDays(s)}d` : "no carb-load"}</>
+                : s.kind === "single"
+                ? <>{s.date}{s.notes ? ` · ${s.notes}` : ""}</>
+                : <>{s.daysOfWeek.map((n) => WEEKDAY_LABELS[n]).join(", ")} · from {s.startDate}{s.endDate ? ` to ${s.endDate}` : " (ongoing)"}{s.notes ? ` · ${s.notes}` : ""}{s.skipDates && s.skipDates.length ? ` · ${s.skipDates.length} day${s.skipDates.length === 1 ? "" : "s"} skipped` : ""}</>}
+              {s.sourceActivity && ` · modeled on ${s.sourceActivity.date} (${s.sourceActivity.name})`}
+              {s.source && ` · from ${s.source}`}
+            </div>
+          </div>
+          <button title="Edit" onClick={() => onEdit(s)} style={iconBtn}><Icon path={ICONS.pencil} size={13} color={dim} /></button>
+          <button title="Delete" onClick={() => onDelete(s)} style={iconBtn}><Icon path={ICONS.trash} size={13} color={coral} /></button>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorrection, trendCalibration, proteinGPerKg, weightGoalStatus, targetWeightKg, units, targetWindowDays, ironmanStatus, imProjection, imProjectionError, imMissingCalibration }) {
   const wUnit = weightUnitLabel(units);

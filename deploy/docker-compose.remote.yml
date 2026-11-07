@@ -1,0 +1,34 @@
+# Compose file for a host that deploy/deploy.sh pushes to. deploy.sh copies it
+# to <remote-dir>/docker-compose.yml (default ~/energy-balance) along with a
+# .env holding the ports from your config.json. On that host you can manage
+# it by hand from that directory:
+#
+#   docker compose ps | logs -f | restart | stop | up -d
+#
+# Unlike ../docker-compose.yml this doesn't build anything or mount a
+# checkout: it runs the image deploy.sh loaded (code only), and keeps all data
+# in the `energy-balance-data` volume. That volume is `external`, so
+# `docker compose down -v` can't delete it; only
+# `docker volume rm energy-balance-data` can.
+name: energy-balance
+
+services:
+  energy-balance:
+    image: energy-balance:app
+    environment:
+      EB_DATA_DIR: /data
+      EB_UPDATE_MODE: remote
+    ports:
+      - "${EB_PORT:-8081}:${EB_PORT:-8081}"
+      - "${EB_TLS_PORT:-8082}:${EB_TLS_PORT:-8082}"
+    volumes:
+      - energy-balance-data:/data
+      # Lets `tailscale cert`/`status` in the container use THIS host's
+      # tailscaled (see ../docker-compose.yml). Harmless if the host has no
+      # Tailscale — Docker just creates an empty directory.
+      - /var/run/tailscale:/var/run/tailscale
+    restart: unless-stopped
+
+volumes:
+  energy-balance-data:
+    external: true

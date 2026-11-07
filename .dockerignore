@@ -12,3 +12,5 @@ caches/*cache.json
 configs/*.key
 configs/*.crt
 caches/update_*.json
+# Remote data backups (deploy/deploy.sh --backup) — contain secrets
+backups/

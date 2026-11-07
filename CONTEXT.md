@@ -43,6 +43,28 @@ secrets — never share these):
 `secrets/app_store.json` (main data store), `secrets/tokens.json` (Strava),
 `caches/strava_cache.json`, `caches/intervals_cache.json`, `configs/tailscale.crt` / `configs/tailscale.key`.
 
+All of those (plus `configs/config.json` and `configs/schedule_sources/`) live under
+`DATA_DIR` in `server.py`: the project root by default, or `$EB_DATA_DIR` with the same
+`configs/` / `secrets/` / `caches/` layout. Shipped files (`configs/manifest.json`,
+`config.example.json`) always come from the project root. Any new runtime data file must be
+built from `DATA_CONFIGS_DIR` / `SECRETS_DIR` / `CACHES_DIR`, never `ROOT` / `CONFIGS_DIR`, or
+it won't persist on remote deploys.
+
+## Remote deploy (`deploy/`)
+
+`deploy/deploy.sh user@host` pushes the app from this machine to another Docker host over ssh
+(no registry): `docker save | gzip | ssh … docker load`. The `Dockerfile` has stages `app`
+(code only — `.dockerignore` keeps data out), `seed` (`app` + one layer: this machine's data
+at `/seed`, from the `seeddata` named build context deploy.sh stages) and a final default
+stage equal to `app`. On the remote, data lives in the external volume `energy-balance-data`
+at `/data` (`EB_DATA_DIR=/data`, `EB_UPDATE_MODE=remote`, see
+`deploy/docker-compose.remote.yml`). The seed image is shipped only when the volume is
+empty or with `--force-data`; `deploy/seed-data.sh` copies `/seed` in, writes
+`/data/.eb-seeded`, refuses (exit 3) to touch existing data without `--force`, and with it
+tars the old data into `/data/.backups/` first. The seed image is deleted on both ends
+afterwards. Not seeded: `caches/update_*.json` and the Tailscale cert/key (host-specific).
+In remote mode `/api/update` returns 409 and the Update card says to use deploy.sh.
+
 ## Build process
 
 Frontend source is `src/js/app-source.jsx`. After editing it, recompile with (from the project root):

@@ -15,3 +15,6 @@ configs/schedule_sources/
 
 # In-app update state (update.sh)
 caches/update_*.json
+
+# Remote data backups (deploy/deploy.sh --backup) — contain secrets
+backups/

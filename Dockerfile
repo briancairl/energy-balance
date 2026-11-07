@@ -3,6 +3,10 @@ FROM python:3.12-slim AS app
 
 WORKDIR /app
 
+# Unbuffered stdout, so server.py's startup messages (including whether HTTPS
+# came up) show in `docker logs` right away instead of sitting in a buffer.
+ENV PYTHONUNBUFFERED=1
+
 # server.py is stdlib-only — no pip install needed.
 COPY . .
 

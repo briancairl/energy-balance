@@ -9,6 +9,10 @@
 #   deploy/deploy.sh --backup user@host      download the remote's data to
 #                                            ./backups/ (never overwrites)
 #   deploy/deploy.sh --rollback user@host    swap back to the previous app
+#   deploy/deploy.sh --config-set tls_enabled=true user@host
+#                                            change the remote's config.json
+#                                            (repeatable; VALUE is JSON, else
+#                                            a string) and restart the app
 #
 # Options: --yes (skip the --force-data prompt), --remote-dir DIR (where the
 # compose file goes on the remote; default ~/energy-balance), --platform
@@ -43,7 +47,7 @@ IMG_SHIP_SEED="energy-balance:deploy-seed"
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 
 ACTION=deploy
 FORCE_DATA=0
@@ -51,6 +55,7 @@ YES=0
 REMOTE_DIR='~/energy-balance'
 PLATFORM=""
 HOST=""
+CONFIG_SET=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --force-data) FORCE_DATA=1 ;;
@@ -58,6 +63,7 @@ while [ $# -gt 0 ]; do
     --status)     ACTION=status ;;
     --backup)     ACTION=backup ;;
     --rollback)   ACTION=rollback ;;
+    --config-set) shift; ACTION=config; CONFIG_SET+=("${1:?--config-set needs KEY=VALUE}") ;;
     --remote-dir) shift; REMOTE_DIR="${1:?--remote-dir needs a value}" ;;
     --platform)   shift; PLATFORM="${1:?--platform needs a value}" ;;
     -h|--help)    usage; exit 0 ;;
@@ -108,7 +114,59 @@ remote_data_state() {
   rsh "$RD run --rm -v $VOLUME:/data --entrypoint bash $IMG_APP /app/deploy/seed-data.sh --check"
 }
 
-# --- --status / --backup / --rollback ---------------------------------------
+# The log of the server's most recent startup (from `since` if given, an
+# RFC3339 time on the remote's clock, else whatever the container has).
+startup_log() {
+  local since_arg=""
+  [ -n "${1:-}" ] && since_arg="--since $1"
+  { rsh "$RCOMPOSE logs --no-log-prefix --no-color $since_arg energy-balance 2>/dev/null" || true; } \
+    | awk '/Energy Balance server running/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }'
+}
+
+# Waits (up to ~60s — `tailscale cert` can take a while) for the server to
+# finish starting after `since`, then says whether HTTPS came up, and if not,
+# why. Sets HTTPS_URL on success.
+HTTPS_URL=""
+report_https() {
+  local since="${1:-}" logs="" i
+  for i in $(seq 1 30); do
+    logs="$(startup_log "$since")"
+    printf '%s' "$logs" | grep -qE 'Login required|Generated login' && break
+    [ -z "$since" ] && break
+    sleep 2
+  done
+  if [ -z "$logs" ]; then
+    warn "no startup output from the server yet — check: ssh $HOST 'cd $REMOTE_DIR && docker compose logs'"
+    return
+  fi
+  if printf '%s' "$logs" | grep -q 'HTTPS (real, trusted cert)'; then
+    HTTPS_URL="$(printf '%s' "$logs" | sed -n 's/.*HTTPS (real, trusted cert): //p' | tail -1)"
+    log "HTTPS is up: $HTTPS_URL"
+    return
+  fi
+  if ! printf '%s' "$logs" | grep -qE 'Setting up HTTPS|tls_enabled is true'; then
+    warn "HTTPS is OFF on $HOST (tls_enabled is false in its config.json), so it's plain HTTP only."
+    warn "  Browsers will say 'not secure' and phones set to HTTPS-only won't load it. Turn it on with:"
+    warn "    deploy/deploy.sh --config-set tls_enabled=true $HOST"
+    return
+  fi
+  warn "HTTPS failed to start on $HOST, so it's plain HTTP only. The server said:"
+  printf '%s\n' "$logs" | { grep -E 'tailscale|tls_hostname|HTTPS|TLS|certificate' || true; } | sed 's/^/      /' >&2
+  if ! rsh 'test -S /var/run/tailscale/tailscaled.sock'; then
+    warn "  $HOST has no Tailscale daemon socket at /var/run/tailscale/tailscaled.sock."
+    warn "  Install Tailscale there (https://tailscale.com/download/linux), run 'sudo tailscale up',"
+    warn "  then: deploy/deploy.sh --config-set tls_enabled=true $HOST   (restarts the app)"
+  fi
+  local pinned
+  pinned="$(printf '%s' "$logs" | sed -n 's/.*Setting up HTTPS for \(.*\) ….*/\1/p' | tail -1)"
+  if [ -n "$pinned" ]; then
+    warn "  It asked for a cert for '$pinned'. Tailscale only issues a cert for the machine's own name,"
+    warn "  so if that's another machine's name, let it auto-detect with:"
+    warn "    deploy/deploy.sh --config-set tls_hostname= $HOST"
+  fi
+}
+
+# --- --status / --backup / --rollback / --config-set ------------------------
 if [ "$ACTION" = status ]; then
   if remote_has_image "$IMG_APP"; then
     rsh "$RD image inspect $IMG_APP --format 'app image:  {{index .Config.Labels \"org.energy-balance.revision\"}} (built {{index .Config.Labels \"org.energy-balance.built\"}} on {{index .Config.Labels \"org.energy-balance.built-on\"}})'"
@@ -123,6 +181,7 @@ if [ "$ACTION" = status ]; then
     1) echo "data:       not initialized (next deploy seeds it from this machine)" ;;
     *) echo "data:       volume exists, state unknown" ;;
   esac
+  report_https
   exit 0
 fi
 
@@ -140,8 +199,39 @@ if [ "$ACTION" = rollback ]; then
   remote_has_image "$IMG_PREV" || die "$HOST has no previous app image to roll back to"
   log "Swapping the current and previous app images"
   rsh "$RD tag $IMG_APP energy-balance:rollback-tmp && $RD tag $IMG_PREV $IMG_APP && $RD tag energy-balance:rollback-tmp $IMG_PREV && $RD rmi energy-balance:rollback-tmp >/dev/null"
+  since="$(rsh 'date -u +%Y-%m-%dT%H:%M:%SZ')"
   rsh "$RCOMPOSE up -d --remove-orphans"
   log "Rolled back (run --rollback again to undo). Data was not touched."
+  report_https "$since"
+  exit 0
+fi
+
+if [ "$ACTION" = config ]; then
+  remote_has_volume && remote_has_image "$IMG_APP" || die "$HOST has nothing deployed yet"
+  rsh "$RD run --rm --entrypoint test $IMG_APP -f /app/deploy/config_set.py" \
+    || die "$HOST's app image predates --config-set; deploy once (deploy/deploy.sh $HOST), then retry"
+  changes="$(python3 - "${CONFIG_SET[@]}" <<'PY'
+import json, sys
+out = {}
+for arg in sys.argv[1:]:
+    key, sep, raw = arg.partition("=")
+    if not sep or not key:
+        sys.exit(f"error: --config-set wants KEY=VALUE, got {arg!r}")
+    try:
+        out[key] = json.loads(raw)
+    except ValueError:
+        out[key] = raw  # not JSON: a plain string (KEY= gives "")
+print(json.dumps(out))
+PY
+)"
+  log "Updating config.json on $HOST (previous copy kept as config.json.bak-*)"
+  rsh "$RCOMPOSE stop >/dev/null 2>&1 || true"
+  printf '%s' "$changes" | rsh "$RD run --rm -i -v $VOLUME:/data --entrypoint python3 $IMG_APP /app/deploy/config_set.py" \
+    || { rsh "$RCOMPOSE up -d >/dev/null 2>&1"; die "could not update config.json (app restarted unchanged)"; }
+  since="$(rsh 'date -u +%Y-%m-%dT%H:%M:%SZ')"
+  log "Restarting the app"
+  rsh "$RCOMPOSE up -d --remove-orphans"
+  report_https "$since"
   exit 0
 fi
 
@@ -228,11 +318,20 @@ with open(os.path.join(stage, ".eb-seed-info"), "w") as f:
     json.dump({"seeded_from": host, "revision": rev,
                "seeded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                "files": files}, f)
-cfg = json.load(open(os.path.join(stage, "configs", "config.json")))
-if cfg.get("tls_enabled") and cfg.get("tls_hostname"):
-    print(f"warning: config.json pins tls_hostname={cfg['tls_hostname']!r} (this machine's?). "
-          "The remote will ask Tailscale for a cert for that name — blank it in the remote's "
-          "config to auto-detect, or edit it here and redeploy with --force-data.", file=sys.stderr)
+cfg_path = os.path.join(stage, "configs", "config.json")
+cfg = json.load(open(cfg_path))
+# Tailscale only issues a cert for a machine's OWN name, so a pinned
+# tls_hostname from this machine can never work on the remote. Blank it in
+# the copy so the remote auto-detects its own (your local config is untouched).
+if cfg.get("tls_hostname"):
+    print(f"    (tls_hostname={cfg['tls_hostname']!r} is this machine's; "
+          "the remote's copy auto-detects its own name instead)")
+    cfg["tls_hostname"] = ""
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+if not cfg.get("tls_enabled"):
+    print("warning: tls_enabled is false — the remote will serve plain HTTP only "
+          "(enable later with --config-set tls_enabled=true)", file=sys.stderr)
 PY
   (cd "$STAGE" && find . -type f ! -name .eb-seed-info | sed 's|^\./|    |' | sort)
 
@@ -292,6 +391,7 @@ print(\"EB_PORT=%d\" % p)
 print(\"EB_TLS_PORT=%d\" % t)
 ' > $REMOTE_DIR/.env"
 
+since="$(rsh 'date -u +%Y-%m-%dT%H:%M:%SZ')"
 log "Starting the app"
 rsh "$RCOMPOSE up -d --remove-orphans"
 rsh "$RD image prune -f >/dev/null 2>&1 || true"
@@ -300,5 +400,10 @@ rsh "$RD image prune -f >/dev/null 2>&1 || true"
 rsh "systemctl is-enabled docker >/dev/null 2>&1" \
   || warn "docker doesn't look enabled at boot on $HOST — run: sudo systemctl enable docker"
 
+report_https "$since"
 port="$(rsh "sed -n 's/^EB_PORT=//p' $REMOTE_DIR/.env")"
-log "Done — $REVISION is running on $HOST (http://${HOST#*@}:${port:-8081}/)"
+if [ -n "$HTTPS_URL" ]; then
+  log "Done — $REVISION is running on $HOST. Open $HTTPS_URL (plain HTTP is also on port ${port:-8081})"
+else
+  log "Done — $REVISION is running on $HOST at http://${HOST#*@}:${port:-8081}/ (HTTP only, see above)"
+fi

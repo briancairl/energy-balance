@@ -64,6 +64,10 @@ empty or with `--force-data`; `deploy/seed-data.sh` copies `/seed` in, writes
 tars the old data into `/data/.backups/` first. The seed image is deleted on both ends
 afterwards. Not seeded: `caches/update_*.json` and the Tailscale cert/key (host-specific).
 In remote mode `/api/update` returns 409 and the Update card says to use deploy.sh.
+A pinned `tls_hostname` is blanked in the seed copy (a Tailscale cert is only issued for
+the node's own name). After start/restart, deploy.sh reads the server's startup log
+(`PYTHONUNBUFFERED=1` in the image makes it show up) and reports whether HTTPS came up.
+`--config-set KEY=VALUE` edits the volume's config.json via `deploy/config_set.py`.
 
 ## Build process
 

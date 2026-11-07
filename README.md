@@ -55,6 +55,7 @@ deploy/deploy.sh --status user@host       # what's deployed, data state
 deploy/deploy.sh --backup user@host       # download the remote's data to ./backups/
 deploy/deploy.sh --rollback user@host     # swap back to the previous app image
 deploy/deploy.sh --force-data user@host   # REPLACE the remote's data with this machine's
+deploy/deploy.sh --config-set tls_enabled=true user@host   # edit the remote's config.json + restart
 ```
 
 The remote needs Docker with the compose plugin, and the ssh user must be able
@@ -79,8 +80,15 @@ come from `~/.ssh/config`. The image is built for the remote's CPU
   current data to `/data/.backups/` inside the volume (newest 10 kept), and then
   copies in this machine's data.
 - Not copied: the Tailscale cert/key (the remote gets its own) and the in-app
-  update state. If `config.json` sets `tls_hostname` to this machine's name,
-  clear it so the remote can detect its own name.
+  update state. A pinned `tls_hostname` is cleared in the remote's copy, since
+  Tailscale only issues a cert for a machine's own name.
+
+**HTTPS on the remote.** Browsers flag plain `http://` as "not secure", and
+phones set to HTTPS-only won't load it. For HTTPS the remote needs Tailscale
+installed and logged in (`sudo tailscale up`), and `tls_enabled: true` in its
+config. Then open `https://<remote>.<tailnet>.ts.net:8082/`, not the plain
+`http://…:8081` address. After every deploy, restart and `--status`, the script
+reports whether HTTPS came up, and why not if it didn't.
 
 On the remote, the compose file is in `~/energy-balance` (`--remote-dir` changes
 this). From there you can run `docker compose logs -f`, `restart` and so on. The

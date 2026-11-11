@@ -2025,6 +2025,27 @@ function App() {
         weightMissing: weightMissing && !isFutureOrToday,
         durationMin, fuelTier, carbTargetG: carbTargetGDisplay, proteinTargetG, fatTargetG: fatTargetGDisplay, isFutureOrToday,
         scheduledSessions, preloading, preloadSession, borrowedKcal, repaidKcal,
+        // Every term that sums to this day's Target, in the order the model
+        // applies them — the Target vs. intake tooltip renders it as a
+        // stack-up. The floor terms are whatever the IronMan under-fueling
+        // floor and the macro (fat) floor / debt strategy added on top, so
+        // the parts always sum exactly to the displayed Target.
+        targetStack: {
+          bmr: dayBmr,
+          neat: baseline - dayBmr,
+          exercise: exerciseKcal,
+          epoc: epocKcal,
+          fatigue: fatigueBuffer,
+          demand,
+          goal: goalAdjustmentKcal,
+          calibration: calibrationKcal,
+          repaid: -repaidKcal,
+          borrowed: borrowedKcal,
+          imFloor: carbDrivenTarget - carbDrivenTargetRaw,
+          macroFloor: targetDisplay - carbDrivenTarget,
+          target: targetDisplay,
+          im: !!im,
+        },
         taper, raceLoading, race: taper?.race || carbLoad?.race || raceToday || null,
         // Weight-change rate over this day's fixed target window (same
         // regression the trend correction uses), and the goal's rate.
@@ -4663,7 +4684,7 @@ function DashboardTab({ rows, summary, bmr, fuelingByTier, goalParams, trendCorr
             {(visibleMacros.carbs || visibleMacros.protein || visibleMacros.fat) && (
               <YAxis yAxisId="grams" orientation="right" tick={{ fill: dim, fontSize: 11, fontFamily: mono }} axisLine={false} tickLine={false} label={{ value: "grams", angle: 90, position: "insideRight", fill: dim, fontSize: 10 }} />
             )}
-            <Tooltip content={<CustomTooltip />} />
+            <Tooltip content={<TargetStackTooltip />} />
             <Bar yAxisId="kcal" dataKey="demand" name="Modeled TDEE (kcal)" fill={panel2} stroke={line} strokeWidth={1} radius={[2, 2, 0, 0]} />
             <Line yAxisId="kcal" type="monotone" dataKey="target" name="Target (kcal)" stroke={cyan} strokeWidth={2} dot={false} strokeDasharray={goalParams.sign !== 0 ? "5 3" : undefined} connectNulls />
             <Line yAxisId="kcal" type="monotone" dataKey="intake" name="Intake (kcal)" stroke={amber} strokeWidth={2.2} dot={{ r: 2.5, fill: amber }} connectNulls />
@@ -5028,7 +5049,7 @@ function FuelingReferencePanel({ fuelingByTier }) {
 }
 
 const RATE_SERIES_KEYS = new Set(["actualRate", "goalRate"]);
-function CustomTooltip({ active, payload, label }) {
+function CustomTooltip({ active, payload, label, bare }) {
   if (!active || !payload || !payload.length) return null;
   // The gap chart already plots "gap" as its own Bar (it'll show up in
   // payload below, no need to repeat it); every other chart just has the
@@ -5038,10 +5059,14 @@ function CustomTooltip({ active, payload, label }) {
   const row = payload[0]?.payload;
   const hasGapSeries = payload.some((p) => p.dataKey === "gap");
   return (
-    <div style={{ background: panel2, border: `1px solid ${line}`, borderRadius: 4, padding: "10px 12px", fontFamily: mono, fontSize: 12 }}>
+    <div style={bare
+      ? { padding: "10px 12px 8px" }
+      : { background: panel2, border: `1px solid ${line}`, borderRadius: 4, padding: "10px 12px", fontFamily: mono, fontSize: 12 }}>
       <div style={{ color: dim, marginBottom: 6 }}>{label}</div>
       {payload.map((p, i) => (
-        <div key={i} style={{ color: p.color, display: "flex", justifyContent: "space-between", gap: 16 }}>
+        // A series filled with panel2 (the Modeled TDEE bar) would be
+        // invisible on the tooltip's own panel2 background — fall back to dim.
+        <div key={i} style={{ color: p.color === panel2 ? dim : p.color, display: "flex", justifyContent: "space-between", gap: 16 }}>
           <span>{p.name}</span><span>{fmt(p.value, RATE_SERIES_KEYS.has(p.dataKey) ? 2 : 0)}</span>
         </div>
       ))}
@@ -5054,6 +5079,52 @@ function CustomTooltip({ active, payload, label }) {
           <span>Gap (kcal)</span><span>{row.gap >= 0 ? "+" : ""}{fmt(row.gap)}</span>
         </div>
       )}
+    </div>
+  );
+}
+
+// Target vs. intake tooltip: the usual series readout, plus the stack-up of
+// calorie contributions that sum to that day's Target (BMR → NEAT → training
+// → EPOC → fatigue = demand, then goal / calibration / pre-load / floors =
+// Target). Zero terms are left out so ordinary days stay short.
+function TargetStackTooltip(props) {
+  const { active, payload } = props;
+  if (!active || !payload || !payload.length) return null;
+  const s = payload[0]?.payload?.targetStack;
+  if (!s) return <CustomTooltip {...props} />;
+  const signed = (v) => `${v >= 0 ? "+" : "−"}${fmt(Math.abs(v))}`;
+  const nonZero = (v) => Math.abs(v || 0) >= 0.5;
+  const demandParts = [
+    ["BMR", s.bmr, true],
+    [s.im ? "NEAT (calibrated)" : "NEAT", s.neat, false],
+    ["Training", s.exercise, false],
+    [s.im ? "Activity scale" : "EPOC", s.epoc, false],
+    ["Fatigue buffer", s.fatigue, false],
+  ];
+  const targetParts = [
+    ["Goal adjustment", s.goal],
+    ["Trend calibration", s.calibration],
+    ["Pre-load repayment", s.repaid],
+    ["Pre-load borrow", s.borrowed],
+    ["Under-fueling floor", s.imFloor],
+    ["Macro floor", s.macroFloor],
+  ];
+  const rowStyle = { display: "flex", justifyContent: "space-between", gap: 16 };
+  const subtotalStyle = { ...rowStyle, marginTop: 3, paddingTop: 3, borderTop: `1px solid ${line}`, fontWeight: 600 };
+  return (
+    <div style={{ background: panel2, border: `1px solid ${line}`, borderRadius: 4, fontFamily: mono, fontSize: 12 }}>
+      <CustomTooltip {...props} bare />
+      <div style={{ padding: "8px 12px 10px", borderTop: `1px solid ${line}` }}>
+        <div style={{ color: dim, marginBottom: 4, fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em" }}>Target stack-up (kcal)</div>
+        {demandParts.filter(([, v, always]) => always || nonZero(v)).map(([name, v], i) => (
+          <div key={name} style={{ ...rowStyle, color: dim }}><span>{name}</span><span>{i === 0 ? fmt(v) : signed(v)}</span></div>
+        ))}
+        <div style={{ ...subtotalStyle, color: paper }}><span>Demand</span><span>{fmt(s.demand)}</span></div>
+        {targetParts.filter(([, v]) => nonZero(v)).map(([name, v]) => (
+          <div key={name} style={{ ...rowStyle, color: dim }}><span>{name}</span><span>{signed(v)}</span></div>
+        ))}
+        <div style={{ ...subtotalStyle, color: cyan }}><span>Target</span><span>{fmt(s.target)}</span></div>
+      </div>
     </div>
   );
 }

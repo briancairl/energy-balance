@@ -213,8 +213,9 @@ history and just persist as entered.
   (`profile.buildRatePct` default 0.25%/wk, `profile.loseRatePct` default 0.5%/wk), converted
   to kcal via the ~7700 kcal/kg tissue approximation.
 - **Trend calibration** (`profile.trendCalibration`, default on): linear regression over
-  `weightLog` vs. the goal's target rate; the gap becomes a daily kcal correction, clamped to
-  ±400 kcal, applied once ≥8 data points spanning ≥10 days exist. `computeTrendCorrection()`.
+  `weightLog` vs. the goal's target rate; the gap becomes a daily kcal correction, clamped
+  asymmetrically: up to +400 kcal when behind the goal's rate, but only −100 kcal when gaining
+  faster than it (a slow pull back down, not a hard cut), applied once ≥8 data points spanning ≥10 days exist. `computeTrendCorrection()`.
 - **Weight-change rate plot** (Dashboard, under Body weight): each row's `actualRateKgWk` (the same
   window regression as the trend correction, computed even when trend calibration is off) vs `goalRateKgWk`
   (that day's goal rate). The actual line stops at today; the goal line runs through the forward days.
@@ -301,6 +302,8 @@ the lock, and only the single-key write is locked):
   `(k−1)·sessionKcal`, and the fatigue buffer is 0 because both are inside the fitted parameters.
 - **Training-day floor**: on any day with session kcal, `carbDrivenTarget = max(…, demand)`. The goal
   deficit, trend correction or a pre-load repayment can't take Target below calibrated maintenance + session.
+  Exception: on a light training day (fuel tier under 60 min, not pre-/race-loading, `imLightTrainingDay`)
+  the floor is `demand + min(0, trendCorrection)`, so the slow (≤100 kcal) trend pull-down still lands there.
   The rolloverCapped bookkeeping sees the same floor, so an unrealized repayment still rolls forward.
   Consequence: if goal adjustment + trend correction nets negative (e.g. already gaining faster than the
   build rate, so the correction cancels the surplus), maintain/build/lose all show calibrated demand on

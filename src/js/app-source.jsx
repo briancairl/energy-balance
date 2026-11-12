@@ -800,6 +800,8 @@ function weightEntriesInWindow(weightLog, anchorKey, windowDays) {
 // alone. Needs a reasonable spread of data before it will speak up.
 // Uses only the windowDays of entries before anchorKey (see targetAnchorKey),
 // never "the last N days from now", so a given day's correction is fixed.
+const TREND_CORRECTION_MAX_SURPLUS_KCAL = 400; // eating more when below the goal's rate
+const TREND_CORRECTION_MAX_DEFICIT_KCAL = 100; // eating less when above the goal's rate (gaining too fast)
 function computeTrendCorrection(weightLog, goalSign, ratePct, anchorKey, windowDays = DEFAULT_TARGET_WINDOW_DAYS) {
   const entries = weightEntriesInWindow(weightLog, anchorKey, windowDays);
   if (entries.length < 8) return { insufficient: true, n: entries.length };
@@ -821,7 +823,11 @@ function computeTrendCorrection(weightLog, goalSign, ratePct, anchorKey, windowD
   const targetWeeklyRateKg = goalSign * (ratePct / 100) * meanY;
   const rawCorrection = ((targetWeeklyRateKg - actualWeeklyRateKg) * KCAL_PER_KG_TISSUE) / 7;
   // Clamp so a noisy or short window can't swing the target wildly in one go.
-  const correctionKcal = Math.max(-400, Math.min(400, rawCorrection));
+  // Asymmetric: when weight is rising faster than the goal's rate (negative
+  // correction), the pull back down is a slow, gentle deficit — not a hard
+  // cut that would undercut training fuel. Falling behind the goal's rate can
+  // still be corrected upward by the full amount.
+  const correctionKcal = Math.max(-TREND_CORRECTION_MAX_DEFICIT_KCAL, Math.min(TREND_CORRECTION_MAX_SURPLUS_KCAL, rawCorrection));
   return { insufficient: false, n, spanDays, actualWeeklyRateKg, targetWeeklyRateKg, correctionKcal };
 }
 
@@ -1869,7 +1875,13 @@ function App() {
       // demand), whatever the goal, trend correction or pre-load repayment
       // would otherwise subtract. A repayment the floor swallows is handled
       // by the chosen debt strategy exactly like one the macro floor swallows.
-      const imFloorKcal = im && exerciseKcal > 0 ? demand : 0;
+      // Exception: on a LIGHT training day (fuel tier under ~1 h, no pre-load
+      // or race carb-load) a negative trend correction — the slow pull-down
+      // when weight is rising faster than the goal's rate — still comes
+      // through, so it isn't confined to the (often rare) rest days. The goal
+      // deficit itself stays rest-day-only.
+      const imLightTrainingDay = im && exerciseKcal > 0 && FUEL_TIERS.indexOf(fuelTier) <= 1 && !preloading && !raceLoading;
+      const imFloorKcal = im && exerciseKcal > 0 ? demand + (imLightTrainingDay ? Math.min(0, calibrationKcal) : 0) : 0;
       const carbDrivenTargetRaw = baseTarget - repaidKcal + borrowedKcal;
       const carbDrivenTarget = im ? Math.max(carbDrivenTargetRaw, imFloorKcal) : carbDrivenTargetRaw;
 
@@ -2055,7 +2067,7 @@ function App() {
           : dayTrend.targetWeeklyRateKg,
         ...(im ? {
           imGoalKcal: goalAdjustmentKcal, imTrendKcal: calibrationKcal, imGoalSign: goalParamsForDay.sign,
-          imMode: true, imCarbGPerKg, imFloorKcal,
+          imMode: true, imCarbGPerKg, imFloorKcal, imLightTrainingDay,
           imFloorApplied: imFloorKcal > 0 && carbDrivenTargetRaw < imFloorKcal,
           imSessionFuel: (source === "planned" ? scheduledSessions : [])
             .map((s) => ({ session: s, fuel: imSessionFuel(s, s.durationMin, profile.imGutCarbGPerH) }))
@@ -2999,7 +3011,7 @@ function ImGoalFloorNote({ info, goalLabel }) {
       {info.repaidKcal > 0 ? `, and a pre-load repayment takes ${fmt(info.repaidKcal)} kcal` : ""} — net {signed(info.netKcal - info.repaidKcal)} kcal,
       which would put Target below calibrated demand, so IronMan mode's training-day floor pins it to demand instead.
       {info.goalSign >= 0 && info.trendKcal < 0
-        ? " You're already gaining faster than this goal's rate, so the trend correction cancels the surplus; switching maintain ↔ build won't change those days."
+        ? " You're already gaining faster than this goal's rate, so the trend correction cancels the surplus; switching maintain ↔ build won't change those days. On light training days (under ~1 h) the trend's small deficit still applies."
         : info.goalSign < 0
         ? " A deficit only lands on rest days in IronMan mode."
         : ""}
@@ -4884,7 +4896,7 @@ function IronmanPanel({ status, units }) {
       {today && (
         <div style={{ marginTop: 10, fontSize: 11.5, color: dim, fontFamily: mono }}>
           Today: target {fmt(today.target)} kcal · carbs {fmt(today.carbTargetG)} g ({fmt(today.imCarbGPerKg, 1)} g/kg day-load){today.imFloorApplied
-            ? ` · training-day floor applied (goal ${today.imGoalKcal >= 0 ? "+" : "−"}${fmt(Math.abs(today.imGoalKcal))} + trend ${today.imTrendKcal >= 0 ? "+" : "−"}${fmt(Math.abs(today.imTrendKcal))} kcal would land below demand, so the goal doesn't change today)`
+            ? ` · training-day floor applied (goal ${today.imGoalKcal >= 0 ? "+" : "−"}${fmt(Math.abs(today.imGoalKcal))} + trend ${today.imTrendKcal >= 0 ? "+" : "−"}${fmt(Math.abs(today.imTrendKcal))} kcal would land below demand, so the goal doesn't change today${today.imLightTrainingDay && today.imTrendKcal < 0 ? "; light day, so the trend's deficit still applies" : ""})`
             : ""}
         </div>
       )}

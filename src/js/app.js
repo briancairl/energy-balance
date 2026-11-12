@@ -568,8 +568,14 @@
     return Object.entries(weightLog).filter(([d]) => d >= startKey && d < anchorKey).sort(([a], [b]) => a < b ? -1 : 1);
   }
   const TREND_CORRECTION_MAX_SURPLUS_KCAL = 400;
-  const TREND_CORRECTION_MAX_DEFICIT_KCAL = 100;
-  function computeTrendCorrection(weightLog, goalSign, ratePct, anchorKey, windowDays = DEFAULT_TARGET_WINDOW_DAYS) {
+  const TREND_DEFICIT_DEFAULT_KCAL = 100;
+  const TREND_DEFICIT_MIN_KCAL = 0;
+  const TREND_DEFICIT_MAX_KCAL = 400;
+  function getTrendMaxDeficitKcal(profile) {
+    const v = parseFloat(profile.trendMaxDeficitKcal);
+    return isNaN(v) ? TREND_DEFICIT_DEFAULT_KCAL : Math.min(TREND_DEFICIT_MAX_KCAL, Math.max(TREND_DEFICIT_MIN_KCAL, v));
+  }
+  function computeTrendCorrection(weightLog, goalSign, ratePct, anchorKey, windowDays = DEFAULT_TARGET_WINDOW_DAYS, maxDeficitKcal = TREND_DEFICIT_DEFAULT_KCAL) {
     const entries = weightEntriesInWindow(weightLog, anchorKey, windowDays);
     if (entries.length < 8) return { insufficient: true, n: entries.length };
     const d0 = entries[0][0];
@@ -589,7 +595,7 @@
     const actualWeeklyRateKg = num / den * 7;
     const targetWeeklyRateKg = goalSign * (ratePct / 100) * meanY;
     const rawCorrection = (targetWeeklyRateKg - actualWeeklyRateKg) * KCAL_PER_KG_TISSUE / 7;
-    const correctionKcal = Math.max(-TREND_CORRECTION_MAX_DEFICIT_KCAL, Math.min(TREND_CORRECTION_MAX_SURPLUS_KCAL, rawCorrection));
+    const correctionKcal = Math.max(-maxDeficitKcal, Math.min(TREND_CORRECTION_MAX_SURPLUS_KCAL, rawCorrection));
     return { insufficient: false, n, spanDays, actualWeeklyRateKg, targetWeeklyRateKg, correctionKcal };
   }
   function weightOnOrBefore(weightLog, sortedKeys, dateKey) {
@@ -646,6 +652,13 @@
   const IM_WEIGHT_DROP_PCT_PER_WEEK = 0.3;
   const IM_FUEL_MIN_SESSION_MIN = 75;
   const IM_DEFAULT_GUT_CARB_G_PER_H = 90;
+  const IM_LIGHT_DAY_DEFAULT_KCAL = 500;
+  const IM_LIGHT_DAY_MIN_KCAL = 100;
+  const IM_LIGHT_DAY_MAX_KCAL = 2e3;
+  function getImLightDayMaxKcal(profile) {
+    const v = parseFloat(profile.imLightDayMaxKcal);
+    return isNaN(v) ? IM_LIGHT_DAY_DEFAULT_KCAL : Math.min(IM_LIGHT_DAY_MAX_KCAL, Math.max(IM_LIGHT_DAY_MIN_KCAL, v));
+  }
   function imCalibrationReady(profile, cal) {
     return !!(profile.ironmanMode && cal && cal.energyBalance && cal.sessionCost && parseFloat(cal.energyBalance.neat) > 0 && parseFloat(cal.energyBalance.activityScale) > 0);
   }
@@ -842,6 +855,8 @@
       goalHistory: [],
       targetWeightKg: "",
       trendCalibration: true,
+      trendMaxDeficitKcal: TREND_DEFICIT_DEFAULT_KCAL,
+      imLightDayMaxKcal: IM_LIGHT_DAY_DEFAULT_KCAL,
       targetWindowDays: DEFAULT_TARGET_WINDOW_DAYS,
       proteinGPerKg: 1,
       minFatG: 100,
@@ -1014,8 +1029,8 @@
     const goalParams = useMemo(() => getGoalParams(profile), [profile.goal, profile.buildRatePct, profile.loseRatePct]);
     const targetWindowDays = getTargetWindowDays(profile);
     const trendCorrection = useMemo(
-      () => computeTrendCorrection(weightLog, goalParams.sign, goalParams.ratePct, toLocalISODate(/* @__PURE__ */ new Date()), targetWindowDays),
-      [weightLog, goalParams, targetWindowDays]
+      () => computeTrendCorrection(weightLog, goalParams.sign, goalParams.ratePct, toLocalISODate(/* @__PURE__ */ new Date()), targetWindowDays, getTrendMaxDeficitKcal(profile)),
+      [weightLog, goalParams, targetWindowDays, profile.trendMaxDeficitKcal]
     );
     const weightTrendAvg = useMemo(() => computeRollingAvgWeight(weightLog), [weightLog]);
     const weightGoalStatus = useMemo(
@@ -1365,7 +1380,7 @@
         const nutritionSource = nutritionEntry ? normalizeNutritionEntry(nutrition[key]).macrosfirst ? "macrosfirst" : "manual" : null;
         const intake = (_e = nutritionEntry == null ? void 0 : nutritionEntry.calories) != null ? _e : null;
         const goalAdjustmentKcal = weightForDay ? goalParamsForDay.sign * (goalParamsForDay.ratePct / 100) * weightForDay * KCAL_PER_KG_TISSUE / 7 : 0;
-        const dayTrend = computeTrendCorrection(weightLog, goalParamsForDay.sign, goalParamsForDay.ratePct, anchorKey, targetWindowDays);
+        const dayTrend = computeTrendCorrection(weightLog, goalParamsForDay.sign, goalParamsForDay.ratePct, anchorKey, targetWindowDays, getTrendMaxDeficitKcal(profile));
         const dayTrendCorrection = profile.trendCalibration ? dayTrend : null;
         const calibrationKcal = dayTrendCorrection && !dayTrendCorrection.insufficient ? dayTrendCorrection.correctionKcal : 0;
         const baseTarget = demand + goalAdjustmentKcal + calibrationKcal;
@@ -1391,7 +1406,7 @@
         const borrowRatio = Math.min(1, Math.max(0, parseFloat(profile.preloadBorrowRatio)));
         const borrowedKcal = raceLoading ? extraCarbKcal : extraCarbKcal * (isNaN(borrowRatio) ? 1 : borrowRatio);
         const repaidKcal = carryRepaymentKcal;
-        const imLightTrainingDay = im && exerciseKcal > 0 && FUEL_TIERS.indexOf(fuelTier) <= 1 && !preloading && !raceLoading;
+        const imLightTrainingDay = im && exerciseKcal > 0 && exerciseKcal + epocKcal <= getImLightDayMaxKcal(profile) && !preloading && !raceLoading;
         const imFloorKcal = im && exerciseKcal > 0 ? demand + (imLightTrainingDay ? Math.min(0, calibrationKcal) : 0) : 0;
         const carbDrivenTargetRaw = baseTarget - repaidKcal + borrowedKcal;
         const carbDrivenTarget = im ? Math.max(carbDrivenTargetRaw, imFloorKcal) : carbDrivenTargetRaw;
@@ -2292,7 +2307,17 @@
         format: (v) => `${v} days`,
         onCommit: (v) => setProfile((p) => ({ ...p, targetWindowDays: parseInt(v, 10) }))
       }
-    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Each day's target is computed from the weigh-ins in the fixed window of days just before it (trend calibration and the maintenance weight baseline), so a past day's target never moves as new data arrives or as the dashboard range scrolls. Longer = steadier but slower to react.")), /* @__PURE__ */ React.createElement(
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "Each day's target is computed from the weigh-ins in the fixed window of days just before it (trend calibration and the maintenance weight baseline), so a past day's target never moves as new data arrives or as the dashboard range scrolls. Longer = steadier but slower to react.")), /* @__PURE__ */ React.createElement(Field, { label: `Max trend pull-down \u2014 ${fmt(getTrendMaxDeficitKcal(profile))} kcal/day` }, /* @__PURE__ */ React.createElement(
+      ConfirmRange,
+      {
+        min: TREND_DEFICIT_MIN_KCAL,
+        max: TREND_DEFICIT_MAX_KCAL,
+        step: "25",
+        value: getTrendMaxDeficitKcal(profile),
+        format: (v) => `\u2212${v} kcal/day`,
+        onCommit: (v) => setProfile((p) => ({ ...p, trendMaxDeficitKcal: parseFloat(v) }))
+      }
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "When your weight is rising faster than the ", goalParams.label.toLowerCase(), " rate, trend calibration trims the target by at most this much \u2014 a slow pull back rather than a hard cut. Falling behind the rate can still be corrected upward by up to +", TREND_CORRECTION_MAX_SURPLUS_KCAL, " kcal/day.")), /* @__PURE__ */ React.createElement(
       IronmanModeSettings,
       {
         profile,
@@ -2302,12 +2327,12 @@
         imCalError,
         onRecalibrate
       }
-    ), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries in the last ${getTargetWindowDays(profile)} days, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`), imGoalFloor && /* @__PURE__ */ React.createElement(ImGoalFloorNote, { info: imGoalFloor, goalLabel: goalParams.label }));
+    ), trendCorrection && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontFamily: mono, fontSize: 12, color: dim } }, trendCorrection.insufficient ? `Gathering data \u2014 ${trendCorrection.n} weight entries in the last ${getTargetWindowDays(profile)} days, need ~8+ spanning 10+ days.` : `Trend: ${trendCorrection.actualWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.actualWeeklyRateKg, units), 2)} ${wUnit}/wk actual vs ${trendCorrection.targetWeeklyRateKg >= 0 ? "+" : ""}${fmt(kgToDisplay(trendCorrection.targetWeeklyRateKg, units), 2)} ${wUnit}/wk target \u2192 correction ${trendCorrection.correctionKcal >= 0 ? "+" : ""}${fmt(trendCorrection.correctionKcal)} kcal/day`), imGoalFloor && /* @__PURE__ */ React.createElement(ImGoalFloorNote, { info: imGoalFloor, goalLabel: goalParams.label, lightDayMaxKcal: getImLightDayMaxKcal(profile) }));
   }
-  function ImGoalFloorNote({ info, goalLabel }) {
+  function ImGoalFloorNote({ info, goalLabel, lightDayMaxKcal }) {
     const signed = (v) => `${v >= 0 ? "+" : "\u2212"}${fmt(Math.abs(v))}`;
     const allTraining = info.flooredDays === info.trainingDays;
-    return /* @__PURE__ */ React.createElement(Banner, { kind: "warning" }, /* @__PURE__ */ React.createElement("b", null, "Goal masked on ", info.flooredDays, " of ", info.trainingDays, " upcoming training day", info.trainingDays === 1 ? "" : "s", "."), " ", "On ", info.label, ", ", goalLabel.toLowerCase(), " adds ", signed(info.goalKcal), " kcal and trend calibration ", signed(info.trendKcal), " kcal", info.repaidKcal > 0 ? `, and a pre-load repayment takes ${fmt(info.repaidKcal)} kcal` : "", " \u2014 net ", signed(info.netKcal - info.repaidKcal), " kcal, which would put Target below calibrated demand, so IronMan mode's training-day floor pins it to demand instead.", info.goalSign >= 0 && info.trendKcal < 0 ? " You're already gaining faster than this goal's rate, so the trend correction cancels the surplus; switching maintain \u2194 build won't change those days. On light training days (under ~1 h) the trend's small deficit still applies." : info.goalSign < 0 ? " A deficit only lands on rest days in IronMan mode." : "", " ", info.restDays > 0 ? `Rest days (${info.restDays} upcoming) still follow the goal.` : allTraining ? "With no upcoming rest days, the goal currently has no visible effect." : "");
+    return /* @__PURE__ */ React.createElement(Banner, { kind: "warning" }, /* @__PURE__ */ React.createElement("b", null, "Goal masked on ", info.flooredDays, " of ", info.trainingDays, " upcoming training day", info.trainingDays === 1 ? "" : "s", "."), " ", "On ", info.label, ", ", goalLabel.toLowerCase(), " adds ", signed(info.goalKcal), " kcal and trend calibration ", signed(info.trendKcal), " kcal", info.repaidKcal > 0 ? `, and a pre-load repayment takes ${fmt(info.repaidKcal)} kcal` : "", " \u2014 net ", signed(info.netKcal - info.repaidKcal), " kcal, which would put Target below calibrated demand, so IronMan mode's training-day floor pins it to demand instead.", info.goalSign >= 0 && info.trendKcal < 0 ? ` You're already gaining faster than this goal's rate, so the trend correction cancels the surplus; switching maintain \u2194 build won't change those days. On light training days (\u2264 ${fmt(lightDayMaxKcal)} kcal of training) the trend's small deficit still applies.` : info.goalSign < 0 ? " A deficit only lands on rest days in IronMan mode." : "", " ", info.restDays > 0 ? `Rest days (${info.restDays} upcoming) still follow the goal.` : allTraining ? "With no upcoming rest days, the goal currently has no visible effect." : "");
   }
   function IronmanModeSettings({ profile, setProfile, imCal, imCalibrating, imCalError, onRecalibrate }) {
     var _a, _b;
@@ -2325,7 +2350,17 @@
         format: (v) => `${v} g/h`,
         onCommit: (v) => setProfile((p) => ({ ...p, imGutCarbGPerH: v }))
       }
-    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "What your gut is currently trained to absorb on rides \u22653h; used only when a planned session has no ", /* @__PURE__ */ React.createElement("code", null, "fuel"), " of its own. Build toward 90\u2013110 g/h over the block (glucose:fructose mixes), practising in training first."))));
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "What your gut is currently trained to absorb on rides \u22653h; used only when a planned session has no ", /* @__PURE__ */ React.createElement("code", null, "fuel"), " of its own. Build toward 90\u2013110 g/h over the block (glucose:fructose mixes), practising in training first.")), /* @__PURE__ */ React.createElement(Field, { label: `Light training day \u2014 \u2264 ${fmt(getImLightDayMaxKcal(profile))} kcal` }, /* @__PURE__ */ React.createElement(
+      ConfirmRange,
+      {
+        min: IM_LIGHT_DAY_MIN_KCAL,
+        max: IM_LIGHT_DAY_MAX_KCAL,
+        step: "50",
+        value: getImLightDayMaxKcal(profile),
+        format: (v) => `\u2264 ${v} kcal`,
+        onCommit: (v) => setProfile((p) => ({ ...p, imLightDayMaxKcal: parseFloat(v) }))
+      }
+    ), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: dim, marginTop: 4 } }, "A training day whose predicted session calories (calibrated) are at or below this counts as light: the training-day floor still holds, but the trend's slow pull-down (when gaining faster than the goal) is let through instead of waiting for a rest day. Pre-load and race carb-load days never count as light."))));
   }
   function ImportTab({ onFile, csvPreview, colMap, setColMap, onImport, nutrition, onSaveManualDay, onDeleteDay, weightLog, onSaveWeight, onDeleteWeight, importError, importNotice, units, stravaData, intervalsData, kcalOverrides }) {
     const [dragOver, setDragOver] = useState(false);

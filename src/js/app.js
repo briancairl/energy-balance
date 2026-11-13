@@ -1511,6 +1511,7 @@
             borrowed: borrowedKcal,
             imFloor: carbDrivenTarget - carbDrivenTargetRaw,
             macroFloor: targetDisplay - carbDrivenTarget,
+            macroFloorWhy: macroFloorReason(targetDisplay - carbDrivenTarget, carbDrivenTarget, carbTargetGDisplay, proteinTargetG, fatTargetGDisplay, weightForDay, raceLoading, preloading, parseFloat(profile.minFatG) || 100),
             target: targetDisplay,
             im: !!im
           },
@@ -3652,6 +3653,26 @@
       borderTop: `1px solid ${line}`
     } }, /* @__PURE__ */ React.createElement("span", null, "Gap (kcal)"), /* @__PURE__ */ React.createElement("span", null, row.gap >= 0 ? "+" : "", fmt(row.gap))));
   }
+  function macroFloorReason(floorKcal, carbDrivenTarget, carbG, proteinG, fatG, weightKg, raceLoading, preloading, minFatG) {
+    if (!(floorKcal >= 0.5)) return null;
+    const carbKcal = (carbG || 0) * 4, proteinKcal = (proteinG || 0) * 4, fatKcal = (fatG || 0) * 9;
+    let reason;
+    if (carbKcal + proteinKcal > carbDrivenTarget) reason = "carbs + protein exceed target";
+    else if (raceLoading) reason = "fat minimum (carb-load %)";
+    else if (preloading && minFatG * 9 >= carbDrivenTarget * 0.2) reason = `fat minimum ${fmt(minFatG)} g (pre-load)`;
+    else reason = "fat minimum 20% of target";
+    return {
+      reason,
+      carbG,
+      proteinG,
+      fatG,
+      carbKcal,
+      proteinKcal,
+      fatKcal,
+      carbGPerKg: weightKg ? (carbG || 0) / weightKg : null,
+      before: carbDrivenTarget
+    };
+  }
   function TargetStackTooltip(props) {
     var _a, _b;
     const { active, payload } = props;
@@ -3677,7 +3698,7 @@
     ];
     const rowStyle = { display: "flex", justifyContent: "space-between", gap: 16 };
     const subtotalStyle = { ...rowStyle, marginTop: 3, paddingTop: 3, borderTop: `1px solid ${line}`, fontWeight: 600 };
-    return /* @__PURE__ */ React.createElement("div", { style: { background: panel2, border: `1px solid ${line}`, borderRadius: 4, fontFamily: mono, fontSize: 12 } }, /* @__PURE__ */ React.createElement(CustomTooltip, { ...props, bare: true }), /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 12px 10px", borderTop: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("div", { style: { color: dim, marginBottom: 4, fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em" } }, "Target stack-up (kcal)"), demandParts.filter(([, v, always]) => always || nonZero(v)).map(([name, v], i) => /* @__PURE__ */ React.createElement("div", { key: name, style: { ...rowStyle, color: dim } }, /* @__PURE__ */ React.createElement("span", null, name), /* @__PURE__ */ React.createElement("span", null, i === 0 ? fmt(v) : signed(v)))), /* @__PURE__ */ React.createElement("div", { style: { ...subtotalStyle, color: paper } }, /* @__PURE__ */ React.createElement("span", null, "Demand"), /* @__PURE__ */ React.createElement("span", null, fmt(s.demand))), targetParts.filter(([, v]) => nonZero(v)).map(([name, v]) => /* @__PURE__ */ React.createElement("div", { key: name, style: { ...rowStyle, color: dim } }, /* @__PURE__ */ React.createElement("span", null, name), /* @__PURE__ */ React.createElement("span", null, signed(v)))), /* @__PURE__ */ React.createElement("div", { style: { ...subtotalStyle, color: cyan } }, /* @__PURE__ */ React.createElement("span", null, "Target"), /* @__PURE__ */ React.createElement("span", null, fmt(s.target)))));
+    return /* @__PURE__ */ React.createElement("div", { style: { background: panel2, border: `1px solid ${line}`, borderRadius: 4, fontFamily: mono, fontSize: 12 } }, /* @__PURE__ */ React.createElement(CustomTooltip, { ...props, bare: true }), /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 12px 10px", borderTop: `1px solid ${line}` } }, /* @__PURE__ */ React.createElement("div", { style: { color: dim, marginBottom: 4, fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em" } }, "Target stack-up (kcal)"), demandParts.filter(([, v, always]) => always || nonZero(v)).map(([name, v], i) => /* @__PURE__ */ React.createElement("div", { key: name, style: { ...rowStyle, color: dim } }, /* @__PURE__ */ React.createElement("span", null, name), /* @__PURE__ */ React.createElement("span", null, i === 0 ? fmt(v) : signed(v)))), /* @__PURE__ */ React.createElement("div", { style: { ...subtotalStyle, color: paper } }, /* @__PURE__ */ React.createElement("span", null, "Demand"), /* @__PURE__ */ React.createElement("span", null, fmt(s.demand))), targetParts.filter(([, v]) => nonZero(v)).map(([name, v]) => /* @__PURE__ */ React.createElement(React.Fragment, { key: name }, /* @__PURE__ */ React.createElement("div", { style: { ...rowStyle, color: dim } }, /* @__PURE__ */ React.createElement("span", null, name), /* @__PURE__ */ React.createElement("span", null, signed(v))), name === "Macro floor" && s.macroFloorWhy && /* @__PURE__ */ React.createElement("div", { style: { color: amber, fontSize: 10.5, paddingLeft: 10, lineHeight: 1.45, maxWidth: 260 } }, /* @__PURE__ */ React.createElement("div", null, "\u21B3 ", s.macroFloorWhy.reason), /* @__PURE__ */ React.createElement("div", { style: { color: dim } }, "carbs ", fmt(s.macroFloorWhy.carbG), " g", s.macroFloorWhy.carbGPerKg !== null ? ` (${fmt(s.macroFloorWhy.carbGPerKg, 1)} g/kg)` : "", " = ", fmt(s.macroFloorWhy.carbKcal), " \xB7 ", "protein ", fmt(s.macroFloorWhy.proteinG), " g = ", fmt(s.macroFloorWhy.proteinKcal), " \xB7 ", "fat ", fmt(s.macroFloorWhy.fatG), " g = ", fmt(s.macroFloorWhy.fatKcal), " ", "\u2192 ", fmt(s.macroFloorWhy.carbKcal + s.macroFloorWhy.proteinKcal + s.macroFloorWhy.fatKcal), " vs ", fmt(s.macroFloorWhy.before), " before the floor")))), /* @__PURE__ */ React.createElement("div", { style: { ...subtotalStyle, color: cyan } }, /* @__PURE__ */ React.createElement("span", null, "Target"), /* @__PURE__ */ React.createElement("span", null, fmt(s.target)))));
   }
   function StatCard({ label, value, color }) {
     return /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: "16px 18px" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em", color: dim, fontWeight: 600, marginBottom: 8 } }, label), /* @__PURE__ */ React.createElement("div", { style: { fontFamily: mono, fontSize: 22, fontWeight: 600, color } }, value));

@@ -2072,6 +2072,7 @@ function App() {
           borrowed: borrowedKcal,
           imFloor: carbDrivenTarget - carbDrivenTargetRaw,
           macroFloor: targetDisplay - carbDrivenTarget,
+          macroFloorWhy: macroFloorReason(targetDisplay - carbDrivenTarget, carbDrivenTarget, carbTargetGDisplay, proteinTargetG, fatTargetGDisplay, weightForDay, raceLoading, preloading, parseFloat(profile.minFatG) || 100),
           target: targetDisplay,
           im: !!im,
         },
@@ -5129,6 +5130,26 @@ function CustomTooltip({ active, payload, label, bare }) {
   );
 }
 
+// Why the macro floor raised Target (tooltip detail): either carbs + protein
+// alone already exceed the calorie target, or they fit but the fat minimum
+// (20% of Target; max(20%, minFatG) on a pre-load day; carbLoadFatFloorPct
+// on a race carb-load day) pushes the macro sum past it. Null when the floor
+// didn't bind.
+function macroFloorReason(floorKcal, carbDrivenTarget, carbG, proteinG, fatG, weightKg, raceLoading, preloading, minFatG) {
+  if (!(floorKcal >= 0.5)) return null;
+  const carbKcal = (carbG || 0) * 4, proteinKcal = (proteinG || 0) * 4, fatKcal = (fatG || 0) * 9;
+  let reason;
+  if (carbKcal + proteinKcal > carbDrivenTarget) reason = "carbs + protein exceed target";
+  else if (raceLoading) reason = "fat minimum (carb-load %)";
+  else if (preloading && minFatG * 9 >= carbDrivenTarget * 0.2) reason = `fat minimum ${fmt(minFatG)} g (pre-load)`;
+  else reason = "fat minimum 20% of target";
+  return {
+    reason, carbG, proteinG, fatG, carbKcal, proteinKcal, fatKcal,
+    carbGPerKg: weightKg ? (carbG || 0) / weightKg : null,
+    before: carbDrivenTarget,
+  };
+}
+
 // Target vs. intake tooltip: the usual series readout, plus the stack-up of
 // calorie contributions that sum to that day's Target (BMR → NEAT → training
 // → EPOC → fatigue = demand, then goal / calibration / pre-load / floors =
@@ -5167,7 +5188,20 @@ function TargetStackTooltip(props) {
         ))}
         <div style={{ ...subtotalStyle, color: paper }}><span>Demand</span><span>{fmt(s.demand)}</span></div>
         {targetParts.filter(([, v]) => nonZero(v)).map(([name, v]) => (
-          <div key={name} style={{ ...rowStyle, color: dim }}><span>{name}</span><span>{signed(v)}</span></div>
+          <React.Fragment key={name}>
+            <div style={{ ...rowStyle, color: dim }}><span>{name}</span><span>{signed(v)}</span></div>
+            {name === "Macro floor" && s.macroFloorWhy && (
+              <div style={{ color: amber, fontSize: 10.5, paddingLeft: 10, lineHeight: 1.45, maxWidth: 260 }}>
+                <div>↳ {s.macroFloorWhy.reason}</div>
+                <div style={{ color: dim }}>
+                  carbs {fmt(s.macroFloorWhy.carbG)} g{s.macroFloorWhy.carbGPerKg !== null ? ` (${fmt(s.macroFloorWhy.carbGPerKg, 1)} g/kg)` : ""} = {fmt(s.macroFloorWhy.carbKcal)}
+                  {" · "}protein {fmt(s.macroFloorWhy.proteinG)} g = {fmt(s.macroFloorWhy.proteinKcal)}
+                  {" · "}fat {fmt(s.macroFloorWhy.fatG)} g = {fmt(s.macroFloorWhy.fatKcal)}
+                  {" "}→ {fmt(s.macroFloorWhy.carbKcal + s.macroFloorWhy.proteinKcal + s.macroFloorWhy.fatKcal)} vs {fmt(s.macroFloorWhy.before)} before the floor
+                </div>
+              </div>
+            )}
+          </React.Fragment>
         ))}
         <div style={{ ...subtotalStyle, color: cyan }}><span>Target</span><span>{fmt(s.target)}</span></div>
       </div>

@@ -49,6 +49,13 @@ IronMan mode (optional, profile.ironmanMode — toggled in Setup -> Goal):
        [--plan configs/schedule_sources/<plan>.json] [--out out.json]
   Tests: python3 -m unittest discover -s src/python -p 'test_*.py'
 
+Expenditure audit (Setup -> Model tuning -> "Estimate from my data"):
+  expenditure_audit.py measures non-exercise expenditure (BMR + NEAT + EPOC +
+  TEF) as logged intake minus the smoothed weight change minus device workout
+  kcal, and suggests the neatFactor / neatOffset that matches it.
+    GET  /api/expenditure/audit?days=56   (read-only)
+  CLI: python3 src/python/expenditure_audit.py --store secrets/app_store.json [--days 56] [--json]
+
 Setup:
   1. Register an app at https://www.strava.com/settings/api
      - Authorization Callback Domain: localhost
@@ -113,6 +120,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import schedule_sync
 import ironman_calibrate
+import expenditure_audit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -965,6 +973,22 @@ class Handler(BaseHTTPRequestHandler):
                 "calibrationFittedAt": calibration.get("fittedAt"),
                 "weightKg": athlete["weightKg"],
             })
+
+        # Measured non-exercise expenditure (BMR + NEAT + EPOC + TEF) from
+        # logged intake vs the smoothed weight trend, compared with the app's
+        # current NEAT/EPOC settings (Setup -> Model tuning). Read-only.
+        #   ?days=N  recommendation window ending at the last weigh-in (default 56)
+        if path == "/api/expenditure/audit":
+            try:
+                days = int(qs.get("days", ["56"])[0])
+            except ValueError:
+                return self._send_json({"error": "days must be an integer"}, 400)
+            days = max(14, min(365, days))
+            try:
+                result = expenditure_audit.run_audit(load_store(), days=days)
+            except Exception as e:
+                return self._send_json({"error": f"audit failed: {e}"}, 500)
+            return self._send_json(result)
 
         if path == "/api/intervals/status":
             cfg = get_intervals_config()

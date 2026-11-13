@@ -2724,7 +2724,7 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
               </>
             ) : (
               <>
-                <ConfirmRange min="1.0" max="1.4" step="0.01" value={profile.neatFactor} format={(v) => `${v}×`}
+                <ConfirmRange min="1.0" max="1.8" step="0.01" value={profile.neatFactor} format={(v) => `${v}×`}
                   onCommit={(v) => setProfile((p) => ({ ...p, neatFactor: v }))} />
                 <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>BMR × {profile.neatFactor}× covers daily NEAT/light activity, before training is added on top.</div>
               </>
@@ -2788,6 +2788,7 @@ function SetupTab({ profile, setProfile, bmr, lastFetched, stravaStatus, stravaE
           <Icon path={ICONS.info} size={14} color={dim} />
           <div>BMR uses the Mifflin-St Jeor equation. The training and recovery adjustments beyond that are heuristics commonly used in endurance-coaching practice, not a single peer-reviewed formula — tune the sliders above to match how your coach or experience calibrates it.</div>
         </div>
+        <ExpenditureAudit profile={profile} setProfile={setProfile} />
       </>) },
 
     { id: "goal", title: "Goal", icon: ICONS.trophy, iconColor: amber,
@@ -3026,6 +3027,149 @@ function GoalCard({ profile, setProfile, goalParams, trendCorrection, weightTren
 
 // Explains, in the Goal card, why switching maintain/build/lose leaves a
 // training day's Target unchanged in IronMan mode (see imGoalFloorSummary).
+// Setup -> Model tuning: "Estimate from my data". Server-side
+// expenditure_audit.py measures what you actually burn outside logged
+// workouts — logged intake minus the smoothed weight change (x 7700) minus
+// device exercise kcal — and compares it with this model's BMR x NEAT +
+// EPOC + fatigue buffer. Apply sets neatFactor / neatOffset so the app's
+// demand matches what was observed, leaving EPOC and the buffer as they are.
+function ExpenditureAudit({ profile, setProfile }) {
+  const [days, setDays] = useState(56);
+  const [audit, setAudit] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [showWindows, setShowWindows] = useState(false);
+  async function run(n = days) {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/expenditure/audit?days=${n}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Audit failed (${res.status}).`);
+      setAudit(data);
+    } catch (e) {
+      setError(e.message || "Could not reach the server.");
+    } finally {
+      setLoading(false);
+    }
+  }
+  const p = audit && audit.ok ? audit.pooled : null;
+  const rec = audit && audit.ok ? audit.recommendation : null;
+  const offsetMode = (profile.neatMode || "multiplier") === "offset";
+  const signed = (v) => `${v >= 0 ? "+" : "−"}${fmt(Math.abs(v))}`;
+  const cell = { padding: "3px 10px 3px 0", whiteSpace: "nowrap" };
+  const num = { ...cell, textAlign: "right", fontFamily: mono };
+  const recValue = rec ? (offsetMode ? rec.neatOffset : rec.neatFactor) : null;
+  const curValue = offsetMode ? parseFloat(profile.neatOffset) : parseFloat(profile.neatFactor);
+  const alreadyApplied = rec && Math.abs(recValue - curValue) < (offsetMode ? 13 : 0.006);
+  const lr = audit && audit.ok ? audit.loadResponse : null;
+  const sp = audit && audit.ok ? audit.split : null;
+  return (
+    <div style={{ marginTop: 18, paddingTop: 16, borderTop: `1px solid ${line}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ fontWeight: 600, fontSize: 13, flex: 1, minWidth: 200 }}>Estimate NEAT + EPOC from my data</div>
+        <select className="inp" value={days} onChange={(e) => { const n = parseInt(e.target.value, 10); setDays(n); if (audit) run(n); }} style={{ width: "auto" }}>
+          {[28, 56, 84, 120].map((n) => <option key={n} value={n}>Last {n} days</option>)}
+        </select>
+        <button onClick={() => run()} disabled={loading} style={{ padding: "7px 12px", fontSize: 12 }}>
+          {loading ? "Analyzing…" : audit ? "Re-run" : "Analyze"}
+        </button>
+      </div>
+      <div style={{ fontSize: 11.5, color: dim, marginTop: 6 }}>
+        Uses your food log, weigh-ins and synced workouts: what you ate, minus what went into (or came out of) body
+        weight, is what you burned. Take away device workout calories and the rest is BMR + food thermogenesis + NEAT
+        + EPOC — compared here with what the sliders above assume.
+      </div>
+      {error && <Banner kind="error">{error}</Banner>}
+      {audit && !audit.ok && <Banner kind="warning">{audit.reason}</Banner>}
+      {p && (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ fontSize: 11.5, color: dim, fontFamily: mono, marginBottom: 6 }}>
+            {p.start} → {p.end} · {p.days} days · {audit.weighInsInWindow} weigh-ins · {Math.round(p.intakeCoverage * 100)}% food-logged · {Math.round(p.exerciseCoverage * 100)}% training synced
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ fontSize: 12.5, borderCollapse: "collapse" }}>
+              <tbody>
+                <tr><td style={cell}>Mean logged intake</td><td style={num}>{fmt(p.meanIntake)}</td><td style={{ ...cell, color: dim }}>kcal/day</td></tr>
+                <tr><td style={cell}>Stored as body weight</td><td style={num}>{signed(p.storageKcal)}</td><td style={{ ...cell, color: dim }}>trend {p.rateKgPerWeek >= 0 ? "+" : ""}{p.rateKgPerWeek} kg/wk</td></tr>
+                <tr><td style={{ ...cell, fontWeight: 600 }}>Observed expenditure</td><td style={{ ...num, fontWeight: 600 }}>{fmt(p.observedTdee)}</td><td style={{ ...cell, color: dim }}>± {fmt(p.sd)}</td></tr>
+                <tr><td style={cell}>− Workouts (device)</td><td style={num}>{fmt(p.exerciseKcal)}</td><td style={{ ...cell, color: dim }}>{p.trainingHoursPerDay} h/day</td></tr>
+                <tr><td style={{ ...cell, fontWeight: 600 }}>= Non-exercise</td><td style={{ ...num, fontWeight: 600 }}>{fmt(p.nonExercise)}</td><td style={{ ...cell, color: dim }}>{p.nonExerciseFactor}× BMR</td></tr>
+                <tr><td style={{ ...cell, paddingLeft: 14, color: dim }}>BMR</td><td style={{ ...num, color: dim }}>{fmt(p.bmr)}</td><td /></tr>
+                <tr><td style={{ ...cell, paddingLeft: 14, color: dim }}>Food thermogenesis (~10%)</td><td style={{ ...num, color: dim }}>{fmt(p.tef)}</td><td /></tr>
+                <tr><td style={{ ...cell, paddingLeft: 14 }}>NEAT + EPOC + other</td><td style={num}>{fmt(p.neatEpocOther)}</td><td /></tr>
+                <tr><td style={cell}>Model assumes (non-exercise)</td><td style={num}>{fmt(p.app.nonExercise)}</td>
+                  <td style={{ ...cell, color: dim }}>{p.app.nonExerciseFactor}× BMR · EPOC {fmt(p.app.epoc)}{p.app.fatigue ? ` · buffer ${fmt(p.app.fatigue)}` : ""}</td></tr>
+                <tr><td style={{ ...cell, fontWeight: 600 }}>Gap</td><td style={{ ...num, fontWeight: 600, color: rec.changeSuggested ? amber : mint }}>{signed(p.gap)}</td>
+                  <td style={{ ...cell, color: dim }}>kcal/day {p.gap > 0 ? "model is under-counting" : "model is over-counting"}</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginTop: 12, padding: "8px 10px", border: `1px solid ${rec.changeSuggested ? amber : line}`, borderRadius: 4, fontSize: 12.5 }}>
+            <span style={{ flex: 1, minWidth: 220 }}>
+              {offsetMode
+                ? <>Suggested NEAT offset <b>{fmt(rec.neatOffset)} kcal</b> ± {fmt(rec.neatOffsetSd)} (now {fmt(curValue)})</>
+                : <>Suggested NEAT factor <b>{rec.neatFactor}×</b> ± {rec.neatFactorSd} (now {curValue}×)</>}
+              {" "}· confidence {rec.confidence}{rec.changeSuggested ? "" : " · within noise of the current setting"}
+            </span>
+            {profile.ironmanMode
+              ? <span style={{ fontSize: 11.5, color: dim }}>IronMan mode uses its own calibrated NEAT — Recalibrate in Goal instead.</span>
+              : <button disabled={alreadyApplied}
+                  onClick={() => setProfile((pr) => offsetMode ? { ...pr, neatOffset: String(rec.neatOffset) } : { ...pr, neatFactor: String(Math.min(1.8, Math.max(1.0, rec.neatFactor))) })}
+                  style={{ padding: "5px 12px", borderRadius: 4, fontWeight: 700, fontSize: 12, cursor: alreadyApplied ? "default" : "pointer", border: "none", background: alreadyApplied ? line : amber, color: ink }}>
+                  {alreadyApplied ? "Applied" : "Apply"}
+                </button>}
+          </div>
+          {lr && (
+            <div style={{ fontSize: 11.5, color: dim, marginTop: 8 }}>
+              Training-load response ({lr.nWindows} two-week blocks): non-exercise burn moves {signed(lr.slopePer100Kcal)}{lr.slopeSe != null ? ` ± ${fmt(lr.slopeSe)}` : ""} kcal
+              per extra 100 kcal/day of training; the model's EPOC adds {lr.appSlopePer100Kcal ?? "—"}.
+              {lr.note ? ` ${lr.note}` : lr.slopeSe != null && Math.abs(lr.slopePer100Kcal - (lr.appSlopePer100Kcal || 0)) > 2 * lr.slopeSe
+                ? (lr.slopePer100Kcal > (lr.appSlopePer100Kcal || 0) ? " Hard blocks cost more than the EPOC setting allows for — consider raising EPOC sensitivity." : " You likely move less on big training blocks (NEAT compensation) — EPOC sensitivity could come down.")
+                : " Consistent with the current EPOC setting."}
+            </div>
+          )}
+          {sp && (
+            <div style={{ fontSize: 11.5, color: dim, marginTop: 6 }}>
+              Kalman fit ({sp.span[0]} → {sp.span[1]}): expenditure ≈ {sp.bmrMultiplier}× BMR + {sp.exerciseMultiplier}× workout kcal
+              {sp.identified ? "." : " — training load didn't vary enough to separate the two reliably; trust the total above, not this split."}
+            </div>
+          )}
+          {audit.notes.map((n, i) => <div key={i} style={{ fontSize: 11.5, color: amber, marginTop: 6 }}>{n}</div>)}
+          {audit.windows.length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <button className="btn-ghost" onClick={() => setShowWindows((v) => !v)} style={{ padding: "4px 10px", fontSize: 11.5 }}>
+                {showWindows ? "Hide" : "Show"} rolling two-week estimates ({audit.windows.length})
+              </button>
+              {showWindows && (
+                <div style={{ overflowX: "auto", marginTop: 8 }}>
+                  <table className="data">
+                    <thead><tr><th>From</th><th>Intake</th><th>kg/wk</th><th>Burned</th><th>Workouts</th><th>Non-ex.</th><th>× BMR</th><th>±</th></tr></thead>
+                    <tbody>
+                      {audit.windows.slice().reverse().map((w) => (
+                        <tr key={w.start}>
+                          <td>{w.start}</td><td>{fmt(w.meanIntake)}</td><td>{w.rateKgPerWeek >= 0 ? "+" : ""}{w.rateKgPerWeek}</td>
+                          <td>{fmt(w.observedTdee)}</td><td>{fmt(w.exerciseKcal)}</td><td>{fmt(w.nonExercise)}</td>
+                          <td>{w.nonExerciseFactor}</td><td style={{ color: dim }}>{fmt(w.sd)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <div style={{ fontSize: 11, color: dim, marginTop: 4 }}>Two-week windows are noisy (water and glycogen swings); the pooled number above is the one to act on.</div>
+                </div>
+              )}
+            </div>
+          )}
+          <div style={{ fontSize: 11, color: dim, marginTop: 8 }}>
+            These are effective numbers: food that never gets logged, device calories that read high or low, and BMR counted
+            inside workout calories all show up here. That's what the targets need, since they're compared with the same log and devices.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ImGoalFloorNote({ info, goalLabel, lightDayMaxKcal }) {
   const signed = (v) => `${v >= 0 ? "+" : "−"}${fmt(Math.abs(v))}`;
   const allTraining = info.flooredDays === info.trainingDays;

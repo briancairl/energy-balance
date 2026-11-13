@@ -33,6 +33,7 @@ index.html    Served as-is from the project root
 | `index.html` | Thin shell: loads React/ReactDOM/Recharts/PapaParse from CDN as globals, then `/app.js`. |
 | `configs/config.json` | Secrets and settings. **Not delivered/committed** — copy from `configs/config.example.json`. |
 | `configs/config.example.json` | Template with every recognized config field. |
+| `src/python/expenditure_audit.py` | Measures non-exercise expenditure from intake + weight trend and suggests NEAT settings (Model tuning). CLI + imported by `server.py`. |
 | `src/python/ironman_calibrate.py` | IronMan-mode calibration (stdlib only): session-cost fit, energy-balance fit, empirical intake-vs-load relation, whole-plan projection. CLI + imported by `server.py`. |
 | `src/python/test_*.py` | Unit tests (synthetic fixtures only): `python3 -m unittest discover -s src/python -p 'test_*.py'`. |
 | `src/python/repair_store.py` | One-off recovery tool for a corrupted `secrets/app_store.json` (see Concurrency below). Keep around. |
@@ -267,6 +268,21 @@ history and just persist as entered.
   funded by debiting a later day; it's a deliberate short-term glycogen-loading overshoot, not
   a swap. See `getTaperState` / `getCarbLoadState` / `getEffectiveSessionsForDate` in
   `app-source.jsx`.
+
+## Expenditure audit (Setup → Model tuning → "Estimate NEAT + EPOC from my data")
+
+`src/python/expenditure_audit.py` (stdlib, CLI + `GET /api/expenditure/audit?days=56`, read-only) measures
+what the athlete burns outside logged workouts instead of assuming it:
+observed TDEE = mean logged intake − 7700 × (RTS-smoothed trend-weight change) / days; non-exercise =
+TDEE − device workout kcal (counted exactly like the non-IronMan `dailyRows` path: Strava `calories` → kJ
+fallback, else intervals.icu). That non-exercise figure (BMR + TEF + NEAT + EPOC + logging bias) is compared
+with the app's `baseline + EPOC + fatigue buffer`, and the suggested `neatFactor` / `neatOffset` is the one
+that closes the gap with EPOC sensitivity and the fatigue buffer left as they are. Uncertainty = smoother level
+SD at both ends + a ±0.25 kg water/glycogen floor + 600 kcal per unlogged day. Also reports rolling 14-day
+windows, a load-response slope (non-exercise kcal per +100 kcal/day of training, across non-overlapping
+windows; tests EPOC vs NEAT compensation) and a wide-prior Kalman split (`ironman_calibrate.fit_energy_balance`).
+All numbers are *effective* (absorb under-logging and device bias), deliberately. The NEAT slider now goes to 1.8×,
+since measured values above 1.4× are common for athletes once food thermogenesis is counted.
 
 ## IronMan mode (`profile.ironmanMode`, Setup → Goal)
 
